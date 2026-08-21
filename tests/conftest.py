@@ -98,7 +98,7 @@ def ad_t0(snapshot_t0_path):
 
 
 @pytest.fixture(scope="session")
-def ad_turb(snapshot_turb_path):
+def ad(snapshot_turb_path):
     """Loaded AthenaData for the latest/most evolved snapshot."""
     from athena_research.core.athena_data import AthenaData
     return AthenaData().load(str(snapshot_turb_path))

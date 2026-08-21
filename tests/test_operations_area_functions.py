@@ -34,32 +34,32 @@ class TestAreaMethodsCrossValidation:
     T_PEAK = 0.1  # well inside the turbulent snapshot's T range, away from
                   # any meshblock-face degeneracy (see TestMeshblockFaceEdgeCase)
 
-    def test_mb_based_and_global_coarse_agree_at_step_1(self, ad_turb):
+    def test_mb_based_and_global_coarse_agree_at_step_1(self, ad):
         s_mb, a_mb = af.calc_area_mb_based(
-            ad_turb, self.T_PEAK, step_sizes=[1], use_gpu=af.cupy_enabled, verbose=False
+            ad, self.T_PEAK, step_sizes=[1], use_gpu=af.cupy_enabled, verbose=False
         )
         s_gl, a_gl = af.calc_area_global_coarse_sampled_offsets(
-            ad_turb, self.T_PEAK, step_sizes=[1], verbose=False
+            ad, self.T_PEAK, step_sizes=[1], verbose=False
         )
         # Same per-cell resolution, different code paths (GPU kernel vs.
         # global coarse-grid sampling with offset averaging) -- expect close
         # agreement, not bit-identical.
         assert float(a_mb[0]) == pytest.approx(float(a_gl[0]), rel=0.02)
 
-    def test_smoothed_indicator_is_within_a_few_percent_of_mb_based(self, ad_turb):
+    def test_smoothed_indicator_is_within_a_few_percent_of_mb_based(self, ad):
         s_mb, a_mb = af.calc_area_mb_based(
-            ad_turb, self.T_PEAK, step_sizes=[1], use_gpu=af.cupy_enabled, verbose=False
+            ad, self.T_PEAK, step_sizes=[1], use_gpu=af.cupy_enabled, verbose=False
         )
         s_sm, a_sm = af.calc_area_smoothed_indicator_mc(
-            ad_turb, self.T_PEAK, step_sizes=[1], verbose=False
+            ad, self.T_PEAK, step_sizes=[1], verbose=False
         )
         # Smoothing genuinely changes the isosurface geometry a little, so
         # this is a looser bound than the two sharp-interface methods above.
         assert float(a_sm[0]) == pytest.approx(float(a_mb[0]), rel=0.1)
 
-    def test_areas_are_positive_and_finite(self, ad_turb):
+    def test_areas_are_positive_and_finite(self, ad):
         s_mb, a_mb = af.calc_area_mb_based(
-            ad_turb, self.T_PEAK, step_sizes=[1, 2], use_gpu=af.cupy_enabled, verbose=False
+            ad, self.T_PEAK, step_sizes=[1, 2], use_gpu=af.cupy_enabled, verbose=False
         )
         assert np.all(np.isfinite(a_mb))
         assert np.all(a_mb > 0)
@@ -67,17 +67,17 @@ class TestAreaMethodsCrossValidation:
 
 @pytest.mark.data
 class TestSetAreaCaching:
-    def test_set_area_caches_and_skips_recomputation(self, ad_turb, tmp_path):
+    def test_set_area_caches_and_skips_recomputation(self, ad, tmp_path):
         h5_path = str(tmp_path / "area_cache.h5data")
         result1 = af.set_area(
-            ad_turb, 0.1, h5_path, step_sizes=[1], verbose=False, use_gpu=af.cupy_enabled
+            ad, 0.1, h5_path, step_sizes=[1], verbose=False, use_gpu=af.cupy_enabled
         )
         assert list(result1["step_sizes"]) == [1]
 
         # Second call with the same step sizes should hit the cache and
         # return the identical stored result without raising.
         result2 = af.set_area(
-            ad_turb, 0.1, h5_path, step_sizes=[1], verbose=False, use_gpu=af.cupy_enabled
+            ad, 0.1, h5_path, step_sizes=[1], verbose=False, use_gpu=af.cupy_enabled
         )
         assert result2["areas"][0] == pytest.approx(result1["areas"][0])
 

@@ -18,11 +18,11 @@ from athena_research.core.base import asnumpy
 
 @pytest.mark.data
 class TestDivergence:
-    def test_auto_select_agrees_with_forced_meshblock_method(self, ad_turb):
+    def test_auto_select_agrees_with_forced_meshblock_method(self, ad):
         from athena_research.operations.grad_div_curl import divergence
 
-        div_auto = divergence(ad_turb, "velx", "vely", "velz", auto_select=True)
-        div_mb = divergence(ad_turb, "velx", "vely", "velz", auto_select=False)
+        div_auto = divergence(ad, "velx", "vely", "velz", auto_select=True)
+        div_mb = divergence(ad, "velx", "vely", "velz", auto_select=False)
 
         auto_np = np.concatenate([asnumpy(d).ravel() for d in div_auto]) \
             if isinstance(div_auto, list) else asnumpy(div_auto).ravel()
@@ -32,15 +32,15 @@ class TestDivergence:
         np.testing.assert_allclose(auto_np, mb_np, rtol=1e-10, atol=1e-12)
         assert np.all(np.isfinite(auto_np))
 
-    def test_simultaneous_blocks_matches_auto_select(self, ad_turb):
+    def test_simultaneous_blocks_matches_auto_select(self, ad):
         """simultaneous_blocks explicitly forces the meshblock method,
         bypassing auto_select entirely -- exercises the exact code path
         that had the dead conditional before the cleanup."""
         from athena_research.operations.grad_div_curl import divergence
 
-        div_auto = divergence(ad_turb, "velx", "vely", "velz", auto_select=True)
+        div_auto = divergence(ad, "velx", "vely", "velz", auto_select=True)
         div_forced = divergence(
-            ad_turb, "velx", "vely", "velz", simultaneous_blocks=1
+            ad, "velx", "vely", "velz", simultaneous_blocks=1
         )
 
         auto_np = np.concatenate([asnumpy(d).ravel() for d in div_auto]) \
@@ -53,11 +53,11 @@ class TestDivergence:
 
 @pytest.mark.data
 class TestGradient:
-    def test_auto_select_agrees_with_forced_meshblock_method(self, ad_turb):
+    def test_auto_select_agrees_with_forced_meshblock_method(self, ad):
         from athena_research.operations.grad_div_curl import gradient
 
-        grad_auto = gradient(ad_turb, "dens", axis="x", auto_select=True)
-        grad_mb = gradient(ad_turb, "dens", axis="x", auto_select=False)
+        grad_auto = gradient(ad, "dens", axis="x", auto_select=True)
+        grad_mb = gradient(ad, "dens", axis="x", auto_select=False)
 
         np.testing.assert_allclose(
             asnumpy(grad_auto), asnumpy(grad_mb), rtol=1e-10, atol=1e-12
@@ -67,11 +67,11 @@ class TestGradient:
 
 @pytest.mark.data
 class TestCurl:
-    def test_auto_select_agrees_with_forced_meshblock_method(self, ad_turb):
+    def test_auto_select_agrees_with_forced_meshblock_method(self, ad):
         from athena_research.operations.grad_div_curl import curl
 
-        curl_auto = curl(ad_turb, "velx", "vely", "velz", auto_select=True)
-        curl_mb = curl(ad_turb, "velx", "vely", "velz", auto_select=False)
+        curl_auto = curl(ad, "velx", "vely", "velz", auto_select=True)
+        curl_mb = curl(ad, "velx", "vely", "velz", auto_select=False)
 
         for comp_auto, comp_mb in zip(curl_auto, curl_mb):
             np.testing.assert_allclose(

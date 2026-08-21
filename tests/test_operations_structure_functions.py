@@ -35,12 +35,12 @@ class TestSeedComputationRegressionForLargeBlockPairIndex:
 
 @pytest.mark.data
 class TestStructureFunctionsRealDataSmoke:
-    def test_set_sf_runs_and_returns_monotonic_finite_values(self, ad_turb):
+    def test_set_sf_runs_and_returns_monotonic_finite_values(self, ad):
         from athena_research.operations.structure_functions import set_sf
-        set_sf(ad_turb, varl=["dens"], redo=True, debug=False)
+        set_sf(ad, varl=["dens"], redo=True, debug=False)
 
-        assert "dens" in ad_turb.sf
-        entry = ad_turb.sf["dens"]
+        assert "dens" in ad.sf
+        entry = ad.sf["dens"]
         r = asnumpy(entry["r"])
         sf = asnumpy(entry["sf"])
         assert r.shape[0] == sf.shape[-1]

@@ -132,30 +132,30 @@ class TestAthenaDataSet:
 
 @pytest.mark.data
 class TestRealSnapshotLoad:
-    def test_load_reports_sane_geometry(self, ad_turb):
-        assert ad_turb.Nx1 > 0 and ad_turb.Nx2 > 0 and ad_turb.Nx3 > 0
-        assert ad_turb.n_mbs > 0
-        assert ad_turb.gamma > 1.0
-        assert isinstance(ad_turb.eos, str) and ad_turb.eos
+    def test_load_reports_sane_geometry(self, ad):
+        assert ad.Nx1 > 0 and ad.Nx2 > 0 and ad.Nx3 > 0
+        assert ad.n_mbs > 0
+        assert ad.gamma > 1.0
+        assert isinstance(ad.eos, str) and ad.eos
 
         required_vars = ["dens", "eint", "velx", "vely", "velz"]
-        if ad_turb.is_mhd:
+        if ad.is_mhd:
             required_vars += ["bcc1", "bcc2", "bcc3"]
         for var in required_vars:
-            assert var in ad_turb.data_raw
-            assert np.all(np.isfinite(ad_turb.data_raw[var]))
-        assert np.all(ad_turb.data_raw["dens"] > 0)
+            assert var in ad.data_raw
+            assert np.all(np.isfinite(ad.data_raw[var]))
+        assert np.all(ad.data_raw["dens"] > 0)
 
-    def test_save_load_h5data_roundtrip(self, ad_turb, tmp_path):
+    def test_save_load_h5data_roundtrip(self, ad, tmp_path):
         from athena_research.core.base import asnumpy
         from athena_research.operations.basic_operations import calc_sum
-        calc_sum(ad_turb, varl=["dens"], redo=True)
+        calc_sum(ad, varl=["dens"], redo=True)
 
         out_path = str(tmp_path / "roundtrip.h5data")
-        ad_turb.save(out_path)
+        ad.save(out_path)
 
         reloaded = AthenaData().load(out_path)
         assert "dens" in reloaded.sum
         assert float(asnumpy(reloaded.sum["dens"])) == pytest.approx(
-            float(asnumpy(ad_turb.sum["dens"]))
+            float(asnumpy(ad.sum["dens"]))
         )

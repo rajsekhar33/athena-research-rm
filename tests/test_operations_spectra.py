@@ -64,36 +64,36 @@ class TestParsevalTheoremSyntheticPeriodicField:
     real-space variance to float64 precision for a genuinely periodic field."""
 
     @pytest.mark.parametrize("method", ["standard", "memory_efficient"])
-    def test_scalar_field_parseval(self, ad_turb, method):
+    def test_scalar_field_parseval(self, ad, method):
         from athena_research.operations.spectra import get_spectrum, get_spectrum_mb
 
-        expected_variance = _inject_periodic_field(ad_turb, "synth_scalar")
+        expected_variance = _inject_periodic_field(ad, "synth_scalar")
 
         if method == "standard":
             _, _, _, E_spectrum, _, _ = get_spectrum(
-                ad_turb, "synth_scalar", strat_flag=False, skip=0.0, nbins=ad_turb.Nx1
+                ad, "synth_scalar", strat_flag=False, skip=0.0, nbins=ad.Nx1
             )
         else:
             _, _, _, E_spectrum, _, _ = get_spectrum_mb(
-                ad_turb, "synth_scalar", strat_flag=False, skip=0.0,
-                nbins=ad_turb.Nx1, ndiv=4,
+                ad, "synth_scalar", strat_flag=False, skip=0.0,
+                nbins=ad.Nx1, ndiv=4,
             )
 
-        n_total = ad_turb.Nx1 * ad_turb.Nx2 * ad_turb.Nx3
+        n_total = ad.Nx1 * ad.Nx2 * ad.Nx3
         # bin 0 is the DC/k=0 mode (mean^2); exclude it to compare against variance
         spectral_variance = float(asnumpy(xp.sum(xp.asarray(E_spectrum)[1:]))) / n_total
 
         assert spectral_variance == pytest.approx(expected_variance, rel=1e-9)
 
-    def test_parseval_verification_class_passes_on_periodic_field(self, ad_turb):
+    def test_parseval_verification_class_passes_on_periodic_field(self, ad):
         """End-to-end check via the actual verify_parseval_theorem.py class,
         exercising its corrected formula (regression test for the dk/DC-bin
         formula bug)."""
         from athena_research.operations.verify_parseval_theorem import ParsevalVerification
 
-        _inject_periodic_field(ad_turb, "synth_scalar")
+        _inject_periodic_field(ad, "synth_scalar")
         pv = ParsevalVerification(verbose=False)
-        result = pv.verify_parseval_scalar(ad_turb, "synth_scalar", method="standard")
+        result = pv.verify_parseval_scalar(ad, "synth_scalar", method="standard")
 
         assert result["relative_error"] < 1e-8
         assert result["passed"]
@@ -105,21 +105,21 @@ class TestSpectraRealDataSmoke:
     functions run and return physically sane output, without asserting
     Parseval (which doesn't hold for this data; see module docstring)."""
 
-    def test_set_spectrum_runs_and_returns_finite_positive_power(self, ad_turb):
+    def test_set_spectrum_runs_and_returns_finite_positive_power(self, ad):
         from athena_research.operations.spectra import set_spectrum
-        set_spectrum(ad_turb, varl=["dens"], redo=True, verbose=False)
+        set_spectrum(ad, varl=["dens"], redo=True, verbose=False)
 
-        assert "dens" in ad_turb.spectra
-        spect = asnumpy(ad_turb.spectra["dens"]["spectrum"])
+        assert "dens" in ad.spectra
+        spect = asnumpy(ad.spectra["dens"]["spectrum"])
         assert np.all(np.isfinite(spect))
         assert np.all(spect >= 0)
 
-    def test_set_spectrum_helmholtz_runs_and_returns_finite_power(self, ad_turb):
+    def test_set_spectrum_helmholtz_runs_and_returns_finite_power(self, ad):
         from athena_research.operations.spectra import set_spectrum_helmholtz
-        set_spectrum_helmholtz(ad_turb, "vel", redo=True, verbose=False)
+        set_spectrum_helmholtz(ad, "vel", redo=True, verbose=False)
 
-        assert "vel" in ad_turb.spectra
+        assert "vel" in ad.spectra
         for key in ("spectrum_comp", "spectrum_sol"):
-            values = asnumpy(ad_turb.spectra["vel"][key])
+            values = asnumpy(ad.spectra["vel"][key])
             assert np.all(np.isfinite(values))
             assert np.all(values >= 0)
