@@ -194,7 +194,7 @@ extern "C" __global__ void mc_area_kernel(
     double* __restrict__ area_out,    // accumulator (single double)
     int Nz, int Ny, int Nx,
     int s,                            // step size (cube side in cells)
-    double iso,                       // log10(T_peak)
+    double iso,                       // log10(T_ref)
     double dz_cell,                   // physical z-spacing per cell
     double dy_cell,                   // physical y-spacing per cell
     double dx_cell                    // physical x-spacing per cell
@@ -506,41 +506,54 @@ def _calc_area_gpu(aug: np.ndarray, iso: float, ad, step_size: int) -> float:
 
 # ── Interface-slab helpers (shared with notebook) ────────────────────────────
 
-def find_interface_z_levels(ad, T_peak, n_buffer=1):
+def _fetch_temp_mb(ad, idx: int) -> np.ndarray:
+    """Fetch ONE meshblock's temperature via the proper `ad.data(var, mbl,
+    mbh)` accessor (always an explicit range) -- never `ad.data_raw[var]`
+    and never for the whole domain at once. See MESHBLOCK_DATA_ACCESS.md at
+    the repo root: a no-range call bypasses the xp GPU/CPU backend
+    abstraction, skips MPI-safe local-index translation, and is
+    memory-unsafe for large runs. `ad.data("temp", ...)` is the
+    already-registered, EOS-aware temperature data_func (see
+    core/data_functions.py), so this also replaces the manual
+    `(gamma-1)*eint/dens` recomputation these callers used to do.
     """
-    Return the x3min values of meshblock z-levels that bracket the T=T_peak
+    return asnumpy(ad.data("temp", idx, idx + 1))[0]
+
+
+def _fetch_log_temp_mb(ad, idx: int) -> np.ndarray:
+    """Fetch ONE meshblock's log10(temperature) -- see `_fetch_temp_mb`."""
+    return np.log10(_fetch_temp_mb(ad, idx))
+
+
+def find_interface_z_levels(ad, T_ref, n_buffer=1):
+    """
+    Return the x3min values of meshblock z-levels that bracket the T=T_ref
     isosurface, plus n_buffer extra levels on each side.
     """
-    mb_geo   = ad.mb_geometry
-    gamma    = ad.gamma
-    eint_raw = ad.data_raw['eint']
-    dens_raw = ad.data_raw['dens']
+    mb_geo = ad.mb_geometry
 
     z3_unique  = np.sort(np.unique(mb_geo[:, 4]))
     log_T_by_z = np.empty(len(z3_unique))
     for iz, z3min in enumerate(z3_unique):
         idx_list = np.where(mb_geo[:, 4] == z3min)[0]
         log_T_by_z[iz] = np.mean([
-            np.log10(float((gamma - 1.0) * eint_raw[m].mean() / dens_raw[m].mean()))
+            np.log10(float(_fetch_temp_mb(ad, int(m)).mean()))
             for m in idx_list
         ])
 
-    iz_cross = int(np.argmin(np.abs(log_T_by_z - np.log10(T_peak))))
+    iz_cross = int(np.argmin(np.abs(log_T_by_z - np.log10(T_ref))))
     iz_low   = max(0, iz_cross - n_buffer)
     iz_high  = min(len(z3_unique) - 1, iz_cross + n_buffer)
     return z3_unique[iz_low : iz_high + 1], iz_cross
 
 
-def _build_slab(ad, T_peak, z_selected):
+def _build_slab(ad, T_ref, z_selected):
     """
     Reconstruct the temperature slab for the selected meshblock z-levels.
     Returns (slab, log_slab, iso) where slab has shape (Nz_slab, Nx2, Nx1).
     """
-    mb_geo   = ad.mb_geometry
-    gamma    = ad.gamma
-    eint_raw = ad.data_raw['eint']
-    dens_raw = ad.data_raw['dens']
-    _, nx3_mb, nx2_mb, nx1_mb = eint_raw.shape
+    mb_geo = ad.mb_geometry
+    nx3_mb, nx2_mb, nx1_mb = ad.nx3, ad.nx2, ad.nx1
 
     Nz_slab = len(z_selected) * nx3_mb
     Nx1, Nx2 = ad.Nx1, ad.Nx2
@@ -550,19 +563,20 @@ def _build_slab(ad, T_peak, z_selected):
     slab    = np.empty((Nz_slab, Nx2, Nx1), dtype=np.float32)
 
     for m in np.where(np.isin(mb_geo[:, 4], z_selected))[0]:
+        m = int(m)
         i1 = int(np.searchsorted(x1_vals, mb_geo[m, 0]))
         i2 = int(np.searchsorted(x2_vals, mb_geo[m, 2]))
         iz = int(np.searchsorted(z_selected, mb_geo[m, 4]))
         slab[iz*nx3_mb:(iz+1)*nx3_mb,
              i2*nx2_mb:(i2+1)*nx2_mb,
-             i1*nx1_mb:(i1+1)*nx1_mb] = (gamma - 1.0) * eint_raw[m] / dens_raw[m]
+             i1*nx1_mb:(i1+1)*nx1_mb] = _fetch_temp_mb(ad, m)
 
-    iso      = float(np.log10(T_peak))
+    iso      = float(np.log10(T_ref))
     log_slab = np.log10(slab.astype(np.float64))
 
     if iso < log_slab.min() or iso > log_slab.max():
         warnings.warn(
-            f'T_peak ({T_peak:.4g}) outside slab temperature range '
+            f'T_ref ({T_ref:.4g}) outside slab temperature range '
             f'[{slab.min():.4g}, {slab.max():.4g}]. '
             'Try increasing n_mb_buffer.',
             stacklevel=4
@@ -599,21 +613,7 @@ def _find_mc_neighbors(ad):
     return neighbors
 
 
-def _build_all_log_temp(ad, T_peak):
-    """
-    Compute log10(T) for every meshblock.
-
-    Returns
-    -------
-    np.ndarray, shape (n_mb, nx3, nx2, nx1), dtype float64
-    """
-    gamma = ad.gamma
-    eint = np.asarray(ad.data_raw['eint'], dtype=np.float64)
-    dens = np.asarray(ad.data_raw['dens'], dtype=np.float64)
-    return np.log10((gamma - 1.0) * eint / dens)
-
-
-def _build_padded_block(log_temp_all, m, neighbors, s_ghost, nx3, nx2, nx1):
+def _build_padded_block(ad, m, neighbors, s_ghost, nx3, nx2, nx1):
     """
     Assemble a padded array for meshblock m.
 
@@ -622,6 +622,12 @@ def _build_padded_block(log_temp_all, m, neighbors, s_ghost, nx3, nx2, nx1):
     meshblock data so the MC kernel can access all 8 corners of every cube
     whose lower-left-back corner lies within [0, nx3) × [0, nx2) × [0, nx1).
 
+    Fetches only the (up to 4) individual meshblocks actually needed --
+    self, +x, +y, +xy, and (if not at the +z domain boundary) +z, +xz, +yz,
+    +xyz -- via `_fetch_log_temp_mb`, never a precomputed whole-domain array
+    (see MESHBLOCK_DATA_ACCESS.md). A small per-call cache avoids re-fetching
+    the same meshblock twice within one padded block.
+
     Boundary conditions
     -------------------
     x1 (+x) : periodic — neighbour always exists.
@@ -629,30 +635,37 @@ def _build_padded_block(log_temp_all, m, neighbors, s_ghost, nx3, nx2, nx1):
     x3 (+z) : outflow  — if no neighbour (at domain top), the last z-layer is
                          replicated into the ghost region (constant extrapolation).
     """
+    cache = {}
+
+    def _get(idx):
+        if idx not in cache:
+            cache[idx] = _fetch_log_temp_mb(ad, idx)
+        return cache[idx]
+
     ix_plus, iy_plus, iz_plus = neighbors[m]
 
     pad = np.empty((nx3 + s_ghost, nx2 + s_ghost, nx1 + s_ghost), dtype=np.float64)
 
     # ── core block ────────────────────────────────────────────────────────────
-    pad[:nx3, :nx2, :nx1] = log_temp_all[m]
+    pad[:nx3, :nx2, :nx1] = _get(m)
 
     # ── +x ghost: first s_ghost x-columns of x+ neighbour ───────────────────
-    pad[:nx3, :nx2, nx1:] = log_temp_all[ix_plus][:nx3, :nx2, :s_ghost]
+    pad[:nx3, :nx2, nx1:] = _get(ix_plus)[:nx3, :nx2, :s_ghost]
 
     # ── +y ghost and +xy corner ───────────────────────────────────────────────
-    pad[:nx3, nx2:, :nx1] = log_temp_all[iy_plus][:nx3, :s_ghost, :nx1]
+    pad[:nx3, nx2:, :nx1] = _get(iy_plus)[:nx3, :s_ghost, :nx1]
     ixy = neighbors[iy_plus][0]              # +x of the +y neighbour
-    pad[:nx3, nx2:, nx1:] = log_temp_all[ixy][:nx3, :s_ghost, :s_ghost]
+    pad[:nx3, nx2:, nx1:] = _get(ixy)[:nx3, :s_ghost, :s_ghost]
 
     # ── +z ghost and its three corners ───────────────────────────────────────
     if iz_plus is not None:
-        pad[nx3:, :nx2, :nx1] = log_temp_all[iz_plus][:s_ghost, :nx2, :nx1]
+        pad[nx3:, :nx2, :nx1] = _get(iz_plus)[:s_ghost, :nx2, :nx1]
         iz_x  = neighbors[iz_plus][0]        # +x of the +z neighbour
         iz_y  = neighbors[iz_plus][1]        # +y of the +z neighbour
         iz_xy = neighbors[iz_y][0]           # +x of (+y of +z) = (+x,+y,+z) neighbour
-        pad[nx3:, :nx2, nx1:] = log_temp_all[iz_x ][:s_ghost, :nx2, :s_ghost]
-        pad[nx3:, nx2:, :nx1] = log_temp_all[iz_y ][:s_ghost, :s_ghost, :nx1]
-        pad[nx3:, nx2:, nx1:] = log_temp_all[iz_xy][:s_ghost, :s_ghost, :s_ghost]
+        pad[nx3:, :nx2, nx1:] = _get(iz_x )[:s_ghost, :nx2, :s_ghost]
+        pad[nx3:, nx2:, :nx1] = _get(iz_y )[:s_ghost, :s_ghost, :nx1]
+        pad[nx3:, nx2:, nx1:] = _get(iz_xy)[:s_ghost, :s_ghost, :s_ghost]
     else:
         # Outflow BC at +z domain boundary: replicate last real z-layer
         pad[nx3:, :nx2, :nx1] = pad[nx3 - 1:nx3, :nx2, :nx1]
@@ -669,7 +682,7 @@ def _calc_area_gpu_mb(padded_gpu, iso, nx3, nx2, nx1, s_ghost, s, dz, dy, dx):
     Parameters
     ----------
     padded_gpu : xp.ndarray  shape (nx3+s_ghost, nx2+s_ghost, nx1+s_ghost)
-    iso        : float       log10(T_peak)
+    iso        : float       log10(T_ref)
     nx3, nx2, nx1 : int      actual (unpadded) meshblock dimensions
     s_ghost    : int         ghost layer thickness used when building padded array
     s          : int         step size for this kernel call
@@ -713,9 +726,9 @@ AREA_METHOD_VERSION = {
     AREA_METHOD_SMOOTHED_INDICATOR_MC: 1,
 }
 
-def calc_area_one_step(ad, T_peak, step_size=1, n_mb_buffer=1, use_gpu=True):
+def calc_area_one_step(ad, T_ref, step_size=1, n_mb_buffer=1, use_gpu=True):
     """
-    Compute the T=T_peak isosurface area for a single step size.
+    Compute the T=T_ref isosurface area for a single step size.
 
     Uses the interface-slab optimisation to avoid reconstructing the full
     Nx3 × Nx2 × Nx1 array.  Matches the C++ `area1` (step_size=1) exactly.
@@ -723,7 +736,7 @@ def calc_area_one_step(ad, T_peak, step_size=1, n_mb_buffer=1, use_gpu=True):
     Parameters
     ----------
     ad : AthenaData
-    T_peak : float
+    T_ref : float
     step_size : int
     n_mb_buffer : int
         Extra meshblock z-levels on each side of the interface slab.
@@ -734,8 +747,8 @@ def calc_area_one_step(ad, T_peak, step_size=1, n_mb_buffer=1, use_gpu=True):
     -------
     float  Physical surface area.
     """
-    z_sel, iz_cross = find_interface_z_levels(ad, T_peak, n_buffer=n_mb_buffer)
-    _, log_slab, iso = _build_slab(ad, T_peak, z_sel)
+    z_sel, iz_cross = find_interface_z_levels(ad, T_ref, n_buffer=n_mb_buffer)
+    _, log_slab, iso = _build_slab(ad, T_ref, z_sel)
     Nz_slab = log_slab.shape[0]
 
     aug = _aug_array(log_slab)
@@ -746,7 +759,7 @@ def calc_area_one_step(ad, T_peak, step_size=1, n_mb_buffer=1, use_gpu=True):
         return _calc_area_skimage(aug, iso, ad, step_size)
 
 
-def calc_areas_all_steps(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=True,
+def calc_areas_all_steps(ad, T_ref, step_sizes=None, n_mb_buffer=1, use_gpu=True,
                          verbose=True):
     """
     Compute isosurface area for all requested step sizes on a single slab
@@ -755,7 +768,7 @@ def calc_areas_all_steps(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=Tru
     Parameters
     ----------
     ad : AthenaData
-    T_peak : float
+    T_ref : float
     step_sizes : list of int, optional
         Defaults to [1, 2, 4, 8, 16, 32, 64].
     n_mb_buffer : int
@@ -770,8 +783,8 @@ def calc_areas_all_steps(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=Tru
     if step_sizes is None:
         step_sizes = STEP_SIZES
 
-    z_sel, iz_cross = find_interface_z_levels(ad, T_peak, n_buffer=n_mb_buffer)
-    _, log_slab, iso = _build_slab(ad, T_peak, z_sel)
+    z_sel, iz_cross = find_interface_z_levels(ad, T_ref, n_buffer=n_mb_buffer)
+    _, log_slab, iso = _build_slab(ad, T_ref, z_sel)
     Nz_slab = log_slab.shape[0]
 
     if verbose:
@@ -796,7 +809,7 @@ def calc_areas_all_steps(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=Tru
     return np.asarray(step_sizes, dtype=int), areas
 
 
-def calc_area_mb_based(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=True,
+def calc_area_mb_based(ad, T_ref, step_sizes=None, n_mb_buffer=1, use_gpu=True,
                        verbose=True, mpi_manager=None):
     """
     Compute isosurface area block by block, keeping GPU memory bounded to one
@@ -812,8 +825,8 @@ def calc_area_mb_based(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=True,
 
     Parameters
     ----------
-    ad          : AthenaData  data_raw must contain 'eint' and 'dens'
-    T_peak      : float
+    ad          : AthenaData  (must support ad.data("temp", mbl, mbh))
+    T_ref      : float
     step_sizes  : list of int, optional
     n_mb_buffer : int
     use_gpu     : bool
@@ -832,7 +845,7 @@ def calc_area_mb_based(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=True,
 
     rank = mpi_manager.rank if mpi_manager is not None else 0
 
-    n_mb, nx3, nx2, nx1 = ad.data_raw['eint'].shape
+    n_mb, nx3, nx2, nx1 = ad.n_mbs, ad.nx3, ad.nx2, ad.nx1
 
     # Filter to step sizes that fit inside one meshblock and evenly divide it.
     valid_steps = []
@@ -867,7 +880,7 @@ def calc_area_mb_based(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=True,
     dz = (ad.x3max - ad.x3min) / ad.Nx3
     dy = (ad.x2max - ad.x2min) / ad.Nx2
     dx = (ad.x1max - ad.x1min) / ad.Nx1
-    iso = float(np.log10(T_peak))
+    iso = float(np.log10(T_ref))
 
     use_kernel = use_gpu and cupy_enabled and _get_module() is not None
 
@@ -878,7 +891,7 @@ def calc_area_mb_based(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=True,
 
         return calc_areas_all_steps(
             ad,
-            T_peak,
+            T_ref,
             step_sizes=valid_steps,
             n_mb_buffer=n_mb_buffer,
             use_gpu=False,
@@ -888,7 +901,7 @@ def calc_area_mb_based(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=True,
     # Identify the selected z-levels.
     z_selected, iz_cross = find_interface_z_levels(
         ad,
-        T_peak,
+        T_ref,
         n_buffer=n_mb_buffer,
     )
     slab_indices = np.where(np.isin(ad.mb_geometry[:, 4], z_selected))[0]
@@ -908,9 +921,6 @@ def calc_area_mb_based(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=True,
         )
         print(f'  Meshblock-valid step sizes: {valid_steps}')
 
-    # Precompute log10(T) for all meshblocks.
-    log_temp_all = _build_all_log_temp(ad, T_peak)
-
     # Build neighbor lookup.
     neighbors = _find_mc_neighbors(ad)
 
@@ -922,9 +932,11 @@ def calc_area_mb_based(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=True,
     n_active = 0
 
     for m in my_slab:
-        block_log = log_temp_all[m]
-
-        # Quick skip: isosurface cannot pass through this block.
+        m = int(m)
+        # Quick skip: isosurface cannot pass through this block. Fetches
+        # only this one meshblock (see _fetch_log_temp_mb), not the whole
+        # domain.
+        block_log = _fetch_log_temp_mb(ad, m)
         if block_log.max() <= iso or block_log.min() >= iso:
             continue
 
@@ -932,7 +944,7 @@ def calc_area_mb_based(ad, T_peak, step_sizes=None, n_mb_buffer=1, use_gpu=True,
 
         # Build padded CPU array, transfer once to GPU for all valid steps.
         padded = _build_padded_block(
-            log_temp_all,
+            ad,
             m,
             neighbors,
             s_ghost,
@@ -1002,8 +1014,7 @@ def _build_meshblock_lookup(ad):
     """
     Build a lookup from integer meshblock coordinates to meshblock index.
 
-    Assumes ad.data_raw['eint'] has shape:
-        (n_mbs, nx3, nx2, nx1)
+    Assumes every meshblock has shape (ad.nx3, ad.nx2, ad.nx1).
 
     Returns
     -------
@@ -1027,7 +1038,7 @@ def _build_meshblock_lookup(ad):
     return lookup
 
 
-def _sample_log_temp_global_index(ad, lookup, gk, gj, gi):
+def _sample_log_temp_global_index(ad, lookup, gk, gj, gi, mb_cache=None):
     """
     Sample log10(T) at one global cell index using BCs from ad._header.
 
@@ -1035,12 +1046,12 @@ def _sample_log_temp_global_index(ad, lookup, gk, gj, gi):
         ad._header['mesh']['ix1_bc']
         ad._header['mesh']['ix2_bc']
         ad._header['mesh']['ix3_bc']
-    """
-    gamma = ad.gamma
-    eint = ad.data_raw['eint']
-    dens = ad.data_raw['dens']
 
-    _, nx3, nx2, nx1 = eint.shape
+    `mb_cache` (optional dict) lets a caller sampling many indices reuse a
+    meshblock's data across calls instead of re-fetching it (via
+    `_fetch_temp_mb`, never `ad.data_raw`) for every single cell.
+    """
+    nx3, nx2, nx1 = ad.nx3, ad.nx2, ad.nx1
 
     periodic_x, periodic_y, periodic_z = _get_periodic_flags(ad)
 
@@ -1058,8 +1069,14 @@ def _sample_log_temp_global_index(ad, lookup, gk, gj, gi):
 
     m = lookup[(i1b, i2b, i3b)]
 
-    T = (gamma - 1.0) * float(eint[m, lk, lj, li]) / float(dens[m, lk, lj, li])
-    return float(np.log10(T))
+    if mb_cache is not None:
+        if m not in mb_cache:
+            mb_cache[m] = _fetch_temp_mb(ad, m)
+        temp_mb = mb_cache[m]
+    else:
+        temp_mb = _fetch_temp_mb(ad, m)
+
+    return float(np.log10(float(temp_mb[lk, lj, li])))
 
 
 def _get_periodic_flags(ad):
@@ -1108,7 +1125,7 @@ def _scipy_mode_tuple_for_mesh(ad):
     )
 
 
-def _build_global_phase_indicator(ad, T_peak, phase='cold', dtype=np.float32):
+def _build_global_phase_indicator(ad, T_ref, phase='cold', dtype=np.float32):
     """
     Reconstruct a full-domain phase indicator on the native grid.
 
@@ -1122,10 +1139,7 @@ def _build_global_phase_indicator(ad, T_peak, phase='cold', dtype=np.float32):
         raise ValueError(f'Unknown phase={phase!r}. Use "cold" or "hot".')
 
     mb_geo = ad.mb_geometry
-    gamma = ad.gamma
-    eint_raw = ad.data_raw['eint']
-    dens_raw = ad.data_raw['dens']
-    _, nx3_mb, nx2_mb, nx1_mb = eint_raw.shape
+    nx3_mb, nx2_mb, nx1_mb = ad.nx3, ad.nx2, ad.nx1
 
     x1_vals = np.sort(np.unique(mb_geo[:, 0]))
     x2_vals = np.sort(np.unique(mb_geo[:, 2]))
@@ -1138,11 +1152,11 @@ def _build_global_phase_indicator(ad, T_peak, phase='cold', dtype=np.float32):
         i2 = int(np.searchsorted(x2_vals, mb_geo[m, 2]))
         i3 = int(np.searchsorted(x3_vals, mb_geo[m, 4]))
 
-        temp = (gamma - 1.0) * eint_raw[m] / dens_raw[m]
+        temp = _fetch_temp_mb(ad, m)
         if phase == 'cold':
-            block = temp <= T_peak
+            block = temp <= T_ref
         else:
-            block = temp >= T_peak
+            block = temp >= T_ref
 
         indicator[
             i3*nx3_mb:(i3+1)*nx3_mb,
@@ -1153,16 +1167,18 @@ def _build_global_phase_indicator(ad, T_peak, phase='cold', dtype=np.float32):
     return indicator
 
 
-def _build_all_phase_indicator(ad, T_peak, phase='cold'):
+def _build_all_phase_indicator(ad, T_ref, phase='cold'):
     """Build a bool phase mask in the native meshblock ordering."""
     phase = str(phase).lower()
     if phase not in ('cold', 'hot'):
         raise ValueError(f'Unknown phase={phase!r}. Use "cold" or "hot".')
 
-    temp = (ad.gamma - 1.0) * ad.data_raw['eint'] / ad.data_raw['dens']
-    if phase == 'cold':
-        return np.asarray(temp <= T_peak, dtype=bool)
-    return np.asarray(temp >= T_peak, dtype=bool)
+    n_mb = ad.n_mbs
+    out = np.empty((n_mb, ad.nx3, ad.nx2, ad.nx1), dtype=bool)
+    for m in range(n_mb):
+        temp_mb = _fetch_temp_mb(ad, m)
+        out[m] = (temp_mb <= T_ref) if phase == 'cold' else (temp_mb >= T_ref)
+    return out
 
 
 def _axis_indices_with_bc(start, stop, n, periodic):
@@ -1240,14 +1256,14 @@ def _cupy_compile_hint(exc):
     )
 
 
-def calc_area_smoothed_indicator_mc(ad, T_peak, step_sizes=None, phase='cold',
+def calc_area_smoothed_indicator_mc(ad, T_ref, step_sizes=None, phase='cold',
                                     sigma_factor=1.0, verbose=True,
                                     compare_scipy=False, scan_axis='auto'):
     """
     Compute scale-dependent interface area with smoothed-indicator marching cubes.
 
     For each requested step size s, this method builds the phase indicator
-    chi = 1(T <= T_peak) by default, smooths chi with Gaussian sigma
+    chi = 1(T <= T_ref) by default, smooths chi with Gaussian sigma
     sigma_factor * s cells, and runs marching cubes on chi_smooth = 0.5.
 
     scan_axis is recorded for future streaming implementations. The current
@@ -1276,10 +1292,10 @@ def calc_area_smoothed_indicator_mc(ad, T_peak, step_sizes=None, phase='cold',
             f'scan_axis={scan_axis}, mode={mode}'
         )
 
-    indicator = _build_global_phase_indicator(ad, T_peak, phase=phase)
+    indicator = _build_global_phase_indicator(ad, T_ref, phase=phase)
 
     if compare_scipy:
-        indicator_ref = _build_global_phase_indicator(ad, T_peak, phase=phase)
+        indicator_ref = _build_global_phase_indicator(ad, T_ref, phase=phase)
         if not np.array_equal(indicator, indicator_ref):
             raise RuntimeError('Internal phase-indicator reconstruction check failed.')
 
@@ -1312,7 +1328,7 @@ def calc_area_smoothed_indicator_mc(ad, T_peak, step_sizes=None, phase='cold',
 
 def calc_area_smoothed_indicator_mc_meshblocks(
     ad,
-    T_peak,
+    T_ref,
     step_sizes=None,
     phase='cold',
     sigma_factor=1.0,
@@ -1342,7 +1358,7 @@ def calc_area_smoothed_indicator_mc_meshblocks(
 
     rank = mpi_manager.rank if mpi_manager is not None else 0
 
-    n_mb, nx3, nx2, nx1 = ad.data_raw['eint'].shape
+    n_mb, nx3, nx2, nx1 = ad.n_mbs, ad.nx3, ad.nx2, ad.nx1
     dz = (ad.x3max - ad.x3min) / ad.Nx3
     dy = (ad.x2max - ad.x2min) / ad.Nx2
     dx = (ad.x1max - ad.x1min) / ad.Nx1
@@ -1397,7 +1413,7 @@ def calc_area_smoothed_indicator_mc_meshblocks(
         step_work.append((s, sigma_cells, halo, pad_shape, work_gb))
 
     lookup = _build_meshblock_lookup(ad)
-    indicator_all = _build_all_phase_indicator(ad, T_peak, phase=phase)
+    indicator_all = _build_all_phase_indicator(ad, T_ref, phase=phase)
 
     for step_index, (s, sigma_cells, halo, pad_shape, work_gb) in enumerate(step_work):
         if rank == 0 and verbose:
@@ -1528,7 +1544,7 @@ def calc_area_smoothed_indicator_mc_meshblocks(
     return np.asarray(step_sizes, dtype=int), totals
 
 
-def _build_coarse_sampled_grid_offset(ad, T_peak, step_size,
+def _build_coarse_sampled_grid_offset(ad, T_ref, step_size,
                                       offset_k=0, offset_j=0, offset_i=0,
                                       verbose=True):
     """
@@ -1586,11 +1602,12 @@ def _build_coarse_sampled_grid_offset(ad, T_peak, step_size,
 
     coarse = np.empty((len(z_idx), len(y_idx), len(x_idx)), dtype=np.float64)
 
+    mb_cache = {}
     for kk, gk in enumerate(z_idx):
         for jj, gj in enumerate(y_idx):
             for ii, gi in enumerate(x_idx):
                 coarse[kk, jj, ii] = _sample_log_temp_global_index(
-                    ad, lookup, gk, gj, gi
+                    ad, lookup, gk, gj, gi, mb_cache=mb_cache
                 )
 
     dz = (ad.x3max - ad.x3min) / ad.Nx3
@@ -1600,7 +1617,7 @@ def _build_coarse_sampled_grid_offset(ad, T_peak, step_size,
     spacing = (s * dz, s * dy, s * dx)
 
     if verbose:
-        iso = float(np.log10(T_peak))
+        iso = float(np.log10(T_ref))
         print(
             f'  Global coarse grid step={s}, '
             f'offset=({ok},{oj},{oi}), '
@@ -1613,7 +1630,7 @@ def _build_coarse_sampled_grid_offset(ad, T_peak, step_size,
     return coarse, spacing
 
 
-def calc_area_global_coarse_sampled_offsets(ad, T_peak, step_sizes=None,
+def calc_area_global_coarse_sampled_offsets(ad, T_ref, step_sizes=None,
                                             offsets='half', verbose=True):
     """
     Compute large-step isosurface areas using offset-averaged globally sampled
@@ -1632,7 +1649,7 @@ def calc_area_global_coarse_sampled_offsets(ad, T_peak, step_sizes=None,
     ----------
     ad : AthenaData
         Loaded Athena snapshot.
-    T_peak : float
+    T_ref : float
         Temperature level defining the isosurface.
     step_sizes : list[int] or None
         Step sizes to compute. If None, uses STEP_SIZES.
@@ -1653,7 +1670,7 @@ def calc_area_global_coarse_sampled_offsets(ad, T_peak, step_sizes=None,
         step_sizes = STEP_SIZES
 
     step_sizes = [int(s) for s in step_sizes]
-    iso = float(np.log10(T_peak))
+    iso = float(np.log10(T_ref))
 
     periodic_x, periodic_y, periodic_z = _get_periodic_flags(ad)
 
@@ -1694,7 +1711,7 @@ def calc_area_global_coarse_sampled_offsets(ad, T_peak, step_sizes=None,
                 for oi in i_offsets:
                     coarse, spacing = _build_coarse_sampled_grid_offset(
                         ad,
-                        T_peak,
+                        T_ref,
                         s,
                         offset_k=ok,
                         offset_j=oj,
@@ -1795,7 +1812,7 @@ def _area_cache_metadata_matches(area_mc, requested_metadata):
     if int(area_mc.get('method_version', 1)) != int(requested_metadata['method_version']):
         return False
 
-    for key in ('T_peak', 'smoothing_sigma_factor'):
+    for key in ('T_ref', 'smoothing_sigma_factor'):
         if key in requested_metadata:
             try:
                 if not np.isclose(float(area_mc.get(key)), float(requested_metadata[key])):
@@ -1810,7 +1827,7 @@ def _area_cache_metadata_matches(area_mc, requested_metadata):
 
     return True
 
-def set_area(ad, T_peak, h5_path: str, step_sizes=None, redo=False,
+def set_area(ad, T_ref, h5_path: str, step_sizes=None, redo=False,
              n_mb_buffer=1, use_gpu=True, verbose=True,
              use_mb_based=True, use_mpi=False,
              area_method=AREA_METHOD_MARCHING_CUBES,
@@ -1845,7 +1862,7 @@ def set_area(ad, T_peak, h5_path: str, step_sizes=None, redo=False,
     requested_metadata = {
         'method': area_method,
         'method_version': AREA_METHOD_VERSION[area_method],
-        'T_peak': float(T_peak),
+        'T_ref': float(T_ref),
     }
     if area_method == AREA_METHOD_SMOOTHED_INDICATOR_MC:
         requested_metadata.update({
@@ -1914,7 +1931,7 @@ def set_area(ad, T_peak, h5_path: str, step_sizes=None, redo=False,
             print('  No missing step sizes to compute.')
         return ad.area_mc
 
-    n_mb, nx3, nx2, nx1 = ad.data_raw['eint'].shape
+    n_mb, nx3, nx2, nx1 = ad.n_mbs, ad.nx3, ad.nx2, ad.nx1
 
     if rank == 0 and verbose:
         print(
@@ -1959,7 +1976,7 @@ def set_area(ad, T_peak, h5_path: str, step_sizes=None, redo=False,
     if smooth_steps:
         s_sm, a_sm = calc_area_smoothed_indicator_mc_meshblocks(
             ad,
-            T_peak,
+            T_ref,
             step_sizes=smooth_steps,
             phase=phase,
             sigma_factor=smoothing_sigma_factor,
@@ -1978,7 +1995,7 @@ def set_area(ad, T_peak, h5_path: str, step_sizes=None, redo=False,
         if use_gpu and cupy_enabled:
             s_mb, a_mb = calc_area_mb_based(
                 ad,
-                T_peak,
+                T_ref,
                 step_sizes=mb_steps,
                 n_mb_buffer=n_mb_buffer,
                 use_gpu=True,
@@ -1988,7 +2005,7 @@ def set_area(ad, T_peak, h5_path: str, step_sizes=None, redo=False,
         else:
             s_mb, a_mb = calc_areas_all_steps(
                 ad,
-                T_peak,
+                T_ref,
                 step_sizes=mb_steps,
                 n_mb_buffer=n_mb_buffer,
                 use_gpu=use_gpu,
@@ -2008,7 +2025,7 @@ def set_area(ad, T_peak, h5_path: str, step_sizes=None, redo=False,
 
         s_gl, a_gl = calc_area_global_coarse_sampled_offsets(
             ad,
-            T_peak,
+            T_ref,
             step_sizes=global_steps,
             offsets='half',
             verbose=(verbose and rank == 0),
@@ -2021,7 +2038,7 @@ def set_area(ad, T_peak, h5_path: str, step_sizes=None, redo=False,
     if slab_steps:
         s_sl, a_sl = calc_areas_all_steps(
             ad,
-            T_peak,
+            T_ref,
             step_sizes=slab_steps,
             n_mb_buffer=n_mb_buffer,
             use_gpu=use_gpu,
@@ -2091,7 +2108,7 @@ def set_area(ad, T_peak, h5_path: str, step_sizes=None, redo=False,
             'step_sizes': merged_steps,
             'areas': merged_areas,
             'time': float(ad.time),
-            'T_peak': float(T_peak),
+            'T_ref': float(T_ref),
             'dx': dx,
             **requested_metadata,
         }
