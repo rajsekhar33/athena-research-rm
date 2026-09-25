@@ -8,7 +8,7 @@ computation. For CPU mode, Numba JIT compilation provides significant speedup
 """
 import numpy as np
 from ..core.base import xp, asnumpy, cupy_enabled
-from ..core.utils import clear_backend_memory
+from ..core.utils import build_owner_tiled_mpi_pairs, get_mpi_block_owner, maybe_trim_gpu_memory_pool
 from ..utils.meshblock_utils import is_block_outside_xyz
 from ..utils.batch_processing import determine_blocks_per_batch
 
@@ -18,6 +18,113 @@ try:
     MPI_AVAILABLE = True
 except ImportError:
     MPI_AVAILABLE = False
+
+
+def _iter_contiguous_block_runs(block_indices):
+    """Yield half-open contiguous global-index runs for sorted block indices."""
+    if not block_indices:
+        return
+
+    sorted_blocks = sorted({int(b) for b in block_indices})
+    run_start = sorted_blocks[0]
+    prev = run_start
+
+    for block_idx in sorted_blocks[1:]:
+        if block_idx == prev + 1:
+            prev = block_idx
+            continue
+        yield run_start, prev + 1
+        run_start = prev = block_idx
+
+    yield run_start, prev + 1
+
+
+def _build_pair_batches_greedy(ordered_pairs, max_blocks_per_batch):
+    """Greedily pack pairs while respecting a meshblock budget."""
+    pair_batches = []
+    pair_idx_local = 0
+    while pair_idx_local < len(ordered_pairs):
+        batch_blocks = set()
+        batch_end_idx_local = pair_idx_local
+        while (batch_end_idx_local < len(ordered_pairs)
+               and len(batch_blocks) < max_blocks_per_batch):
+            gb1_local, gb2_local = ordered_pairs[batch_end_idx_local]
+            new_blocks = {gb1_local, gb2_local} - batch_blocks
+            if (len(batch_blocks) + len(new_blocks) > max_blocks_per_batch
+                    and len(batch_blocks) > 0):
+                break
+            batch_blocks.update(new_blocks)
+            batch_end_idx_local += 1
+        pair_batches.append(
+            (ordered_pairs[pair_idx_local:batch_end_idx_local], list(batch_blocks)))
+        pair_idx_local = batch_end_idx_local
+    return pair_batches
+
+
+def _chunk_sequence(seq, chunk_size):
+    """Yield consecutive fixed-size chunks from a sorted sequence."""
+    for idx in range(0, len(seq), chunk_size):
+        yield seq[idx:idx + chunk_size]
+
+
+def _build_remote_pair_batch_groups(one_local_pairs, max_blocks_per_batch,
+                                    local_start, local_end,
+                                    total_blocks=None, mpi_size=None):
+    """Group one-local MPI pairs by local chunk and remote owner.
+
+    Each group keeps a local chunk resident while the matching remote chunks are
+    streamed through it. This avoids reloading the same local block run for each
+    remote chunk and preserves contiguous local access patterns.
+    """
+    if not one_local_pairs:
+        return []
+
+    local_budget = max(1, max_blocks_per_batch // 2)
+    remote_budget = max(1, max_blocks_per_batch - local_budget)
+
+    local_remote_map = {}
+    for gb1, gb2 in one_local_pairs:
+        if local_start <= gb1 < local_end:
+            local_block, remote_block = gb1, gb2
+        else:
+            local_block, remote_block = gb2, gb1
+        remote_map = local_remote_map.setdefault(local_block, {})
+        remote_map.setdefault(remote_block, []).append((gb1, gb2))
+
+    pair_batch_groups = []
+    local_blocks = sorted(local_remote_map)
+    for local_chunk in _chunk_sequence(local_blocks, local_budget):
+        remote_blocks_by_owner = {}
+        for local_block in local_chunk:
+            for remote_block in local_remote_map[local_block]:
+                owner = None
+                if total_blocks is not None and mpi_size is not None:
+                    owner = get_mpi_block_owner(remote_block, total_blocks, mpi_size)
+                remote_blocks_by_owner.setdefault(owner, set()).add(remote_block)
+
+        remote_batches = []
+        owner_keys = sorted(remote_blocks_by_owner, key=lambda value: (-1 if value is None else value))
+        for owner in owner_keys:
+            remote_blocks = sorted(remote_blocks_by_owner[owner])
+            for remote_chunk in _chunk_sequence(remote_blocks, remote_budget):
+                batch_pairs = []
+                for local_block in local_chunk:
+                    remote_map = local_remote_map[local_block]
+                    for remote_block in remote_chunk:
+                        batch_pairs.extend(remote_map.get(remote_block, ()))
+                if batch_pairs:
+                    remote_batches.append((batch_pairs, list(remote_chunk)))
+
+        if remote_batches:
+            pair_batch_groups.append((list(local_chunk), remote_batches))
+
+    return pair_batch_groups
+
+
+def _free_gpu_memory_pool():
+    """Release cached CuPy allocations only when free device memory gets low."""
+    if cupy_enabled:
+        maybe_trim_gpu_memory_pool()
 
 # Only define CUDA kernel if CuPy is actually being used
 if cupy_enabled:
@@ -1261,7 +1368,7 @@ def _compute_sf_cpu_vectorized(data1, data2, weight1, weight2,
     return sf, num_bin_points, weight_sum_bin
 
 def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=100, log_bin_flag=True, 
-           nsamples_block_min=1000, debug=False):
+           nsamples_block_min=1000, debug=False, weight_support_rescaling=False):
     """
     Calculate structure functions for a given field using GPU acceleration.
     
@@ -1533,7 +1640,7 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
                 # When MPI is needed, set_sf automatically calls get_sf_mb instead
                 # Use deterministic seed matching GPU: idx * 1013904223, wrapped
                 # to uint32 range (matches the GPU kernel's native uint32 wraparound).
-                cpu_seed = int((idx * 1013904223) % (2**32))
+                cpu_seed = int((int(idx) * 1013904223) % (2**32))
                 sf_cpu, num_cpu, weights_cpu = _compute_sf_cpu_vectorized(
                     data1_cpu, data2_cpu,
                     weight1_cpu, weight2_cpu,
@@ -1556,7 +1663,7 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
                 # Launch kernel with deterministic base seed
                 # Use idx (block pair index) as base seed for reproducibility,
                 # wrapped to uint32 range to match the kernel's native arithmetic.
-                base_seed = np.uint32((idx * 1013904223) % (2**32))
+                base_seed = np.uint32((int(idx) * 1013904223) % (2**32))
                 structure_function_kernel(
                     (blockspergrid,), (threadsperblock,),
                     (data1, data2,
@@ -1572,8 +1679,9 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
                     periodic_x, periodic_y, periodic_z,
                     base_seed))
                     
-                # Synchronize after kernel launch
-                xp.cuda.Stream.null.synchronize()
+                # Keep the hot path asynchronous unless debug asks for eager synchronization.
+                if debug:
+                    xp.cuda.Stream.null.synchronize()
         
         if debug:
             print(f"Debug: Completed processing all block pairs")
@@ -1599,7 +1707,7 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
 
 
 def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=100, log_bin_flag=True, 
-            nsamples_block_min=1000, sparse_data=False, debug=False, simultaneous_blocks=None, mpi_manager=None):
+            nsamples_block_min=1000, sparse_data=False, debug=False, simultaneous_blocks=None, mpi_manager=None, weight_support_rescaling=False):
     """
     Calculate structure functions for multiple variables using GPU acceleration with optimized batch processing.
     
@@ -1714,6 +1822,12 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
     n_weights = len(weights_list)
     if debug and rank == 0:
         print(f"[DEBUG get_sf_mb] Processing {n_weights} weight schemes: {weights_list}")
+
+    if weight_support_rescaling and not sparse_data:
+        weight_sampling_scales = _compute_weight_support_rescaling_factors(
+            ad, weights_list, xyzlim=xyz, mpi_manager=mpi_manager, debug=(debug and rank == 0))
+    else:
+        weight_sampling_scales = {weight_name: 1.0 for weight_name in weights_list}
     
     # Validate and adjust max_order
     if max_order > 10:
@@ -1791,6 +1905,7 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
     
     # Block cache to store loaded data
     block_cache = {}
+    pair_workspace = _allocate_isotropic_sf_pair_workspace(no_vars, max_order, nbins, array_module=xp)
     
     # Determine if we're using MPI
     use_mpi = mpi_manager is not None
@@ -1809,13 +1924,13 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
             print(f"Debug: Rank {mpi_manager.rank}: All ranks synchronized")
         
         total_global_blocks = ad.n_mbs
+        total_global_pairs = (total_global_blocks * (total_global_blocks + 1)) // 2
+
         if debug:
-            total_pairs = total_global_blocks * (total_global_blocks + 1) // 2
-            print(f"Debug: Rank {mpi_manager.rank}: Total global pairs: {total_pairs}")
-        
-        # Distribute pairs across ranks using round-robin without building the full global pair list.
-        my_pairs = _build_rank_assigned_pairs(
-            total_global_blocks, mpi_manager.rank, mpi_manager.size)
+            print(f"Debug: Rank {mpi_manager.rank}: Total global pairs: {total_global_pairs}")
+
+        my_pairs = build_owner_tiled_mpi_pairs(
+            total_global_blocks, mpi_manager.size, mpi_manager.rank)
         
         if debug:
             print(f"Debug: Rank {mpi_manager.rank}: Assigned {len(my_pairs)} pairs to process")
@@ -1829,7 +1944,8 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
                           rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                           n_samples1, n_points_per_block, nsamples_block_min,
                           periodic_x, periodic_y, periodic_z, sparse_data, xyzlim=xyz,
-                          mpi_manager=mpi_manager, mb_offset=mb_offset, debug=debug)
+                          mpi_manager=mpi_manager, mb_offset=mb_offset, debug=debug,
+                          pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
     else:
         # NON-MPI MODE: Process local blocks only
         # Process blocks in batches
@@ -1850,7 +1966,8 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
                                 block_centers, rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                                 n_samples1, n_points_per_block, nsamples_block_min, 
                                 periodic_x, periodic_y, periodic_z, sparse_data, xyzlim=xyz, 
-                                use_mpi=False, mpi_manager=None, mb_offset=0)
+                                use_mpi=False, mpi_manager=None, mb_offset=0,
+                                pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
         if debug:
             print(f"Debug: Completed batch pair processing")
     
@@ -1892,7 +2009,8 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
                                         block_centers, rmax, rmin, Lx, Ly, Lz, rbins, 
                                         nbins, max_order, n_samples1, n_points_per_block, 
                                         nsamples_block_min, periodic_x, periodic_y, periodic_z, 
-                                        sparse_data, xyzlim=xyz, debug=debug)
+                                        sparse_data, xyzlim=xyz, debug=debug,
+                                        pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
                 if debug:
                     print(f"Debug: Completed processing missed pairs")
     
@@ -1925,14 +2043,9 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
         weight_sum_bin_np = asnumpy(weight_sum_bin)
         
         # Sum results across all ranks
-        sf_total = mpi_manager.reduce(sf_np, op='sum', root=0)
-        num_bin_points_total = mpi_manager.reduce(num_bin_points_np, op='sum', root=0)
-        weight_sum_bin_total = mpi_manager.reduce(weight_sum_bin_np, op='sum', root=0)
-        
-        # Broadcast aggregated results to all ranks
-        sf_total = mpi_manager.broadcast(sf_total, root=0)
-        num_bin_points_total = mpi_manager.broadcast(num_bin_points_total, root=0)
-        weight_sum_bin_total = mpi_manager.broadcast(weight_sum_bin_total, root=0)
+        sf_total = mpi_manager.allreduce(sf_np, op='sum')
+        num_bin_points_total = mpi_manager.allreduce(num_bin_points_np, op='sum')
+        weight_sum_bin_total = mpi_manager.allreduce(weight_sum_bin_np, op='sum')
         
         # Convert back to GPU arrays if using CuPy
         sf = xp.asarray(sf_total)
@@ -1945,202 +2058,281 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
     if debug:
         print(f"Debug: Total points in bins: {num_bin_points.sum()}")
     return r_, sf, weight_sum_bin, xp.array(num_bin_points, dtype=int)
-
 def _process_mpi_pairs(ad, my_pairs, block_cache, weights_list, varlist,
                       sf, num_bin_points, weight_sum_bin,
                       rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                       n_samples1, n_points_per_block, nsamples_block_min,
                       periodic_x, periodic_y, periodic_z, sparse_data=False, xyzlim=None,
-                      mpi_manager=None, mb_offset=0, debug=False):
+                      mpi_manager=None, mb_offset=0, debug=False, pair_workspace=None,
+                      weight_sampling_scales=None):
     """
     Process assigned block pairs in MPI mode with memory-efficient batching.
-    
+
     PAIR COVERAGE GUARANTEE:
     - Caller generates ALL pairs (i,j) where 0 <= i <= j < n_mbs
     - Pairs are distributed round-robin: rank r processes pairs where idx % size == r
     - This ensures every pair is processed by exactly one rank
     - Results from all ranks are aggregated via MPI reduce after processing
-    
+
     MEMORY MANAGEMENT:
     - Pairs processed in batches sized by determine_blocks_per_batch()
     - Batch size calculated from actual GPU/CPU memory and block dimensions
     - Blocks loaded/unloaded per batch to respect memory constraints
-    
+
     OPTIMIZATION:
     - Pairs reordered to minimize remote block fetching:
       1. Both blocks local (no MPI needed)
       2. One block local (minimal MPI)
       3. Both blocks remote (maximum MPI)
     """
+    def _build_pair_batches(ordered_pairs, max_blocks_per_batch):
+        return _build_pair_batches_greedy(ordered_pairs, max_blocks_per_batch)
+
     rank = mpi_manager.rank if mpi_manager else 0
-    size = mpi_manager.size if mpi_manager else 1
-    
+
     if debug:
         print(f"Debug: Rank {rank}: Processing {len(my_pairs)} assigned pairs")
-    
-    # Get local block range for this rank
+
     local_start = mb_offset
-    # Calculate number of local meshblocks
     if hasattr(ad, 'has_full_data') and not ad.has_full_data:
         nmbs_local = ad.local_mb_end - ad.local_mb_start
     else:
         nmbs_local = ad.n_mbs
     local_end = mb_offset + nmbs_local
-    
+
     if debug:
         print(f"Debug: Rank {rank}: Local blocks [{local_start}, {local_end})")
-    
-    # DON'T filter pairs - process ALL assigned pairs
-    # We'll load remote blocks via MPI as needed
-    
-    # Compute block centers for ALL GLOBAL blocks (needed for sampling weights)
-    # Each rank computes this independently - no communication needed
+
     block_centers_global = np.zeros((ad.n_mbs, 3))
     full_geometry = ad.mb_geometry[:ad.n_mbs, :]
     block_centers_global[:, 0] = 0.5 * (full_geometry[:, 0] + full_geometry[:, 1])
     block_centers_global[:, 1] = 0.5 * (full_geometry[:, 2] + full_geometry[:, 3])
     block_centers_global[:, 2] = 0.5 * (full_geometry[:, 4] + full_geometry[:, 5])
-    
+
     if debug:
         print(f"Debug: Rank {rank}: Created global block_centers with shape {block_centers_global.shape}")
-        if debug:
-            print(f"Debug: Rank {rank}: Processing {len(my_pairs)} assigned pairs (including remote blocks)")
-    
-    # Determine batch size based on actual memory and block size
-    # Use same memory estimation as non-MPI version
+        print(f"Debug: Rank {rank}: Processing {len(my_pairs)} assigned pairs (including remote blocks)")
+
     from athena_research.utils.batch_processing import determine_blocks_per_batch
-    
-    # Calculate blocks per batch based on memory
+
     blocks_per_batch = determine_blocks_per_batch(ad.n_mbs, len(varlist) * 3, len(weights_list), n_points_per_block)
-    
+
     if debug:
         print(f"Debug: Rank {rank}: Calculated blocks_per_batch={blocks_per_batch} based on memory constraints")
-    
-    # Get all unique blocks needed by this rank
+
     all_blocks_needed = set()
     for global_b1, global_b2 in my_pairs:
         all_blocks_needed.add(global_b1)
         all_blocks_needed.add(global_b2)
-    
-    # Separate local vs remote blocks
+
     local_blocks = [b for b in all_blocks_needed if local_start <= b < local_end]
     remote_blocks = [b for b in all_blocks_needed if b < local_start or b >= local_end]
-    
+
     if debug:
         print(f"Debug: Rank {rank}: Need {len(local_blocks)} local and {len(remote_blocks)} remote blocks")
-    
-    # Optimize pair ordering: prioritize pairs with both blocks local,
-    # then pairs with one local block, then pairs with both remote
-    # This minimizes remote block fetching per batch
+
     pairs_by_locality = {
         'both_local': [],
         'one_local': [],
         'both_remote': []
     }
-    
+
     for global_b1, global_b2 in my_pairs:
         b1_local = (local_start <= global_b1 < local_end)
         b2_local = (local_start <= global_b2 < local_end)
-        
+
         if b1_local and b2_local:
             pairs_by_locality['both_local'].append((global_b1, global_b2))
         elif b1_local or b2_local:
             pairs_by_locality['one_local'].append((global_b1, global_b2))
         else:
             pairs_by_locality['both_remote'].append((global_b1, global_b2))
-    
-    # Reorder pairs to process local-heavy batches first
-    optimized_pairs = (pairs_by_locality['both_local'] + 
-                      pairs_by_locality['one_local'] + 
-                      pairs_by_locality['both_remote'])
-    
+
+    local_only_pairs = pairs_by_locality['both_local']
+    total_pairs = len(my_pairs)
+
     if debug:
-        print(f"Debug: Rank {rank}: Pair locality - both_local:{len(pairs_by_locality['both_local'])}, "
-              f"one_local:{len(pairs_by_locality['one_local'])}, both_remote:{len(pairs_by_locality['both_remote'])}")
-    
-    
-    # Process pairs in batches
+        print(
+            f"Debug: Rank {rank}: Pair locality - both_local:{len(pairs_by_locality['both_local'])}, "
+            f"one_local:{len(pairs_by_locality['one_local'])}, both_remote:{len(pairs_by_locality['both_remote'])}"
+        )
+
     pairs_processed = 0
-    pair_idx = 0
-    
-    while pair_idx < len(optimized_pairs):
-        # Determine blocks needed for this batch of pairs
-        batch_blocks_needed = set()
-        batch_end_idx = pair_idx
-        
-        # Greedily add pairs to batch until we hit memory limit
-        while batch_end_idx < len(optimized_pairs) and len(batch_blocks_needed) < blocks_per_batch:
-            global_b1, global_b2 = optimized_pairs[batch_end_idx]
-            
-            # Check if adding this pair would exceed batch size
-            new_blocks = set()
-            if global_b1 not in block_cache:
-                new_blocks.add(global_b1)
-            if global_b2 not in block_cache:
-                new_blocks.add(global_b2)
-            
-            # If this would exceed limit and we already have some blocks, stop
-            if len(batch_blocks_needed) + len(new_blocks) > blocks_per_batch and len(batch_blocks_needed) > 0:
-                break
-            
-            batch_blocks_needed.update(new_blocks)
-            batch_end_idx += 1
-        
-        # Extract batch pairs
-        batch_pairs = optimized_pairs[pair_idx:batch_end_idx]
-        
+    local_pair_batches = _build_pair_batches(local_only_pairs, blocks_per_batch)
+
+    if debug:
+        print(f"Debug: Rank {rank}: Local-only batches={len(local_pair_batches)}")
+
+    for batch_idx, (batch_pairs, batch_blocks_needed) in enumerate(local_pair_batches, start=1):
         if debug:
-            print(f"Debug: Rank {rank}: Processing batch with {len(batch_blocks_needed)} blocks, {len(batch_pairs)} pairs")
-        
-        # Load blocks for this batch
-        if batch_blocks_needed:
-            _load_all_blocks_upfront(ad, block_cache, list(batch_blocks_needed),
-                                    weights_list, varlist, 
-                                    local_start, local_end, xyzlim, mpi_manager, debug=False)
-        
-        # Process all pairs in this batch
+            print(
+                f"Debug: Rank {rank}: Processing local-only batch {batch_idx}/{len(local_pair_batches)} "
+                f"with {len(batch_blocks_needed)} blocks, {len(batch_pairs)} pairs"
+            )
+
+        _load_all_blocks_upfront(
+            ad, block_cache, batch_blocks_needed,
+            weights_list, varlist,
+            local_start, local_end, xyzlim, mpi_manager, debug=False,
+            exchange_remote=False
+        )
+
         for global_b1, global_b2 in batch_pairs:
             if debug and pairs_processed % 10 == 0:
-                if debug:
-                    print(f"Debug: Rank {rank}: Processing pair {pairs_processed}/{len(optimized_pairs)}: ({global_b1}, {global_b2})")
-            
-            # Check if blocks are outside xyz limits
+                print(
+                    f"Debug: Rank {rank}: Processing pair {pairs_processed}/{total_pairs}: "
+                    f"({global_b1}, {global_b2})"
+                )
+
             if xyzlim is not None:
-                if is_block_outside_xyz(ad.mb_geometry, global_b1, xyzlim) or \
-                   is_block_outside_xyz(ad.mb_geometry, global_b2, xyzlim):
+                if (is_block_outside_xyz(ad.mb_geometry, global_b1, xyzlim)
+                        or is_block_outside_xyz(ad.mb_geometry, global_b2, xyzlim)):
                     continue
-            
-            # Verify both blocks are loaded
+
             if global_b1 not in block_cache or global_b2 not in block_cache:
                 if debug:
-                    print(f"Debug: Rank {rank}: Warning - blocks ({global_b1}, {global_b2}) not in cache, skipping")
+                    print(
+                        f"Debug: Rank {rank}: Warning - blocks ({global_b1}, {global_b2}) not in cache, skipping"
+                    )
                 continue
-        
-            # Process the pair using GLOBAL indices
-            _process_block_pair(ad, global_b1, global_b2, block_cache, block_centers_global,
-                               weights_list, varlist, sf, num_bin_points, weight_sum_bin,
-                               rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
-                               n_samples1, n_points_per_block, nsamples_block_min,
-                               periodic_x, periodic_y, periodic_z, sparse_data, debug=False, use_mpi=True)
-            
+
+            _process_block_pair(
+                ad, global_b1, global_b2, block_cache, block_centers_global,
+                weights_list, varlist, sf, num_bin_points, weight_sum_bin,
+                rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
+                n_samples1, n_points_per_block, nsamples_block_min,
+                periodic_x, periodic_y, periodic_z, sparse_data, debug=False, use_mpi=True,
+                pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
+
             pairs_processed += 1
-        
-        # Clear cache for this batch to free memory
+
         for block_id in batch_blocks_needed:
             if block_id in block_cache:
                 del block_cache[block_id]
-        
+
+        _free_gpu_memory_pool()
+
         if debug:
-            print(f"Debug: Rank {rank}: Batch complete, cleared {len(batch_blocks_needed)} blocks, processed {pairs_processed}/{len(optimized_pairs)} pairs so far")
-        
-        # Move to next batch
-        pair_idx = batch_end_idx
-    
+            print(
+                f"Debug: Rank {rank}: Local-only batch complete, cleared {len(batch_blocks_needed)} blocks, "
+                f"processed {pairs_processed}/{total_pairs} pairs so far"
+            )
+
+    remote_pair_batch_groups = _build_remote_pair_batch_groups(
+        pairs_by_locality['one_local'],
+        blocks_per_batch,
+        local_start, local_end,
+        total_blocks=ad.n_mbs, mpi_size=mpi_manager.size)
+    # Round-robin assignment can place both blocks on other ranks. Stream
+    # those pairs too; omitting them silently loses valid contributions.
+    both_remote_batches = _build_pair_batches_greedy(
+        pairs_by_locality['both_remote'], max(2, blocks_per_batch))
+    if both_remote_batches:
+        remote_pair_batch_groups.append(([], both_remote_batches))
+    max_group_count = int(mpi_manager.allreduce(len(remote_pair_batch_groups), op='max'))
+
+    if debug:
+        print(
+            f"Debug: Rank {rank}: Remote groups={len(remote_pair_batch_groups)}, "
+            f"synchronized max_groups={max_group_count}"
+        )
+
+    for group_idx in range(max_group_count):
+        if group_idx < len(remote_pair_batch_groups):
+            local_group_blocks, remote_batches = remote_pair_batch_groups[group_idx]
+        else:
+            local_group_blocks, remote_batches = [], []
+
+        if local_group_blocks:
+            _load_all_blocks_upfront(
+                ad, block_cache, local_group_blocks,
+                weights_list, varlist,
+                local_start, local_end, xyzlim, mpi_manager, debug=False,
+                exchange_remote=False
+            )
+
+        max_remote_batch_count = int(mpi_manager.allreduce(len(remote_batches), op='max'))
+        if debug:
+            print(
+                f"Debug: Rank {rank}: Remote group {group_idx + 1}/{max_group_count} uses "
+                f"{len(local_group_blocks)} local blocks and {len(remote_batches)} remote chunks"
+            )
+
+        for remote_batch_idx in range(max_remote_batch_count):
+            if remote_batch_idx < len(remote_batches):
+                batch_pairs, remote_blocks_needed = remote_batches[remote_batch_idx]
+            else:
+                batch_pairs, remote_blocks_needed = [], []
+
+            if debug:
+                print(
+                    f"Debug: Rank {rank}: Processing remote chunk {remote_batch_idx + 1}/{max_remote_batch_count} "
+                    f"with {len(remote_blocks_needed)} remote blocks and {len(batch_pairs)} pairs"
+                )
+
+            _load_all_blocks_upfront(
+                ad, block_cache, remote_blocks_needed,
+                weights_list, varlist,
+                local_start, local_end, xyzlim, mpi_manager, debug=False,
+                exchange_remote=True
+            )
+
+            for global_b1, global_b2 in batch_pairs:
+                if debug and pairs_processed % 10 == 0:
+                    print(
+                        f"Debug: Rank {rank}: Processing pair {pairs_processed}/{total_pairs}: "
+                        f"({global_b1}, {global_b2})"
+                    )
+
+                if xyzlim is not None:
+                    if (is_block_outside_xyz(ad.mb_geometry, global_b1, xyzlim)
+                            or is_block_outside_xyz(ad.mb_geometry, global_b2, xyzlim)):
+                        continue
+
+                if global_b1 not in block_cache or global_b2 not in block_cache:
+                    if debug:
+                        print(
+                            f"Debug: Rank {rank}: Warning - blocks ({global_b1}, {global_b2}) not in cache, skipping"
+                        )
+                    continue
+
+                _process_block_pair(
+                    ad, global_b1, global_b2, block_cache, block_centers_global,
+                    weights_list, varlist, sf, num_bin_points, weight_sum_bin,
+                    rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
+                    n_samples1, n_points_per_block, nsamples_block_min,
+                    periodic_x, periodic_y, periodic_z, sparse_data, debug=False, use_mpi=True,
+                    pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales
+                )
+
+                pairs_processed += 1
+
+            for block_id in remote_blocks_needed:
+                if block_id in block_cache:
+                    del block_cache[block_id]
+
+            _free_gpu_memory_pool()
+
+        for block_id in local_group_blocks:
+            if block_id in block_cache:
+                del block_cache[block_id]
+
+        _free_gpu_memory_pool()
+
+        if debug:
+            print(
+                f"Debug: Rank {rank}: Remote group complete, cleared {len(local_group_blocks)} local blocks, "
+                f"processed {pairs_processed}/{total_pairs} pairs so far"
+            )
+
     if debug:
         print(f"Debug: Rank {rank}: Completed processing all {pairs_processed} assigned pairs")
+        print(f"Debug: Rank {mpi_manager.rank}: Completed processing all {pairs_processed} assigned pairs")
+
 
 def _load_all_blocks_upfront(ad, block_cache, blocks_needed, weights_list, varlist,
-                             local_start, local_end, xyzlim, mpi_manager, debug=False):
+                             local_start, local_end, xyzlim, mpi_manager, debug=False,
+                             exchange_remote=True):
     """
     Load ALL blocks needed upfront in ONE collective MPI operation.
     
@@ -2155,10 +2347,49 @@ def _load_all_blocks_upfront(ad, block_cache, blocks_needed, weights_list, varli
     if debug:
         print(f"Debug: Rank {rank}: Loading {len(local_blocks)} local, {len(remote_blocks)} remote blocks")
     
-    _load_local_blocks_into_cache(
-        ad, block_cache, local_blocks, weights_list, varlist, xyzlim,
-        cast_to_float=True)
-    
+    # Load local blocks using contiguous runs only, not the full enclosing span.
+    if local_blocks:
+        region_status_map = _prepare_xyz_block_regions(
+            ad, local_blocks, xyzlim)
+
+        for global_mbl, global_mbh in _iter_contiguous_block_runs(local_blocks):
+            weight_data_dict = {}
+            for weight_name in weights_list:
+                weight_data_dict[weight_name] = (
+                    ad.data(weight_name, global_mbl, global_mbh)
+                    if isinstance(weight_name, str) else weight_name)
+
+            var_data_dict = {}
+            for var_name in varlist:
+                var_data_dict[var_name] = (
+                    ad.data(var_name, global_mbl, global_mbh)
+                    if isinstance(var_name, str) else var_name)
+
+            for global_b in range(global_mbl, global_mbh):
+                array_idx = global_b - global_mbl
+                region_status = region_status_map[global_b]
+                region_status, region_trimmed, coords_block, weights_block, vars_block = (
+                    _extract_xyz_region_block_data(
+                        ad.mb_geometry[global_b],
+                        weight_data_dict[weights_list[0]][array_idx].shape,
+                        {weight_name: weight_data_dict[weight_name][array_idx]
+                         for weight_name in weights_list},
+                        {var_name: var_data_dict[var_name][array_idx]
+                         for var_name in varlist},
+                        region_status, xyzlim))
+
+                block_cache[global_b] = _finalize_block_cache_entry(
+                    coords_block, region_status, region_trimmed,
+                    weights_block, vars_block,
+                    weights_list, varlist)
+
+    if not exchange_remote or mpi_manager is None:
+        return
+
+    remote_request_count = int(mpi_manager.allreduce(len(remote_blocks), op='sum'))
+    if remote_request_count == 0:
+        return
+
     # Exchange remote blocks via MPI (all ranks participate together)
     _exchange_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, varlist,
                                 local_start, local_end, xyzlim, mpi_manager, debug)
@@ -2178,9 +2409,41 @@ def _load_blocks_for_mpi_pair(ad, block_cache, blocks_needed, weights_list, varl
         if debug:
             print(f"Debug: Rank {mpi_manager.rank}: Loading {len(local_blocks)} local blocks, {len(remote_blocks)} remote blocks")
     
-    _load_local_blocks_into_cache(
-        ad, block_cache, local_blocks, weights_list, varlist, xyzlim,
-        cast_to_float=False)
+    # Load local blocks using contiguous runs only, not the full enclosing span.
+    if local_blocks:
+        region_status_map = _prepare_xyz_block_regions(
+            ad, local_blocks, xyzlim)
+
+        for global_mbl, global_mbh in _iter_contiguous_block_runs(local_blocks):
+            weight_data_dict = {}
+            for weight_name in weights_list:
+                weight_data_dict[weight_name] = (
+                    ad.data(weight_name, global_mbl, global_mbh)
+                    if isinstance(weight_name, str) else weight_name)
+
+            var_data_dict = {}
+            for var_name in varlist:
+                var_data_dict[var_name] = (
+                    ad.data(var_name, global_mbl, global_mbh)
+                    if isinstance(var_name, str) else var_name)
+
+            for global_b in range(global_mbl, global_mbh):
+                array_idx = global_b - global_mbl
+                region_status = region_status_map[global_b]
+                region_status, region_trimmed, coords_block, weights_block, vars_block = (
+                    _extract_xyz_region_block_data(
+                        ad.mb_geometry[global_b],
+                        weight_data_dict[weights_list[0]][array_idx].shape,
+                        {weight_name: weight_data_dict[weight_name][array_idx]
+                         for weight_name in weights_list},
+                        {var_name: var_data_dict[var_name][array_idx]
+                         for var_name in varlist},
+                        region_status, xyzlim))
+
+                block_cache[global_b] = _finalize_block_cache_entry(
+                    coords_block, region_status, region_trimmed,
+                    weights_block, vars_block,
+                    weights_list, varlist)
     
     # Load remote blocks via MPI if any
     if remote_blocks:
@@ -2192,11 +2455,10 @@ def _exchange_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, va
     """
     Exchange remote blocks using MPI with proper synchronization to avoid deadlock.
     """
+    from ..core.base import asnumpy
+
     rank = mpi_manager.rank
     size = mpi_manager.size
-    
-    # Synchronize before starting MPI communication
-    mpi_manager.comm.Barrier()
     
     # Determine block ownership
     mbs_per_rank = ad.n_mbs // size
@@ -2225,9 +2487,6 @@ def _exchange_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, va
     # All ranks gather everyone's requests
     all_requests = mpi_manager.comm.allgather(my_requests)
     
-    # Synchronize after allgather
-    mpi_manager.comm.Barrier()
-    
     # Prepare data that other ranks need from me
     blocks_to_send = {}
     for requesting_rank, their_requests in enumerate(all_requests):
@@ -2239,66 +2498,62 @@ def _exchange_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, va
             print(f"Debug: Rank {mpi_manager.rank}: Sending {sum(len(v) for v in blocks_to_send.values())} blocks to {len(blocks_to_send)} ranks")
     
     # Prepare data for blocks I own
-    owned_blocks_requested = sorted({
-        block_idx
-        for block_list in blocks_to_send.values()
-        for block_idx in block_list
-        if local_start <= block_idx < local_end
-    })
-    serialized_blocks = _build_serialized_block_payloads(
-        ad, owned_blocks_requested, weights_list, varlist, xyzlim)
     data_to_send = {}
     for dest_rank, block_list in blocks_to_send.items():
-        data_to_send[dest_rank] = {
-            block_idx: serialized_blocks[block_idx]
-            for block_idx in block_list
-            if block_idx in serialized_blocks
-        }
+        data_to_send[dest_rank] = {}
+
+        my_blocks = [b for b in block_list if local_start <= b < local_end]
+
+        if my_blocks:
+            region_status_map = _prepare_xyz_block_regions(
+                ad, my_blocks, xyzlim)
+
+            for global_mbl, global_mbh in _iter_contiguous_block_runs(my_blocks):
+                weight_data_dict = {}
+                for weight_name in weights_list:
+                    weight_data_dict[weight_name] = (
+                        ad.data(weight_name, global_mbl, global_mbh)
+                        if isinstance(weight_name, str) else weight_name)
+
+                var_data_dict = {}
+                for var_name in varlist:
+                    var_data_dict[var_name] = (
+                        ad.data(var_name, global_mbl, global_mbh)
+                        if isinstance(var_name, str) else var_name)
+
+                for global_b in range(global_mbl, global_mbh):
+                    array_idx = global_b - global_mbl
+                    region_status = region_status_map[global_b]
+                    region_status, region_trimmed, coords_block, weights_block, vars_block = (
+                        _extract_xyz_region_block_data(
+                            ad.mb_geometry[global_b],
+                            weight_data_dict[weights_list[0]][array_idx].shape,
+                            {weight_name: weight_data_dict[weight_name][array_idx]
+                             for weight_name in weights_list},
+                            {var_name: var_data_dict[var_name][array_idx]
+                             for var_name in varlist},
+                            region_status, xyzlim))
+
+                    block_data = {
+                        'weights': {},
+                        'vars': {}
+                    }
+
+                    for weight_name in weights_list:
+                        block_data['weights'][weight_name] = asnumpy(weights_block[weight_name])
+
+                    for var_name in varlist:
+                        block_data['vars'][var_name] = asnumpy(vars_block[var_name])
+
+                    data_to_send[dest_rank][global_b] = block_data
     
-    # Synchronize before communication
-    mpi_manager.comm.Barrier()
-    
-    # Use coordinated send/recv to avoid deadlock
-    # Strategy: lower-ranked processes send first, higher-ranked receive first
-    received_data_all = {}
-    
-    for other_rank in range(size):
-        if other_rank == rank:
-            continue
-        
-        # Determine send/recv order based on rank ordering
-        if rank < other_rank:
-            # Lower rank sends first, then receives
-            if other_rank in data_to_send:
-                mpi_manager.comm.send(data_to_send[other_rank], dest=other_rank, tag=1000 + rank)
-            if other_rank in my_requests:
-                received_data = mpi_manager.comm.recv(source=other_rank, tag=1000 + other_rank)
-                received_data_all.update(received_data)
-        else:
-            # Higher rank receives first, then sends
-            if other_rank in my_requests:
-                received_data = mpi_manager.comm.recv(source=other_rank, tag=1000 + other_rank)
-                received_data_all.update(received_data)
-            if other_rank in data_to_send:
-                mpi_manager.comm.send(data_to_send[other_rank], dest=other_rank, tag=1000 + rank)
-    
-    # Store received data in cache, converting to GPU arrays if needed
+    received_data_all = _exchange_chunked_block_payloads(
+        mpi_manager, my_requests, data_to_send, tag_base=1000)
+
+    # Store received data in cache, rebuilding coordinates from geometry locally
     for global_b, block_data in received_data_all.items():
-        # Convert numpy arrays to appropriate backend (GPU/CPU)
-        block_cache[global_b] = {
-            'coords': {
-                'x': xp.asarray(block_data['coords']['x'], dtype=xp.float64),
-                'y': xp.asarray(block_data['coords']['y'], dtype=xp.float64),
-                'z': xp.asarray(block_data['coords']['z'], dtype=xp.float64)
-            },
-            'xyz_region_status': block_data.get('xyz_region_status', 'inside'),
-            'xyz_region_trimmed': block_data.get('xyz_region_trimmed', False),
-            'weights': {k: xp.asarray(v, dtype=xp.float64) for k, v in block_data['weights'].items()},
-            'vars': {k: xp.asarray(v, dtype=xp.float64) for k, v in block_data['vars'].items()}
-        }
-    
-    # Final synchronization
-    mpi_manager.comm.Barrier()
+        block_cache[global_b] = _rebuild_remote_block_cache_entry(
+            ad, global_b, block_data, xyzlim)
     
     if debug:
         print(f"Debug: Rank {mpi_manager.rank}: MPI block exchange completed")
@@ -2308,7 +2563,8 @@ def _process_batch_pairs(ad, batches, block_cache, processed_pairs, weights_list
                     block_centers, rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                     n_samples1, n_points_per_block, nsamples_block_min, 
                     periodic_x, periodic_y, periodic_z, sparse_data=False, xyzlim=None, debug=False, 
-                    use_mpi=False, mpi_manager=None, mb_offset=0):
+                    use_mpi=False, mpi_manager=None, mb_offset=0, pair_workspace=None,
+                    weight_sampling_scales=None):
     """
     Helper function to process batch pairs for structure functions.
     
@@ -2379,7 +2635,8 @@ def _process_batch_pairs(ad, batches, block_cache, processed_pairs, weights_list
                                         sf, num_bin_points, weight_sum_bin, 
                                         rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                                         n_samples1, n_points_per_block, nsamples_block_min,
-                                        periodic_x, periodic_y, periodic_z, sparse_data, use_mpi=use_mpi)
+                                        periodic_x, periodic_y, periodic_z, sparse_data, use_mpi=use_mpi,
+                                        pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
                     processed_pairs.add(pair)
         
         # Process cross-batch pairs
@@ -2415,7 +2672,8 @@ def _process_batch_pairs(ad, batches, block_cache, processed_pairs, weights_list
                                             sf, num_bin_points, weight_sum_bin, 
                                             rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                                             n_samples1, n_points_per_block, nsamples_block_min,
-                                            periodic_x, periodic_y, periodic_z, sparse_data, use_mpi=use_mpi)
+                                            periodic_x, periodic_y, periodic_z, sparse_data, use_mpi=use_mpi,
+                                            pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
                         processed_pairs.add(pair)
             
             # Clear batch2 data from cache
@@ -2429,9 +2687,7 @@ def _process_batch_pairs(ad, batches, block_cache, processed_pairs, weights_list
                 del block_cache[b]
         
         # Clean up GPU memory
-        if cupy_enabled:
-            xp.cuda.Stream.null.synchronize()
-            xp.get_default_memory_pool().free_all_blocks()
+        _free_gpu_memory_pool()
 
 
 def _load_batch_data(ad, block_cache, batch_blocks, weights_list, varlist, xyzlim=None, 
@@ -2487,9 +2743,43 @@ def _load_batch_data(ad, block_cache, batch_blocks, weights_list, varlist, xyzli
         local_blocks = blocks_to_load
         remote_blocks = []
     
-    _load_local_blocks_into_cache(
-        ad, block_cache, local_blocks, weights_list, varlist, xyzlim,
-        cast_to_float=True)
+    # Load local blocks. Keep the active batch on the GPU, but only load
+    # the exact contiguous runs needed by this batch instead of the full
+    # min-to-max enclosing span.
+    if local_blocks:
+        region_status_map = _prepare_xyz_block_regions(
+            ad, local_blocks, xyzlim)
+
+        for global_mbl, global_mbh in _iter_contiguous_block_runs(local_blocks):
+            weight_data_dict = {}
+            for weight_name in weights_list:
+                weight_data_dict[weight_name] = (
+                    ad.data(weight_name, global_mbl, global_mbh)
+                    if isinstance(weight_name, str) else weight_name)
+
+            var_data_dict = {}
+            for var_name in varlist:
+                var_data_dict[var_name] = (
+                    ad.data(var_name, global_mbl, global_mbh)
+                    if isinstance(var_name, str) else var_name)
+
+            for global_b in range(global_mbl, global_mbh):
+                array_idx = global_b - global_mbl
+                region_status = region_status_map[global_b]
+                region_status, region_trimmed, coords_block, weights_block, vars_block = (
+                    _extract_xyz_region_block_data(
+                        ad.mb_geometry[global_b],
+                        weight_data_dict[weights_list[0]][array_idx].shape,
+                        {weight_name: weight_data_dict[weight_name][array_idx]
+                         for weight_name in weights_list},
+                        {var_name: var_data_dict[var_name][array_idx]
+                         for var_name in varlist},
+                        region_status, xyzlim))
+
+                block_cache[global_b] = _finalize_block_cache_entry(
+                    coords_block, region_status, region_trimmed,
+                    weights_block, vars_block,
+                    weights_list, varlist)
     
     # Handle remote blocks via MPI
     if remote_blocks and mpi_manager is not None:
@@ -2528,74 +2818,84 @@ def _prepare_xyz_block_regions(ad, block_indices, xyzlim):
     return region_status_map
 
 
-def _load_local_blocks_into_cache(ad, block_cache, local_blocks, weights_list,
-                                  varlist, xyzlim, cast_to_float=True):
-    """Load only the requested local blocks, preserving sparse block selections."""
+def _compute_weight_support_rescaling_factors(ad, weights_list, xyzlim=None, mpi_manager=None, debug=False):
+    """Compute global per-weight sampling rescaling factors from valid-support fractions."""
+    if not weights_list:
+        return {}
+
+    if hasattr(ad, "has_full_data") and not ad.has_full_data:
+        local_blocks = list(range(ad.local_mb_start, ad.local_mb_end))
+    else:
+        local_blocks = list(range(ad.n_mbs))
+
     if not local_blocks:
-        return
+        return {weight_name: 1.0 for weight_name in weights_list}
 
+    block_shape = (ad.nx3, ad.nx2, ad.nx1)
+    full_block_cells = ad.nx1 * ad.nx2 * ad.nx3
     region_status_map = _prepare_xyz_block_regions(ad, local_blocks, xyzlim)
+    candidate_count_local = 0
+    support_counts_local = {weight_name: 0 for weight_name in weights_list}
 
-    for global_mbl, global_mbh in _iter_contiguous_block_ranges(local_blocks):
+    for global_mbl, global_mbh in _iter_contiguous_block_runs(local_blocks):
         weight_data_dict = {}
         for weight_name in weights_list:
             weight_data_dict[weight_name] = (
                 ad.data(weight_name, global_mbl, global_mbh)
-                if isinstance(weight_name, str) else weight_name)
-
-        var_data_dict = {}
-        for var_name in varlist:
-            var_data_dict[var_name] = (
-                ad.data(var_name, global_mbl, global_mbh)
-                if isinstance(var_name, str) else var_name)
+                if isinstance(weight_name, str) else weight_name[global_mbl:global_mbh])
 
         for global_b in range(global_mbl, global_mbh):
-            if global_b not in region_status_map:
+            region_status = region_status_map[global_b]
+            if region_status == 'outside':
                 continue
 
+            active_slices = None
+            candidate_count = full_block_cells
+            if region_status == 'partial':
+                active_slices = _build_xyz_active_slices_from_geometry(
+                    ad.mb_geometry[global_b], block_shape, xyzlim)
+                if active_slices is None:
+                    continue
+                candidate_count = int(np.prod([sl.stop - sl.start for sl in active_slices]))
+
+            candidate_count_local += candidate_count
             array_idx = global_b - global_mbl
-            region_status = region_status_map[global_b]
-            region_status, region_trimmed, coords_block, weights_block, vars_block = (
-                _extract_xyz_region_block_data(
-                    ad.mb_geometry[global_b],
-                    weight_data_dict[weights_list[0]][array_idx].shape,
-                    {weight_name: weight_data_dict[weight_name][array_idx]
-                     for weight_name in weights_list},
-                    {var_name: var_data_dict[var_name][array_idx]
-                     for var_name in varlist},
-                    region_status, xyzlim))
-
-            block_cache[global_b] = {
-                'coords': coords_block,
-                'xyz_region_status': region_status,
-                'xyz_region_trimmed': region_trimmed,
-                'weights': {},
-                'vars': {}
-            }
-
             for weight_name in weights_list:
-                weight_arr = weights_block[weight_name]
-                block_cache[global_b]['weights'][weight_name] = (
-                    xp.asarray(weight_arr, dtype=xp.float64)
-                    if cast_to_float else weight_arr)
+                block = weight_data_dict[weight_name][array_idx]
+                if active_slices is not None:
+                    block = block[active_slices]
+                support_counts_local[weight_name] += int(asnumpy(xp.count_nonzero(block)))
 
-            for var_name in varlist:
-                var_arr = vars_block[var_name]
-                block_cache[global_b]['vars'][var_name] = (
-                    xp.asarray(var_arr, dtype=xp.float64)
-                    if cast_to_float else var_arr)
+    candidate_count_global = candidate_count_local
+    support_counts_global = dict(support_counts_local)
+    if mpi_manager is not None:
+        candidate_count_global = int(mpi_manager.allreduce(candidate_count_local, op='sum'))
+        support_counts_global = {
+            weight_name: int(mpi_manager.allreduce(count, op='sum'))
+            for weight_name, count in support_counts_local.items()
+        }
 
-        del weight_data_dict
-        del var_data_dict
-        clear_backend_memory()
+    candidate_count_global = max(candidate_count_global, 1)
+    scales = {}
+    for weight_name in weights_list:
+        support_count = max(support_counts_global[weight_name], 1)
+        scales[weight_name] = max(1.0, float(candidate_count_global) / float(support_count))
+
+    if debug:
+        for weight_name in weights_list:
+            support_fraction = support_counts_global[weight_name] / float(candidate_count_global)
+            print(
+                f"[DEBUG get_sf_mb] Weight support fraction for {weight_name}: {support_fraction:.6e}, "
+                f"global sampling scale={scales[weight_name]:.6g}")
+
+    return scales
 
 
-def _build_uniform_axis_values(axis_min, axis_max, n_axis, axis_slice,
-                               array_module=xp):
+def _build_uniform_axis_values(axis_min, axis_max, n_axis, axis_slice):
     """Build 1D cell-center coordinates for a sliced Cartesian axis."""
     dx = (axis_max - axis_min) / n_axis
     idx = np.arange(axis_slice.start, axis_slice.stop, dtype=np.float64)
-    return array_module.asarray(axis_min + (idx + 0.5) * dx, dtype=np.float64)
+    return xp.asarray(axis_min + (idx + 0.5) * dx, dtype=xp.float64)
 
 
 def _geometry_axis_slice(axis_min, axis_max, n_axis, lim_min, lim_max):
@@ -2624,8 +2924,7 @@ def _build_xyz_active_slices_from_geometry(block_geometry, block_shape, xyzlim):
     return (z_slice, y_slice, x_slice)
 
 
-def _build_block_coords_from_geometry(block_geometry, block_shape, active_slices,
-                                      array_module=xp):
+def _build_block_coords_from_geometry(block_geometry, block_shape, active_slices):
     """Construct flattened Cartesian coordinates directly from meshblock geometry."""
     nx3, nx2, nx1 = block_shape
     if active_slices is None:
@@ -2633,20 +2932,17 @@ def _build_block_coords_from_geometry(block_geometry, block_shape, active_slices
     z_slice, y_slice, x_slice = active_slices
     x1min, x1max, x2min, x2max, x3min, x3max = block_geometry
 
-    x_vals = _build_uniform_axis_values(
-        x1min, x1max, nx1, x_slice, array_module=array_module)
-    y_vals = _build_uniform_axis_values(
-        x2min, x2max, nx2, y_slice, array_module=array_module)
-    z_vals = _build_uniform_axis_values(
-        x3min, x3max, nx3, z_slice, array_module=array_module)
+    x_vals = _build_uniform_axis_values(x1min, x1max, nx1, x_slice)
+    y_vals = _build_uniform_axis_values(x2min, x2max, nx2, y_slice)
+    z_vals = _build_uniform_axis_values(x3min, x3max, nx3, z_slice)
 
     nx = x_vals.size
     ny = y_vals.size
     nz = z_vals.size
     return {
-        'x': array_module.tile(x_vals, ny * nz),
-        'y': array_module.tile(array_module.repeat(y_vals, nx), nz),
-        'z': array_module.repeat(z_vals, ny * nx),
+        'x': xp.tile(x_vals, ny * nz),
+        'y': xp.tile(xp.repeat(y_vals, nx), nz),
+        'z': xp.repeat(z_vals, ny * nx),
     }
 
 
@@ -2698,124 +2994,178 @@ def _extract_xyz_region_block_data(block_geometry, block_shape,
     return region_status, region_trimmed, coords_block, weights_out, vars_out
 
 
-def _iter_contiguous_block_ranges(block_indices):
-    """Yield contiguous [start, stop) ranges from a block-index list."""
-    if not block_indices:
-        return
+def _rebuild_remote_block_cache_entry(ad, block_idx, block_data, xyzlim):
+    """Reconstruct received remote-block coordinates from mesh geometry."""
+    block_shape = (ad.nx3, ad.nx2, ad.nx1)
+    region_status = _classify_xyz_block_region(ad.mb_geometry, block_idx, xyzlim)
+    active_slices = None
+    region_trimmed = False
+    if region_status == 'partial':
+        active_slices = _build_xyz_active_slices_from_geometry(
+            ad.mb_geometry[block_idx], block_shape, xyzlim)
+        if active_slices is None:
+            region_status = 'outside'
+        else:
+            region_trimmed = True
 
-    sorted_blocks = sorted(set(block_indices))
-    start = sorted_blocks[0]
-    prev = start
-    for block_idx in sorted_blocks[1:]:
-        if block_idx == prev + 1:
-            prev = block_idx
+    if region_status == 'outside':
+        empty = xp.asarray([], dtype=xp.float64)
+        coords_block = {'x': empty, 'y': empty, 'z': empty}
+    else:
+        coords_block = _build_block_coords_from_geometry(
+            ad.mb_geometry[block_idx], block_shape, active_slices)
+
+    return _finalize_block_cache_entry(
+        coords_block, region_status, region_trimmed,
+        block_data.get('weights', {}),
+        block_data.get('vars', {}),
+        list(block_data.get('weights', {}).keys()),
+        list(block_data.get('vars', {}).keys()),
+    )
+
+
+
+def _pack_cached_var_views(var_blocks, varlist):
+    """Pack meshblock variables once and expose per-variable views into that buffer."""
+    if not varlist:
+        empty = xp.asarray([], dtype=xp.float64)
+        return {}, empty, 0
+
+    first = xp.asarray(var_blocks[varlist[0]], dtype=xp.float64).reshape(-1)
+    n_points = first.size
+    packed = xp.empty(len(varlist) * n_points, dtype=xp.float64)
+    views = {}
+
+    packed[:n_points] = first
+    views[varlist[0]] = packed[:n_points]
+    for ivar, var_name in enumerate(varlist[1:], start=1):
+        start = ivar * n_points
+        end = start + n_points
+        packed[start:end] = xp.asarray(var_blocks[var_name], dtype=xp.float64).reshape(-1)
+        views[var_name] = packed[start:end]
+
+    return views, packed, n_points
+
+
+def _finalize_block_cache_entry(coords_block, region_status, region_trimmed,
+                                weights_block, var_blocks,
+                                weights_list, varlist):
+    """Create the standard cached block representation used by SF routines."""
+    weights_out = {
+        weight_name: xp.asarray(weights_block[weight_name], dtype=xp.float64).reshape(-1)
+        for weight_name in weights_list
+    }
+    weight_nonzero_counts = {
+        weight_name: int(asnumpy(xp.count_nonzero(weight_values)))
+        for weight_name, weight_values in weights_out.items()
+    }
+    vars_out, var_stack, n_var_points = _pack_cached_var_views(var_blocks, varlist)
+    return {
+        'coords': coords_block,
+        'xyz_region_status': region_status,
+        'xyz_region_trimmed': region_trimmed,
+        'weights': weights_out,
+        'weight_nonzero_counts': weight_nonzero_counts,
+        'vars': vars_out,
+        'var_stack': var_stack,
+        'n_var_points': n_var_points,
+    }
+
+
+def _pack_sparse_var_stack(var_stack, n_points, no_vars, valid_mask):
+    """Pack only the valid cells from a cached per-block variable stack."""
+    if no_vars == 0 or n_points == 0:
+        return xp.asarray([], dtype=xp.float64)
+    matrix = var_stack.reshape(no_vars, n_points)
+    return xp.ascontiguousarray(matrix[:, valid_mask].reshape(-1), dtype=xp.float64)
+
+
+def _allocate_isotropic_sf_pair_workspace(no_vars, max_order, nbins, array_module=xp):
+    """Allocate reusable isotropic SF scratch arrays."""
+    return {
+        'sf': array_module.zeros(no_vars * max_order * nbins, dtype=array_module.float64),
+        'num': array_module.zeros(nbins, dtype=array_module.float64),
+        'wsum': array_module.zeros(nbins, dtype=array_module.float64),
+    }
+
+
+def _zero_isotropic_sf_pair_workspace(workspace):
+    """Reset isotropic SF scratch arrays in place."""
+    workspace['sf'].fill(0)
+    workspace['num'].fill(0)
+    workspace['wsum'].fill(0)
+
+
+def _estimate_block_payload_nbytes(block_data):
+    """Estimate the serialized payload size for a transferred block."""
+    total = 0
+    for section in ('weights', 'vars'):
+        for values in block_data.get(section, {}).values():
+            total += getattr(values, 'nbytes', np.asarray(values).nbytes)
+    return max(total, 1)
+
+
+def _chunk_block_payloads(blocks_data, target_bytes=64 * 1024 * 1024, max_blocks=4):
+    """Split a block-payload dict into smaller MPI-safe chunks."""
+    if not blocks_data:
+        return []
+
+    chunks = []
+    current = {}
+    current_bytes = 0
+    for block_idx, block_data in blocks_data.items():
+        block_bytes = _estimate_block_payload_nbytes(block_data)
+        if current and (len(current) >= max_blocks or current_bytes + block_bytes > target_bytes):
+            chunks.append(current)
+            current = {}
+            current_bytes = 0
+        current[block_idx] = block_data
+        current_bytes += block_bytes
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _exchange_chunked_block_payloads(mpi_manager, requests_by_rank, data_to_send, tag_base=1000):
+    """Exchange Python block payloads in bounded-size chunks."""
+    rank = mpi_manager.rank
+    size = mpi_manager.size
+    chunked_data_to_send = {
+        dest_rank: _chunk_block_payloads(blocks_data)
+        for dest_rank, blocks_data in data_to_send.items()
+        if blocks_data
+    }
+    send_counts = {
+        dest_rank: len(chunks)
+        for dest_rank, chunks in chunked_data_to_send.items()
+        if chunks
+    }
+    all_send_counts = mpi_manager.comm.allgather(send_counts)
+    received_data_all = {}
+
+    for other_rank in range(size):
+        if other_rank == rank:
             continue
-        yield start, prev + 1
-        start = block_idx
-        prev = block_idx
-    yield start, prev + 1
 
+        send_chunks = chunked_data_to_send.get(other_rank, [])
+        recv_chunk_count = all_send_counts[other_rank].get(rank, 0)
 
-def _build_rank_assigned_pairs(total_global_blocks, rank, size):
-    """Build only this rank's upper-triangular block-pair list."""
-    my_pairs = []
-    pair_idx = 0
-    for i in range(total_global_blocks):
-        for j in range(i, total_global_blocks):
-            if pair_idx % size == rank:
-                my_pairs.append((i, j))
-            pair_idx += 1
-    return my_pairs
+        if rank < other_rank:
+            for chunk in send_chunks:
+                mpi_manager.comm.send(chunk, dest=other_rank, tag=tag_base + rank)
+            for _ in range(recv_chunk_count):
+                received_data_all.update(
+                    mpi_manager.comm.recv(source=other_rank, tag=tag_base + other_rank)
+                )
+        else:
+            for _ in range(recv_chunk_count):
+                received_data_all.update(
+                    mpi_manager.comm.recv(source=other_rank, tag=tag_base + other_rank)
+                )
+            for chunk in send_chunks:
+                mpi_manager.comm.send(chunk, dest=other_rank, tag=tag_base + rank)
 
-
-def _free_temporary_gpu_memory():
-    """Release temporary CuPy allocations created while staging MPI payloads."""
-    clear_backend_memory()
-
-
-def _build_serialized_block_payloads(ad, block_indices, weights_list, varlist,
-                                     xyzlim):
-    """Build numpy-backed block payloads, loading each requested block once."""
-    from ..core.base import asnumpy
-
-    payloads = {}
-    unique_blocks = sorted(set(block_indices))
-    if not unique_blocks:
-        return payloads
-
-    region_status_map = _prepare_xyz_block_regions(ad, unique_blocks, xyzlim)
-
-    for global_mbl, global_mbh in _iter_contiguous_block_ranges(unique_blocks):
-        weight_data_dict = {}
-        for weight_name in weights_list:
-            weight_data_dict[weight_name] = (
-                ad.data(weight_name, global_mbl, global_mbh)
-                if isinstance(weight_name, str) else weight_name)
-
-        var_data_dict = {}
-        for var_name in varlist:
-            var_data_dict[var_name] = (
-                ad.data(var_name, global_mbl, global_mbh)
-                if isinstance(var_name, str) else var_name)
-
-        for global_b in range(global_mbl, global_mbh):
-            array_idx = global_b - global_mbl
-            region_status = region_status_map[global_b]
-            block_geometry = ad.mb_geometry[global_b]
-            block_shape = weight_data_dict[weights_list[0]][array_idx].shape
-
-            if region_status == 'outside':
-                empty = np.asarray([], dtype=np.float64)
-                region_trimmed = False
-                coords_block = {'x': empty, 'y': empty, 'z': empty}
-                weights_block = {name: empty for name in weights_list}
-                vars_block = {name: empty for name in varlist}
-            else:
-                active_slices = None
-                region_trimmed = False
-                if region_status == 'partial':
-                    active_slices = _build_xyz_active_slices_from_geometry(
-                        block_geometry, block_shape, xyzlim)
-                    if active_slices is None:
-                        empty = np.asarray([], dtype=np.float64)
-                        region_status = 'outside'
-                        coords_block = {'x': empty, 'y': empty, 'z': empty}
-                        weights_block = {name: empty for name in weights_list}
-                        vars_block = {name: empty for name in varlist}
-                    else:
-                        region_trimmed = True
-
-                if region_status != 'outside':
-                    coords_block = _build_block_coords_from_geometry(
-                        block_geometry, block_shape, active_slices,
-                        array_module=np)
-
-                    def _flatten_to_numpy(arr):
-                        arr_view = arr if active_slices is None else arr[active_slices]
-                        return np.asarray(asnumpy(arr_view), dtype=np.float64).reshape(-1)
-
-                    weights_block = {
-                        name: _flatten_to_numpy(weight_data_dict[name][array_idx])
-                        for name in weights_list
-                    }
-                    vars_block = {
-                        name: _flatten_to_numpy(var_data_dict[name][array_idx])
-                        for name in varlist
-                    }
-
-            payloads[global_b] = {
-                'coords': coords_block,
-                'xyz_region_status': region_status,
-                'xyz_region_trimmed': region_trimmed,
-                'weights': weights_block,
-                'vars': vars_block
-            }
-
-        del weight_data_dict
-        del var_data_dict
-        _free_temporary_gpu_memory()
-
-    return payloads
+    return received_data_all
 
 def _load_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, varlist,
                             mpi_manager, xyzlim=None):
@@ -2842,7 +3192,7 @@ def _load_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, varlis
     xyzlim : array, optional
         Region of interest limits
     """
-    from ..core.base import xp
+    from ..core.base import xp, asnumpy
     
     if not remote_blocks:
         return
@@ -2879,69 +3229,62 @@ def _load_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, varlis
     data_to_send = {}
     for requesting_rank, their_requests in enumerate(all_requests):
         if rank in their_requests:
+            blocks_they_want = their_requests[rank]
             data_to_send[requesting_rank] = {}
+            owned_blocks = [
+                global_idx for global_idx in blocks_they_want
+                if 0 <= (global_idx - ad.local_mb_start) < (ad.local_mb_end - ad.local_mb_start)
+            ]
+            region_status_map = _prepare_xyz_block_regions(
+                ad, owned_blocks, xyzlim)
 
-    owned_blocks_requested = sorted({
-        block_idx
-        for their_requests in all_requests
-        for block_idx in their_requests.get(rank, [])
-        if ad.local_mb_start <= block_idx < ad.local_mb_end
-    })
-    serialized_blocks = _build_serialized_block_payloads(
-        ad, owned_blocks_requested, weights_list, varlist, xyzlim)
-    for requesting_rank, their_requests in enumerate(all_requests):
-        if rank not in their_requests:
-            continue
-        data_to_send[requesting_rank] = {
-            block_idx: serialized_blocks[block_idx]
-            for block_idx in their_requests[rank]
-            if block_idx in serialized_blocks
-        }
-    
-    # Exchange data using point-to-point communication
-    # Send data to requesting ranks
-    send_requests = []
-    for dest_rank, blocks_data in data_to_send.items():
-        if dest_rank != rank and blocks_data:
-            send_requests.append(mpi_manager.comm.isend(blocks_data, dest=dest_rank, tag=100 + rank))
-    
-    # Receive data from owning ranks
-    for source_rank in requests_by_rank.keys():
-        if source_rank != rank:
-            received_data = mpi_manager.comm.recv(source=source_rank, tag=100 + source_rank)
-            
-            # Store received blocks in cache
-            for global_idx, block_data in received_data.items():
-                block_cache[global_idx] = {
-                    'coords': {},
-                    'xyz_region_status': block_data.get('xyz_region_status', 'inside'),
-                    'xyz_region_trimmed': block_data.get('xyz_region_trimmed', False),
-                    'weights': {},
-                    'vars': {}
+            for global_mbl, global_mbh in _iter_contiguous_block_runs(owned_blocks):
+                weight_data_dict = {
+                    weight_name: ad.data(weight_name, global_mbl, global_mbh)
+                    for weight_name in weights_list
                 }
-                
-                # Convert back to xp arrays
-                block_cache[global_idx]['coords']['x'] = xp.asarray(block_data['coords']['x'], dtype=xp.float64)
-                block_cache[global_idx]['coords']['y'] = xp.asarray(block_data['coords']['y'], dtype=xp.float64)
-                block_cache[global_idx]['coords']['z'] = xp.asarray(block_data['coords']['z'], dtype=xp.float64)
-                
-                for weight_name in block_data['weights']:
-                    block_cache[global_idx]['weights'][weight_name] = xp.asarray(
-                        block_data['weights'][weight_name], dtype=xp.float64)
-                
-                for var in block_data['vars']:
-                    block_cache[global_idx]['vars'][var] = xp.asarray(
-                        block_data['vars'][var], dtype=xp.float64)
+                var_data_dict = {
+                    var: ad.data(var, global_mbl, global_mbh)
+                    for var in varlist
+                }
+
+                for global_idx in range(global_mbl, global_mbh):
+                    array_idx = global_idx - global_mbl
+                    region_status = region_status_map[global_idx]
+                    region_status, region_trimmed, coords_block, weights_block, vars_block = (
+                        _extract_xyz_region_block_data(
+                            ad.mb_geometry[global_idx],
+                            weight_data_dict[weights_list[0]][array_idx].shape,
+                            {weight_name: weight_data_dict[weight_name][array_idx]
+                             for weight_name in weights_list},
+                            {var: var_data_dict[var][array_idx] for var in varlist},
+                            region_status, xyzlim))
+                    block_data = {
+                        'weights': {},
+                        'vars': {}
+                    }
+
+                    for weight_name in weights_list:
+                        block_data['weights'][weight_name] = asnumpy(weights_block[weight_name])
+
+                    for var in varlist:
+                        block_data['vars'][var] = asnumpy(vars_block[var])
+
+                    data_to_send[requesting_rank][global_idx] = block_data
     
-    # Wait for all sends to complete
-    for req in send_requests:
-        req.wait()
+    received_data_all = _exchange_chunked_block_payloads(
+        mpi_manager, requests_by_rank, data_to_send, tag_base=100)
+
+    for global_idx, block_data in received_data_all.items():
+        block_cache[global_idx] = _rebuild_remote_block_cache_entry(
+            ad, global_idx, block_data, xyzlim)
             
 def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, varlist,
                     sf, num_bin_points, weight_sum_bin, 
                     rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                     n_samples1, n_points_per_block, nsamples_block_min,
-                    periodic_x, periodic_y, periodic_z, sparse_data=False, debug=False, use_mpi=False, random_seed=None):
+                    periodic_x, periodic_y, periodic_z, sparse_data=False, debug=False, use_mpi=False, random_seed=None,
+                    pair_workspace=None, weight_sampling_scales=None):
     """Process a single pair of blocks for structure functions using varlist kernel"""
     
     if debug:
@@ -3017,11 +3360,23 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
             # Get weights for this scheme
             weight1 = block_cache[b1]['weights'][weight_name]
             weight2 = block_cache[b2]['weights'][weight_name]
+            support1 = block_cache[b1]['weight_nonzero_counts'][weight_name]
+            support2 = block_cache[b2]['weight_nonzero_counts'][weight_name]
+            if support1 == 0 or support2 == 0:
+                if debug:
+                    print(f"Debug: Skipping pair ({b1}, {b2}) for weight {weight_name} - zero phase support in block cache")
+                continue
             
+            sampling_scale = 1.0 if weight_sampling_scales is None else float(weight_sampling_scales.get(weight_name, 1.0))
+            scaled_n_samples1 = max(int(np.ceil(n_samples1 * sampling_scale)), nsamples_block_min)
+            scaled_n_samples2 = max(int(np.ceil(n_samples2 * sampling_scale)), nsamples_block_min)
+
             if debug:
                 print(f"Debug: Weight arrays extracted, sizes: {weight1.size}, {weight2.size}")
                 if debug:
                     print(f"Debug: Weight ranges: w1[{weight1.min():.3f}, {weight1.max():.3f}], w2[{weight2.min():.3f}, {weight2.max():.3f}]")
+                if debug:
+                    print(f"Debug: Global sampling scale for {weight_name}: {sampling_scale:.6g}")
             
             # Process data differently based on sparse_data flag
             if sparse_data:
@@ -3069,27 +3424,13 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                 if debug:
                     print(f"Debug: Valid arrays created, sizes: {n_valid1}, {n_valid2}")
                 
-                # Prepare stacked data for varlist kernel
-                if debug:
-                    print(f"Debug: Preparing stacked data arrays")
-                
-                data1_valid = xp.zeros(no_vars * n_valid1, dtype=xp.float64)
-                data2_valid = xp.zeros(no_vars * n_valid2, dtype=xp.float64)
-                
-                for ivar, var in enumerate(varlist):
-                    if debug and ivar < 2:  # Debug first 2 variables
-                        if debug:
-                            print(f"Debug: Processing variable {ivar}: {var}")
-                    
-                    var_data1 = block_cache[b1]['vars'][var][valid_points1]
-                    var_data2 = block_cache[b2]['vars'][var][valid_points2]
-                    
-                    # Store variables contiguously for each variable block
-                    data1_valid[ivar * n_valid1:(ivar+1) * n_valid1] = var_data1
-                    data2_valid[ivar * n_valid2:(ivar+1) * n_valid2] = var_data2
-                
-                n_samples1_adj = min(n_samples1, n_valid1)
-                n_samples2_adj = min(n_samples2, n_valid2)
+                data1_valid = _pack_sparse_var_stack(
+                    block_cache[b1]['var_stack'], block_cache[b1]['n_var_points'], no_vars, valid_points1)
+                data2_valid = _pack_sparse_var_stack(
+                    block_cache[b2]['var_stack'], block_cache[b2]['n_var_points'], no_vars, valid_points2)
+
+                n_samples1_adj = min(scaled_n_samples1, n_valid1)
+                n_samples2_adj = min(scaled_n_samples2, n_valid2)
                 
                 if debug:
                     print(f"Debug: Adjusted samples: n_samples1_adj={n_samples1_adj}, n_samples2_adj={n_samples2_adj}")
@@ -3109,19 +3450,16 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                 z2_valid = z2
                 weight2_valid = weight2
                 
-                n_valid1 = n_points_per_block
-                n_valid2 = n_points_per_block
-                n_samples1_adj = n_samples1
-                n_samples2_adj = n_samples2
+                # The cached arrays may already be interface-trimmed at load time,
+                # so the valid-point count must follow the cached data rather than
+                # the original full meshblock cell count.
+                n_valid1 = block_cache[b1]['n_var_points']
+                n_valid2 = block_cache[b2]['n_var_points']
+                n_samples1_adj = min(scaled_n_samples1, n_valid1)
+                n_samples2_adj = min(scaled_n_samples2, n_valid2)
                 
-                # Prepare stacked data for varlist kernel
-                data1_valid = xp.zeros(no_vars * n_valid1, dtype=xp.float64)
-                data2_valid = xp.zeros(no_vars * n_valid2, dtype=xp.float64)
-                
-                for ivar, var in enumerate(varlist):
-                    # Store variables contiguously for each variable block
-                    data1_valid[ivar * n_valid1:(ivar+1) * n_valid1] = block_cache[b1]['vars'][var]
-                    data2_valid[ivar * n_valid2:(ivar+1) * n_valid2] = block_cache[b2]['vars'][var]
+                data1_valid = block_cache[b1]['var_stack']
+                data2_valid = block_cache[b2]['var_stack']
             
             if debug:
                 print(f"Debug: Making data arrays contiguous")
@@ -3135,13 +3473,16 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                 if debug:
                     print(f"Debug: Expected sizes: {no_vars * n_valid1}, {no_vars * n_valid2}")
             
-            # Local arrays for accumulation - flat arrays for the kernel
             if debug:
-                print(f"Debug: Creating local accumulation arrays")
-            
-            local_sf = xp.zeros(no_vars * max_order * nbins, dtype=xp.float64)
-            local_num_bin_points = xp.zeros(nbins, dtype=xp.float64)
-            local_weight_sum_bin = xp.zeros(nbins, dtype=xp.float64)
+                print(f"Debug: Preparing local accumulation workspace")
+
+            workspace = pair_workspace
+            if workspace is None:
+                workspace = _allocate_isotropic_sf_pair_workspace(no_vars, max_order, nbins, array_module=xp)
+            _zero_isotropic_sf_pair_workspace(workspace)
+            local_sf = workspace['sf']
+            local_num_bin_points = workspace['num']
+            local_weight_sum_bin = workspace['wsum']
             
             # Configure CUDA grid
             threadsperblock = 256
@@ -3251,7 +3592,7 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                         # Use GPU kernel with deterministic base seed
                         # Use block indices to create reproducible seed
                         pair_seed = random_seed if random_seed is not None else (b1 * 10000 + b2)
-                        base_seed = np.uint32((pair_seed * 1013904223) % (2**32))
+                        base_seed = np.uint32((int(pair_seed) * 1013904223) % (2**32))
                         structure_function_varlist_kernel(
                             (blockspergrid,), (threadsperblock,),
                             (data1_valid, data2_valid, no_vars,
@@ -3274,31 +3615,24 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                     print(f"ERROR: Kernel launch failed: {e}")
                     raise
             
-            # Synchronize (only for GPU)
-            if cupy_enabled and structure_function_varlist_kernel is not None:
+            # Keep the hot path asynchronous unless debug asks for eager synchronization.
+            if debug and cupy_enabled and structure_function_varlist_kernel is not None:
                 try:
                     xp.cuda.Stream.null.synchronize()
-                    if debug:
-                        print(f"Debug: CUDA synchronization completed")
+                    print(f"Debug: CUDA synchronization completed")
                 except Exception as e:
                     print(f"ERROR: CUDA synchronization failed: {e}")
                     raise
-                
-                # Process results for each variable (GPU only)
+
+            if cupy_enabled and structure_function_varlist_kernel is not None:
                 if debug:
                     print(f"Debug: Processing kernel results")
-                
+
                 for ivar, var in enumerate(varlist):
-                    # Calculate offsets for this variable in the flat array
                     sf_offset = ivar * max_order * nbins
-                    
-                    # Extract this variable's data and reshape
                     var_sf = local_sf[sf_offset:sf_offset + max_order * nbins].reshape(max_order, nbins)
-                    
-                    # Accumulate results
                     sf[iw, ivar] += var_sf
-                
-                # Add to weight statistics once per weight (shared across all variables)
+
                 num_bin_points[iw] += local_num_bin_points
                 weight_sum_bin[iw] += local_weight_sum_bin
             
@@ -3680,8 +4014,8 @@ def get_sf_helmholtz(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7
                     num_bin_points = num_bin_points_contiguous
                     weight_sum_bin = weight_sum_bin_contiguous
                     
-                    # Synchronize after kernel launch
-                    if cupy_enabled:
+                    # Keep the hot path asynchronous unless debug asks for eager synchronization.
+                    if debug and cupy_enabled:
                         xp.cuda.Stream.null.synchronize()
                 
                     if debug:
@@ -3931,13 +4265,13 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
             print(f"Debug: Rank {mpi_manager.rank}: All ranks synchronized")
         
         total_global_blocks = ad.n_mbs
+        total_global_pairs = (total_global_blocks * (total_global_blocks + 1)) // 2
+
         if debug:
-            total_pairs = total_global_blocks * (total_global_blocks + 1) // 2
-            print(f"Debug: Rank {mpi_manager.rank}: Total global pairs: {total_pairs}")
-        
-        # Distribute pairs across ranks using round-robin without materializing all pairs.
-        my_pairs = _build_rank_assigned_pairs(
-            total_global_blocks, mpi_manager.rank, mpi_manager.size)
+            print(f"Debug: Rank {mpi_manager.rank}: Total global pairs: {total_global_pairs}")
+
+        my_pairs = build_locality_balanced_mpi_pairs(
+            total_global_blocks, mpi_manager.size, mpi_manager.rank)
         
         if debug:
             print(f"Debug: Rank {mpi_manager.rank}: Assigned {len(my_pairs)} pairs to process")
@@ -4050,16 +4384,10 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
         weight_sum_bin_np = asnumpy(weight_sum_bin)
         
         # Sum results across all ranks
-        sf_comp_total = mpi_manager.reduce(sf_comp_np, op='sum', root=0)
-        sf_sol_total = mpi_manager.reduce(sf_sol_np, op='sum', root=0)
-        num_bin_points_total = mpi_manager.reduce(num_bin_points_np, op='sum', root=0)
-        weight_sum_bin_total = mpi_manager.reduce(weight_sum_bin_np, op='sum', root=0)
-        
-        # Broadcast aggregated results to all ranks
-        sf_comp_total = mpi_manager.broadcast(sf_comp_total, root=0)
-        sf_sol_total = mpi_manager.broadcast(sf_sol_total, root=0)
-        num_bin_points_total = mpi_manager.broadcast(num_bin_points_total, root=0)
-        weight_sum_bin_total = mpi_manager.broadcast(weight_sum_bin_total, root=0)
+        sf_comp_total = mpi_manager.allreduce(sf_comp_np, op='sum')
+        sf_sol_total = mpi_manager.allreduce(sf_sol_np, op='sum')
+        num_bin_points_total = mpi_manager.allreduce(num_bin_points_np, op='sum')
+        weight_sum_bin_total = mpi_manager.allreduce(weight_sum_bin_np, op='sum')
         
         # Convert back to GPU arrays if using CuPy
         sf_comp = xp.asarray(sf_comp_total)
@@ -4257,6 +4585,8 @@ def _process_mpi_pairs_helmholtz(ad, my_pairs, block_cache, weights_list, varlis
             if block_id in block_cache:
                 del block_cache[block_id]
         
+        _free_gpu_memory_pool()
+
         if debug:
             print(f"Debug: Rank {rank}: Batch complete, cleared {len(batch_blocks_needed)} blocks, processed {pairs_processed}/{len(optimized_pairs)} pairs so far")
         
@@ -4415,9 +4745,7 @@ def _process_batch_pairs_helmholtz(ad, batches, block_cache, processed_pairs, we
                 del block_cache[b]
         
         # Clean up GPU memory
-        if cupy_enabled:
-            xp.cuda.Stream.null.synchronize()
-            xp.get_default_memory_pool().free_all_blocks()
+        _free_gpu_memory_pool()
             
         if debug:
             print(f"Debug: Completed Helmholtz batch {batch_idx1+1}/{len(batches)}")
@@ -4483,6 +4811,12 @@ def _process_block_pair_helmholtz(ad, b1, b2, block_cache, block_centers, weight
         # Get weights for this scheme
         weight1 = block_cache[b1]['weights'][weight_name]
         weight2 = block_cache[b2]['weights'][weight_name]
+        support1 = block_cache[b1]['weight_nonzero_counts'][weight_name]
+        support2 = block_cache[b2]['weight_nonzero_counts'][weight_name]
+        if support1 == 0 or support2 == 0:
+            if debug:
+                print(f"Debug: Skipping Helmholtz pair ({b1}, {b2}) for weight {weight_name} - zero phase support in block cache")
+            continue
         
         try:
             # Process data differently based on sparse_data flag
@@ -4559,10 +4893,13 @@ def _process_block_pair_helmholtz(ad, b1, b2, block_cache, block_centers, weight
                 vy2_valid = vy2
                 vz2_valid = vz2
                 
-                n_valid1 = n_points_per_block
-                n_valid2 = n_points_per_block
-                n_samples1_adj = n_samples1
-                n_samples2_adj = n_samples2
+                # The cached arrays may already be interface-trimmed at load time,
+                # so the valid-point count must follow the cached data rather than
+                # the original full meshblock cell count.
+                n_valid1 = x1_valid.size
+                n_valid2 = x2_valid.size
+                n_samples1_adj = min(n_samples1, n_valid1)
+                n_samples2_adj = min(n_samples2, n_valid2)
             
             # Local arrays for accumulation
             local_sf_comp = xp.zeros((max_order, nbins), dtype=xp.float64)
@@ -5096,8 +5433,7 @@ def _reduce_aniso_mhd_accumulators(accum, mpi_manager):
     """MPI-reduce and broadcast all anisotropic MHD accumulator arrays."""
     def _reduce(arr):
         arr_np = asnumpy(arr)
-        total = mpi_manager.reduce(arr_np, op='sum', root=0)
-        total = mpi_manager.broadcast(total, root=0)
+        total = mpi_manager.allreduce(arr_np, op='sum')
         return xp.asarray(total)
 
     for group in accum.values():
@@ -5265,6 +5601,12 @@ def _process_block_pair_aniso_mhd(ad, b1, b2, block_cache, block_centers,
     for iw, weight_name in enumerate(weights_list):
         weight1 = block_cache[b1]['weights'][weight_name]
         weight2 = block_cache[b2]['weights'][weight_name]
+        support1 = block_cache[b1]['weight_nonzero_counts'][weight_name]
+        support2 = block_cache[b2]['weight_nonzero_counts'][weight_name]
+        if support1 == 0 or support2 == 0:
+            if debug:
+                print(f'Debug: Skipping aniso_mhd pair ({b1}, {b2}) for weight {weight_name} - zero phase support in block cache')
+            continue
         _zero_aniso_mhd_pair_workspace(workspace)
 
         try:
@@ -5537,6 +5879,9 @@ def _process_mpi_pairs_aniso_mhd(ad, my_pairs, block_cache,
                                    pair_workspace=None):
     """Distribute aniso_mhd block pairs across MPI ranks."""
 
+    def _build_pair_batches(ordered_pairs, max_blocks_per_batch):
+        return _build_pair_batches_greedy(ordered_pairs, max_blocks_per_batch)
+
     rank = mpi_manager.rank if mpi_manager else 0
     all_varlist = vel_varlist + bcc_varlist
 
@@ -5568,38 +5913,28 @@ def _process_mpi_pairs_aniso_mhd(ad, my_pairs, block_cache,
         else:
             pairs_by_locality['both_remote'].append((gb1, gb2))
 
-    optimized_pairs = (pairs_by_locality['both_local'] +
-                       pairs_by_locality['one_local'] +
-                       pairs_by_locality['both_remote'])
+    local_only_pairs = pairs_by_locality['both_local']
 
     pairs_processed = 0
-    pair_idx = 0
+    local_pair_batches = _build_pair_batches(local_only_pairs, blocks_per_batch)
 
-    while pair_idx < len(optimized_pairs):
-        batch_blocks_needed = set()
-        batch_end_idx = pair_idx
-        while batch_end_idx < len(optimized_pairs) and len(batch_blocks_needed) < blocks_per_batch:
-            gb1, gb2 = optimized_pairs[batch_end_idx]
-            new_blocks = set()
-            if gb1 not in block_cache:
-                new_blocks.add(gb1)
-            if gb2 not in block_cache:
-                new_blocks.add(gb2)
-            if len(batch_blocks_needed) + len(new_blocks) > blocks_per_batch and len(batch_blocks_needed) > 0:
-                break
-            batch_blocks_needed.update(new_blocks)
-            batch_end_idx += 1
+    if debug:
+        print(
+            f'Debug: Rank {rank}: Local-only aniso batches={len(local_pair_batches)}'
+        )
 
-        batch_pairs = optimized_pairs[pair_idx:batch_end_idx]
-
-        if batch_blocks_needed:
-            _load_all_blocks_upfront(ad, block_cache, list(batch_blocks_needed),
-                                     weights_list, all_varlist,
-                                     local_start, local_end, xyzlim, mpi_manager, debug=False)
+    for batch_idx, (batch_pairs, batch_blocks_needed) in enumerate(local_pair_batches, start=1):
+        _load_all_blocks_upfront(
+            ad, block_cache, batch_blocks_needed,
+            weights_list, all_varlist,
+            local_start, local_end, xyzlim, mpi_manager, debug=False,
+            exchange_remote=False
+        )
 
         for gb1, gb2 in batch_pairs:
             if xyzlim is not None:
-                if is_block_outside_xyz(ad.mb_geometry, gb1, xyzlim) or                    is_block_outside_xyz(ad.mb_geometry, gb2, xyzlim):
+                if (is_block_outside_xyz(ad.mb_geometry, gb1, xyzlim)
+                        or is_block_outside_xyz(ad.mb_geometry, gb2, xyzlim)):
                     continue
             if gb1 not in block_cache or gb2 not in block_cache:
                 continue
@@ -5627,7 +5962,93 @@ def _process_mpi_pairs_aniso_mhd(ad, my_pairs, block_cache,
             if block_id in block_cache:
                 del block_cache[block_id]
 
-        pair_idx = batch_end_idx
+        _free_gpu_memory_pool()
+
+    remote_pair_batch_groups = _build_remote_pair_batch_groups(
+        pairs_by_locality['one_local'],
+        blocks_per_batch,
+        local_start, local_end,
+        total_blocks=ad.n_mbs, mpi_size=mpi_manager.size)
+    # Round-robin assignment can place both blocks on other ranks. Stream
+    # those pairs too; omitting them silently loses valid contributions.
+    both_remote_batches = _build_pair_batches_greedy(
+        pairs_by_locality['both_remote'], max(2, blocks_per_batch))
+    if both_remote_batches:
+        remote_pair_batch_groups.append(([], both_remote_batches))
+    max_group_count = int(mpi_manager.allreduce(len(remote_pair_batch_groups), op='max'))
+
+    if debug:
+        print(
+            f'Debug: Rank {rank}: Remote aniso groups={len(remote_pair_batch_groups)}, '
+            f'synchronized max_groups={max_group_count}'
+        )
+
+    for group_idx in range(max_group_count):
+        if group_idx < len(remote_pair_batch_groups):
+            local_group_blocks, remote_batches = remote_pair_batch_groups[group_idx]
+        else:
+            local_group_blocks, remote_batches = [], []
+
+        if local_group_blocks:
+            _load_all_blocks_upfront(
+                ad, block_cache, local_group_blocks,
+                weights_list, all_varlist,
+                local_start, local_end, xyzlim, mpi_manager, debug=False,
+                exchange_remote=False
+            )
+
+        max_remote_batch_count = int(mpi_manager.allreduce(len(remote_batches), op='max'))
+        for remote_batch_idx in range(max_remote_batch_count):
+            if remote_batch_idx < len(remote_batches):
+                batch_pairs, remote_blocks_needed = remote_batches[remote_batch_idx]
+            else:
+                batch_pairs, remote_blocks_needed = [], []
+
+            _load_all_blocks_upfront(
+                ad, block_cache, remote_blocks_needed,
+                weights_list, all_varlist,
+                local_start, local_end, xyzlim, mpi_manager, debug=False,
+                exchange_remote=True
+            )
+
+            for gb1, gb2 in batch_pairs:
+                if xyzlim is not None:
+                    if (is_block_outside_xyz(ad.mb_geometry, gb1, xyzlim)
+                            or is_block_outside_xyz(ad.mb_geometry, gb2, xyzlim)):
+                        continue
+                if gb1 not in block_cache or gb2 not in block_cache:
+                    continue
+                _process_block_pair_aniso_mhd(
+                    ad, gb1, gb2, block_cache, block_centers_global,
+                    weights_list, vel_varlist, bcc_varlist,
+                    sf_accum,
+                    rmax, rmin, Lx, Ly, Lz,
+                    lbins, lprll_bins, lperp_bins,
+                    nbins, nbins_prll, nbins_perp, max_order,
+                    cos_theta_prll_min, cos_theta_perp_max,
+                    n_samples1, n_points_per_block, nsamples_block_min,
+                    periodic_x, periodic_y, periodic_z,
+                    use_nearfield_bias=use_nearfield_bias,
+                    same_block_pair_boost=same_block_pair_boost,
+                    face_block_pair_boost=face_block_pair_boost,
+                    edge_block_pair_boost=edge_block_pair_boost,
+                    corner_block_pair_boost=corner_block_pair_boost,
+                    sparse_data=sparse_data, debug=False, use_mpi=True,
+                    random_seed=(gb1 * 10000 + gb2),
+                    pair_workspace=pair_workspace)
+                pairs_processed += 1
+
+            for block_id in remote_blocks_needed:
+                if block_id in block_cache:
+                    del block_cache[block_id]
+
+            _free_gpu_memory_pool()
+
+        for block_id in local_group_blocks:
+            if block_id in block_cache:
+                del block_cache[block_id]
+
+        _free_gpu_memory_pool()
 
     if debug:
         print(f'Debug: Rank {rank}: Completed {pairs_processed} aniso_mhd pairs')
@@ -5656,6 +6077,9 @@ def get_sf_aniso_mhd_mb(ad, vel_var='vel', bcc_var='bcc', weights='ones', xyz=No
     - l_prll: near-parallel pairs binned by |l . B_hat|
     - l_perp: near-perpendicular pairs binned by sqrt(|l|^2 - l_prll^2)
     """
+    if not cupy_enabled:
+        raise RuntimeError('Anisotropic MHD structure functions require the CuPy GPU backend')
+
     rank = mpi_manager.rank if mpi_manager else 0
 
     if debug and rank == 0:
@@ -5768,7 +6192,7 @@ def get_sf_aniso_mhd_mb(ad, vel_var='vel', bcc_var='bcc', weights='ones', xyz=No
         mpi_manager.comm.Barrier()
 
         total_global = ad.n_mbs
-        my_pairs = _build_rank_assigned_pairs(total_global, rank, mpi_manager.size)
+        my_pairs = build_owner_tiled_mpi_pairs(total_global, mpi_manager.size, rank)
 
         _process_mpi_pairs_aniso_mhd(
             ad, my_pairs, block_cache,

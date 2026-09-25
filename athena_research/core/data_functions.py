@@ -22,7 +22,7 @@ derived_var_list = [
     'Thotbool', 'Thotbool_vol', 'Thotbool_mass',
     'Trangebool', 'Trangebool_vol', 'Trangebool_mass',
     'nrho', 'nprs', 'nrho_hot', 'nprs_hot', 'nrho_range', 'nprs_range',
-    'nvelx', 'nvely', 'nvelz', 
+    'nvelx', 'nvely', 'nvelz', 'nbcc1', 'nbcc2', 'nbcc3',
     'eflxwave', 'eflxwave_hot', 'eflxwave_range',
     'delrhodelT', 'delrhodelT_hot', 'delrhodelT_range',
     'delvrdelT', 'delvrdelT_hot', 'delvrdelT_range',
@@ -868,34 +868,38 @@ def get_data(self, var, mbl=None, mbh=None, **kwargs):
                 data1_name = 'velr'
                 data2_name = 'temp'
             
-            # Determine weight and suffix based on variable name
+            # Determine weight (as a variable-name string) and suffix based on
+            # variable name. NOTE: weights must be a string, not a pre-sliced
+            # mbl:mbh array -- vertical_profile_func/set_profile always
+            # iterates the FULL local domain internally and loads 'weights'
+            # itself per its own batch (see the nvelx/nbcc1 branch above for
+            # the same issue). This branch previously also looked up
+            # self.set_vertical_mb / self.set_vertical, neither of which is
+            # ever bound on AthenaData, so it unconditionally raised
+            # ImportError('No vertical profile method available') rather than
+            # silently computing anything wrong.
             if var in ['delrhodelT_hot', 'eflxwave_hot', 'delvrdelT_hot']:
-                weight_data = get_data(self, 'Thotbool', mbl, mbh, **kwargs) * get_data(self, 'vol', mbl, mbh)
+                weight_name = 'Thotbool_vol'
                 varsuf = '_vw_hot'
             elif var in ['delrhodelT_range', 'eflxwave_range', 'delvrdelT_range']:
-                weight_data = get_data(self, 'Trangebool', mbl, mbh, **kwargs) * get_data(self, 'vol', mbl, mbh)
+                weight_name = 'Trangebool_vol'
                 varsuf = '_vw_range'
             else:
-                weight_data = get_data(self, 'vol', mbl, mbh)
+                weight_name = 'vol'
                 varsuf = ''
-            
-            # Calculate vertical profiles with set_vertical_mb
+
             bins = self.Nx3
-
-            from ..operations.profiles import set_vertical_mb
-            set_vertical_mb(self, varl=[data1_name, data2_name], bins=bins,
-                           weights=weight_data, varsuf=varsuf, redo=False,
-                           mbl=mbl, mbh=mbh)
-
+            vert = self.vertical_profile_func(self, varl=[data1_name, data2_name], bins=bins,
+                                   weights=weight_name, varsuf=varsuf, redo=False)
 
             # Extract the profiles and calculate the correlation
-            z_prof = self.vert[data1_name + varsuf]['z']
-            data1_z_prof = xp.asarray(self.vert[data1_name + varsuf]['profile'])
-            data2_z_prof = xp.asarray(self.vert[data2_name + varsuf]['profile'])
+            z_prof = xp.asarray(vert[data1_name + varsuf]['z'])
+            data1_z_prof = xp.asarray(vert[data1_name + varsuf]['profile'])
+            data2_z_prof = xp.asarray(vert[data2_name + varsuf]['profile'])
             var_z_loc = xp.digitize(get_data(self, 'z', mbl, mbh), (z_prof[1:] + z_prof[:-1]) * 0.5)
             delta_data1 = get_data(self, data1_name, mbl, mbh) - data1_z_prof[var_z_loc]
             delta_data2 = get_data(self, data2_name, mbl, mbh) - data2_z_prof[var_z_loc]
-            
+
             return delta_data1 * delta_data2
             
         # Boolean function for spatial region filtering
@@ -994,13 +998,20 @@ def get_data(self, var, mbl=None, mbh=None, **kwargs):
             var_z_prof = xp.asarray(vert[mb_var+varsuf]['profile'])
             var_z_loc = xp.digitize(get_data(self, 'z', mbl, mbh), (z_prof[1:]+z_prof[:-1])*0.5)
             return get_data(self, mb_var, mbl, mbh)/var_z_prof[var_z_loc]
-        elif var in ['nvelx', 'nvely', 'nvelz']:
+        elif var in ['nvelx', 'nvely', 'nvelz', 'nbcc1', 'nbcc2', 'nbcc3']:
             mb_var = var[1:]
-            weight_data = get_data(self, 'vol', mbl, mbh)
             varsuf = ''
             bins = self.Nx3
+            # NOTE: weights must be passed as the string 'vol', not a pre-sliced
+            # mbl:mbh array -- vertical_profile_func/set_profile always iterates
+            # the FULL local domain internally (mb_start_global=0..ad.n_mbs) and
+            # loads 'weights' itself per its own batch. A pre-sliced array is
+            # returned as-is (get_data short-circuits non-string var) and its
+            # fixed size then mismatches set_profile's own per-batch data shape,
+            # corrupting (or crashing) the cached z-profile depending on which
+            # mbl:mbh happened to trigger the first (redo=False) computation.
             vert=self.vertical_profile_func(self, varl=[mb_var], bins=bins,
-                                   weights=weight_data, varsuf=varsuf, redo=False)
+                                   weights='vol', varsuf=varsuf, redo=False)
             z_prof = xp.asarray(vert[mb_var+varsuf]['z'])
             var_z_prof = xp.asarray(vert[mb_var+varsuf]['profile'])
             var_z_loc = xp.digitize(get_data(self, 'z', mbl, mbh), (z_prof[1:]+z_prof[:-1])*0.5)

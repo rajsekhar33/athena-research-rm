@@ -90,13 +90,15 @@ class AthenaData:
             The loaded AthenaData object
         """
         self.filename = filename
+        is_h5data = filename.endswith('.h5data') or '.h5data.' in filename
+        is_hdf5 = filename.endswith(('.h5', '.hdf5', '.h5data')) or is_h5data
         if (filename.endswith('.bin')):
             self.binary_name = filename
             self.load_binary(filename, **kwargs)
         elif (filename.endswith('.athdf')):
             self.athdf_name = filename
             self.load_athdf(filename, **kwargs)
-        elif (filename.endswith(('.h5','.hdf5', '.h5data'))):
+        elif is_hdf5:
             self.hdf5_name = filename
             self.load_hdf5(filename, **kwargs)
         elif (filename.endswith('.pkl')):
@@ -140,19 +142,22 @@ class AthenaData:
         to keep file sizes small. Only post-processed results like distributions,
         profiles, spectra, and structure functions are saved.
         """
+        is_h5data = filename.endswith('.h5data') or '.h5data.' in filename
+        is_hdf5 = filename.endswith(('.h5', '.hdf5', '.h5data')) or is_h5data
         if default_except_keys is None:
             # Default exclusion list - prevents raw data from being saved
             default_except_keys = ['binary', 'h5file', 'h5dic', 'coord',
-                                   'data_raw', 'data_func', 'meshbdata_func',
+                                   'data_raw', 'mb_data', 'data_func', 'meshbdata_func',
                                    'rendering', 'h5_supplement']
         
         if except_keys is None:
             except_keys = []
         
-        # For h5data files, ensure data_raw is always excluded
-        if filename.endswith('.h5data'):
-            if 'data_raw' not in default_except_keys and 'data_raw' not in except_keys:
-                except_keys = list(except_keys) + ['data_raw']
+        # For h5data files, ensure raw meshblock data is always excluded.
+        if is_h5data:
+            for raw_key in ('data_raw', 'mb_data'):
+                if raw_key not in default_except_keys and raw_key not in except_keys:
+                    except_keys = list(except_keys) + [raw_key]
             print(f"Saving post-processed data only (raw data excluded)")
             
         dic = {}
@@ -160,12 +165,14 @@ class AthenaData:
             if (k not in except_keys + default_except_keys and not callable(v)):
                 dic[k] = v
         
-        # Verify data_raw is not in the dictionary for h5data files
-        if filename.endswith('.h5data') and 'data_raw' in dic:
-            print("Warning: Removing data_raw from h5data save")
-            del dic['data_raw']
+        # Verify raw meshblock data is not in the dictionary for h5data files.
+        if is_h5data:
+            for raw_key in ('data_raw', 'mb_data'):
+                if raw_key in dic:
+                    print(f"Warning: Removing {raw_key} from h5data save")
+                    del dic[raw_key]
         
-        if (filename.endswith(('.h5','.hdf5', '.h5data'))):
+        if is_hdf5:
             self.save_hdf5(dic, filename, **kwargs)
         elif (filename.endswith(('.p','.pkl'))):
             self.save_pickle(dic, filename, **kwargs)
@@ -234,7 +241,13 @@ class AthenaData:
         -------
         None
         """
-        self._load_from_dic(load_dict_from_hdf5(filename), **kwargs)
+        exclude_hdf5_keys = kwargs.pop('exclude_hdf5_keys', None)
+        if exclude_hdf5_keys is None and (filename.endswith('.h5data') or '.h5data.' in filename):
+            exclude_hdf5_keys = ['mb_data', 'data_raw']
+        self._load_from_dic(
+            load_dict_from_hdf5(filename, exclude_keys=exclude_hdf5_keys),
+            **kwargs,
+        )
         
     def save_hdf5(self, dic, filename):
         """
@@ -286,8 +299,19 @@ class AthenaData:
         None
         """
         if except_keys is None:
-            except_keys = ['header', 'data', 'binary', 'coord', 'data_raw']
-            
+            # MPI/meshblock-distribution bookkeeping (mpi_rank, mpi_size,
+            # has_full_data, local_mb_start, local_mb_end) reflects the state
+            # of whichever process wrote this dict, not anything meaningful
+            # for the object doing the loading now. set_mpi_distribution()'s
+            # docstring says to call it BEFORE loading data for exactly this
+            # reason -- restoring these from a saved dict would silently
+            # override that and scope every subsequent ad.data() call (and
+            # any raw-file load right after this one) to a stale partial
+            # meshblock range.
+            except_keys = ['header', 'data', 'binary', 'coord', 'data_raw',
+                           'mpi_rank', 'mpi_size', 'has_full_data',
+                           'local_mb_start', 'local_mb_end']
+
         for k, v in dic.items():
             if (k not in except_keys):
                 self.__dict__[k] = v

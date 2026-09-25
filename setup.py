@@ -6,6 +6,8 @@ setup(
     description="Tools for analyzing Athenak simulation data with CPU/GPU and MPI support",
     author="Rajsekhar Mohapatra",
     packages=find_packages(),
+    package_data={"athena_research": ["operations/marching_cubes_src/*.hpp",
+                                      "operations/marching_cubes_src/README.md"]},
     python_requires=">=3.7",
     install_requires=[
         "numpy>=1.18.0",

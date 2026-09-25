@@ -373,9 +373,9 @@ def _build_cuda_source() -> str:
     with open(_MC_HPP) as f:
         mc_src = _preprocess_cpp_for_cuda(f.read())
 
-    # Derive a physically-scaled process_cube_phys from mc_src; the original
-    # process_cube it's derived from stays in mc_src too (unused, harmless).
+    # Remove process_cube from mc_src – we will add process_cube_phys instead
     proc_cube_phys = _build_process_cube_phys(mc_src)
+    proc_cube_align = _build_process_cube_align(proc_cube_phys)
 
     cuda_src = (
         # Define float.h constants stripped along with the include.
@@ -384,11 +384,17 @@ def _build_cuda_source() -> str:
         '#define FLT_EPSILON 1.192093e-07f\n'
         '#endif\n'
         + lut_src
-        + mc_src           # Cube struct, test_face, test_interior, add_triangle, process_cube
+        + mc_src              # Cube struct, test_face, test_interior, add_triangle, process_cube
         + _ADD_TRIANGLE_PHYS
         + proc_cube_phys
-        + _KERNEL_MAIN     # slab-based kernel
-        + _KERNEL_MAIN_MB  # meshblock-based kernel
+        + _KERNEL_MAIN        # slab-based area kernel
+        + _KERNEL_MAIN_MB     # meshblock area kernel
+        + _BOX_AVG_B_DEVICE   # box-average B over s×s×s block for alignment kernel
+        + _ADD_TRIANGLE_ALIGN # per-triangle alignment accumulator
+        + proc_cube_align     # process_cube_align (generated)
+        + _KERNEL_ALIGN_MB    # meshblock alignment kernel
+        + _KERNEL_ALIGN_MB_BATCH  # one flattened launch for an alignment batch
+        + _KERNEL_ALIGN_COARSE  # grouped coarse-cube alignment kernel
     )
     return cuda_src
 
@@ -408,8 +414,11 @@ def _get_module():
         # until the first get_function() call, so we probe one function here
         # to force compilation and catch errors in this try/except block.
         mod = xp.RawModule(code=cuda_src, options=('--std=c++14', '--maxrregcount=64'))
-        mod.get_function('mc_area_kernel')      # force compile
-        mod.get_function('mc_area_kernel_mb')   # force compile
+        mod.get_function('mc_area_kernel')       # force compile
+        mod.get_function('mc_area_kernel_mb')    # force compile
+        mod.get_function('mc_align_kernel_mb')   # force compile
+        mod.get_function('mc_align_kernel_mb_batch')  # force compile
+        mod.get_function('mc_align_kernel_coarse')  # force compile
         _MC_MODULE = mod
         print('GPU marching-cubes kernels compiled successfully.')
         return _MC_MODULE
@@ -2121,3 +2130,934 @@ def set_area(ad, T_ref, h5_path: str, step_sizes=None, redo=False,
         )
 
     return ad.area_mc
+
+
+_BOX_AVG_B_DEVICE = r"""
+// Arithmetic mean of the s×s×s cell block starting at (K,J,I) in the padded array.
+// For s=1 this reduces to the single cell value at (K,J,I).
+__device__ inline double box_avg_B(
+    const double* __restrict__ f, int Ny_pad, int Nx_pad,
+    int K, int J, int I, int s
+) {
+    double sum = 0.0;
+    for (int dk = 0; dk < s; dk++)
+        for (int dj = 0; dj < s; dj++)
+            for (int di = 0; di < s; di++)
+                sum += f[(K+dk)*Ny_pad*Nx_pad + (J+dj)*Nx_pad + (I+di)];
+    return sum * (1.0 / (double)(s*s*s));
+}
+"""
+
+
+_ADD_TRIANGLE_ALIGN = r"""
+__device__ inline
+void add_triangle_align(const char *trig, char n, Cube cube,
+                        double dx, double dy, double dz,
+                        const double* __restrict__ bx,
+                        const double* __restrict__ by,
+                        const double* __restrict__ bz,
+                        int Ny_pad, int Nx_pad,
+                        int I, int J, int K, int s,
+                        double* __restrict__ area_out,
+                        double* __restrict__ align_out) {
+  double xt[3],yt[3],zt[3];
+  double xv, yv, zv;
+  int nv;
+
+  for( int t = 0 ; t < 3*n ; t++ ){
+    switch( trig[t] ) {
+      case  0: xt[t%3]=1./(1-cube.v1/cube.v0); yt[t%3]=0.; zt[t%3]=0.; break;
+      case  1: xt[t%3]=1.; yt[t%3]=1./(1-cube.v2/cube.v1); zt[t%3]=0.; break;
+      case  2: xt[t%3]=1./(1-cube.v2/cube.v3); yt[t%3]=1.; zt[t%3]=0.; break;
+      case  3: xt[t%3]=0.; yt[t%3]=1./(1-cube.v3/cube.v0); zt[t%3]=0.; break;
+      case  4: xt[t%3]=1./(1-cube.v5/cube.v4); yt[t%3]=0.; zt[t%3]=1.; break;
+      case  5: xt[t%3]=1.; yt[t%3]=1./(1-cube.v6/cube.v5); zt[t%3]=1.; break;
+      case  6: xt[t%3]=1./(1-cube.v6/cube.v7); yt[t%3]=1.; zt[t%3]=1.; break;
+      case  7: xt[t%3]=0.; yt[t%3]=1./(1-cube.v7/cube.v4); zt[t%3]=1.; break;
+      case  8: xt[t%3]=0.; yt[t%3]=0.; zt[t%3]=1./(1-cube.v4/cube.v0); break;
+      case  9: xt[t%3]=1.; yt[t%3]=0.; zt[t%3]=1./(1-cube.v5/cube.v1); break;
+      case 10: xt[t%3]=1.; yt[t%3]=1.; zt[t%3]=1./(1-cube.v6/cube.v2); break;
+      case 11: xt[t%3]=0.; yt[t%3]=1.; zt[t%3]=1./(1-cube.v7/cube.v3); break;
+      case 12:
+        xv=0.;yv=0.;zv=0.;nv=0;
+        if(cube.v1*cube.v0<0){xv+=1./(1-cube.v1/cube.v0);yv+=0.;zv+=0.;nv++;}
+        if(cube.v2*cube.v1<0){xv+=1.;yv+=1./(1-cube.v2/cube.v1);zv+=0.;nv++;}
+        if(cube.v2*cube.v3<0){xv+=1./(1-cube.v2/cube.v3);yv+=1.;zv+=0.;nv++;}
+        if(cube.v3*cube.v0<0){xv+=0.;yv+=1./(1-cube.v3/cube.v0);zv+=0.;nv++;}
+        if(cube.v5*cube.v4<0){xv+=1./(1-cube.v5/cube.v4);yv+=0.;zv+=1.;nv++;}
+        if(cube.v6*cube.v5<0){xv+=1.;yv+=1./(1-cube.v6/cube.v5);zv+=1.;nv++;}
+        if(cube.v6*cube.v7<0){xv+=1./(1-cube.v6/cube.v7);yv+=1.;zv+=1.;nv++;}
+        if(cube.v7*cube.v4<0){xv+=0.;yv+=1./(1-cube.v7/cube.v4);zv+=1.;nv++;}
+        if(cube.v4*cube.v0<0){xv+=0.;yv+=0.;zv+=1./(1-cube.v4/cube.v0);nv++;}
+        if(cube.v5*cube.v1<0){xv+=1.;yv+=0.;zv+=1./(1-cube.v5/cube.v1);nv++;}
+        if(cube.v6*cube.v2<0){xv+=1.;yv+=1.;zv+=1./(1-cube.v6/cube.v2);nv++;}
+        if(cube.v7*cube.v3<0){xv+=0.;yv+=1.;zv+=1./(1-cube.v7/cube.v3);nv++;}
+        xt[t%3]=xv/nv;yt[t%3]=yv/nv;zt[t%3]=zv/nv;
+        break;
+      default: break;
+    }
+
+    if( t%3 == 2 ) {
+      double v1=(xt[0]-xt[1])*dx, v2=(yt[0]-yt[1])*dy, v3=(zt[0]-zt[1])*dz;
+      double w1=(xt[0]-xt[2])*dx, w2=(yt[0]-yt[2])*dy, w3=(zt[0]-zt[2])*dz;
+      double u1=v2*w3-v3*w2, u2=v3*w1-v1*w3, u3=v1*w2-v2*w1;
+      double unorm = sqrt(u1*u1+u2*u2+u3*u3);
+      double area  = 0.5*unorm;
+      atomicAdd(area_out, area);
+      if( unorm < 1.0e-30 ) continue;
+
+      // B averaged over the s×s×s cell block that defines this MC cube.
+      double bx_c = box_avg_B(bx, Ny_pad, Nx_pad, K, J, I, s);
+      double by_c = box_avg_B(by, Ny_pad, Nx_pad, K, J, I, s);
+      double bz_c = box_avg_B(bz, Ny_pad, Nx_pad, K, J, I, s);
+      double bnorm = sqrt(bx_c*bx_c+by_c*by_c+bz_c*bz_c);
+      if( bnorm < 1.0e-30 ) continue;
+
+      // b̂·n̂ = (bcc1*u1 + bcc2*u2 + bcc3*u3) / (|B|*|u|)
+      // bx=bcc1=x1-comp, u1=x1-comp of n̂ — axes consistent
+      double dot = (bx_c*u1 + by_c*u2 + bz_c*u3) / (bnorm * unorm);
+      atomicAdd(align_out, area * dot * dot);
+    }
+  }
+}
+"""
+
+
+_KERNEL_ALIGN_MB = r"""
+extern "C" __global__ void mc_align_kernel_mb(
+    const double* __restrict__ data,   // padded log10(T)
+    const double* __restrict__ bx,     // padded bcc1  (x1-component of B)
+    const double* __restrict__ by,     // padded bcc2  (x2-component)
+    const double* __restrict__ bz,     // padded bcc3  (x3-component)
+    double* __restrict__ area_out,
+    double* __restrict__ align_out,    // sum of area*(b̂·n̂)²
+    int nx3, int nx2, int nx1,
+    int s_ghost,
+    int s,
+    double iso,
+    double dz_cell, double dy_cell, double dx_cell
+) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int j = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    int k = (int)(blockIdx.z * blockDim.z + threadIdx.z);
+
+    int ni = nx1 / s;
+    int nj = nx2 / s;
+    int nk = nx3 / s;
+
+    if (i >= ni || j >= nj || k >= nk) return;
+
+    int I = i*s, J = j*s, K = k*s;
+
+    int Nx_pad = nx1 + s_ghost;
+    int Ny_pad = nx2 + s_ghost;
+
+    #define _D(kk,jj,ii) (data[(kk)*Ny_pad*Nx_pad+(jj)*Nx_pad+(ii)]-iso)
+
+    Cube cube(
+        _D(K,   J,   I  ), _D(K,   J,   I+s),
+        _D(K,   J+s, I+s), _D(K,   J+s, I  ),
+        _D(K+s, J,   I  ), _D(K+s, J,   I+s),
+        _D(K+s, J+s, I+s), _D(K+s, J+s, I  )
+    );
+
+    #undef _D
+
+    double cube_dx = (double)s * dx_cell;
+    double cube_dy = (double)s * dy_cell;
+    double cube_dz = (double)s * dz_cell;
+
+    process_cube_align(cube, cube_dx, cube_dy, cube_dz,
+                       bx, by, bz, Ny_pad, Nx_pad, I, J, K, s,
+                       area_out, align_out);
+}
+"""
+
+
+_KERNEL_ALIGN_MB_BATCH = r"""
+extern "C" __global__ void mc_align_kernel_mb_batch(
+    const double* __restrict__ data,
+    const double* __restrict__ bx,
+    const double* __restrict__ by,
+    const double* __restrict__ bz,
+    double* __restrict__ area_out,
+    double* __restrict__ align_out,
+    int n_blocks, int nx3, int nx2, int nx1,
+    int s_ghost, int s, double iso,
+    double dz_cell, double dy_cell, double dx_cell
+) {
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int ni = nx1 / s, nj = nx2 / s, nk = nx3 / s;
+    int cubes_per_block = ni * nj * nk;
+    if (tid >= n_blocks * cubes_per_block) return;
+
+    int mb = tid / cubes_per_block;
+    int local = tid - mb * cubes_per_block;
+    int i = local % ni;
+    int j = (local / ni) % nj;
+    int k = local / (ni * nj);
+    int I = i*s, J = j*s, K = k*s;
+    int Nx_pad = nx1 + s_ghost, Ny_pad = nx2 + s_ghost;
+    int block_size = (nx3 + s_ghost) * Ny_pad * Nx_pad;
+    const double* d = data + mb * block_size;
+    const double* bxp = bx + mb * block_size;
+    const double* byp = by + mb * block_size;
+    const double* bzp = bz + mb * block_size;
+
+    #define _D(kk,jj,ii) (d[(kk)*Ny_pad*Nx_pad+(jj)*Nx_pad+(ii)]-iso)
+    Cube cube(
+        _D(K,   J,   I  ), _D(K,   J,   I+s),
+        _D(K,   J+s, I+s), _D(K,   J+s, I  ),
+        _D(K+s, J,   I  ), _D(K+s, J,   I+s),
+        _D(K+s, J+s, I+s), _D(K+s, J+s, I  )
+    );
+    #undef _D
+
+    process_cube_align(cube, (double)s*dx_cell, (double)s*dy_cell,
+                       (double)s*dz_cell, bxp, byp, bzp, Ny_pad, Nx_pad,
+                       I, J, K, s, area_out, align_out);
+}
+"""
+
+
+_KERNEL_ALIGN_COARSE = r"""
+extern "C" __global__ void mc_align_kernel_coarse(
+    const double* __restrict__ cubes,
+    const double* __restrict__ bx_avg,
+    const double* __restrict__ by_avg,
+    const double* __restrict__ bz_avg,
+    double* __restrict__ area_out,
+    double* __restrict__ align_out,
+    int n_cubes,
+    double cube_dz, double cube_dy, double cube_dx
+) {
+    int c = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (c >= n_cubes) return;
+
+    const double* v = cubes + 8*c;
+    Cube cube(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    // box_avg_B with s=1 reads element zero.  Each pointer addresses one
+    // pre-averaged coarse-cube field value, so no large padded array is needed.
+    process_cube_align(cube, cube_dx, cube_dy, cube_dz,
+                       bx_avg + c, by_avg + c, bz_avg + c,
+                       2, 2, 0, 0, 0, 1, area_out, align_out);
+}
+"""
+
+
+def _build_process_cube_align(proc_cube_phys_src: str) -> str:
+    """
+    Generate process_cube_align from the already-built process_cube_phys source.
+
+    process_cube_phys uses:
+      return add_triangle_phys(TILING, N, cube, dx, dy, dz);
+      return 0.0;   (no-triangle cases)
+
+    Transformations applied:
+      1. Change function name/signature: double→void, add B arrays + position + outputs
+      2. return add_triangle_phys(  →  add_triangle_align(   (drop return, rename)
+      3. , cube, dx, dy, dz);  →  , cube, dx, dy, dz, bx, by, bz, Ny_pad, Nx_pad,
+                                    I, J, K, s, area_out, align_out);
+      4. return 0.0;  →  return;   (no-triangle case, void function)
+    """
+    src = proc_cube_phys_src
+
+    # 1. Rename and extend signature.
+    src = src.replace(
+        'double process_cube_phys(Cube cube, double dx, double dy, double dz)',
+        '__device__ void process_cube_align(\n'
+        '    Cube cube, double dx, double dy, double dz,\n'
+        '    const double* __restrict__ bx,\n'
+        '    const double* __restrict__ by,\n'
+        '    const double* __restrict__ bz,\n'
+        '    int Ny_pad, int Nx_pad,\n'
+        '    int I, int J, int K, int s,\n'
+        '    double* __restrict__ area_out,\n'
+        '    double* __restrict__ align_out)',
+    )
+
+    # 2. Replace "return add_triangle_phys(" with a compound open-brace.
+    #    The original "return" prevented switch-case fall-through; we preserve that
+    #    by wrapping each call as "{ add_triangle_align(...); return; }".
+    src = src.replace('return add_triangle_phys(', '{ add_triangle_align(')
+
+    # 3. Close the compound statement: extend args and add return + closing brace.
+    src = src.replace(
+        ', cube, dx, dy, dz);',
+        ', cube, dx, dy, dz, bx, by, bz, Ny_pad, Nx_pad, I, J, K, s, area_out, align_out); return; }',
+    )
+
+    # 4. No-triangle case: return 0.0; → return;
+    src = src.replace('return 0.0;', 'return;')
+
+    return '\n// ── process_cube_align (field-normal alignment) ──\n' + src + '\n'
+
+
+def _get_kernel_align_mb():
+    """Return the meshblock alignment kernel (mc_align_kernel_mb)."""
+    mod = _get_module()
+    return mod.get_function('mc_align_kernel_mb') if mod is not None else None
+
+
+def _get_kernel_align_mb_batch():
+    """Return the flattened, multi-meshblock alignment kernel."""
+    mod = _get_module()
+    return mod.get_function('mc_align_kernel_mb_batch') if mod is not None else None
+
+
+def _get_kernel_align_coarse():
+    """Return the GPU kernel for meshblock-grouped coarse alignment cubes."""
+    mod = _get_module()
+    return mod.get_function('mc_align_kernel_coarse') if mod is not None else None
+
+
+
+
+
+
+
+
+def _iter_contiguous_block_runs(block_indices):
+    """Yield half-open contiguous global meshblock-index runs."""
+    if not block_indices:
+        return
+    ordered = sorted({int(m) for m in block_indices})
+    first = previous = ordered[0]
+    for block in ordered[1:]:
+        if block == previous + 1:
+            previous = block
+            continue
+        yield first, previous + 1
+        first = previous = block
+    yield first, previous + 1
+
+
+def _alignment_batch_fields(ad, block_indices, iso_field, vector_fields,
+                            log_iso_field=False):
+    """Load a scalar and vector field using contiguous ``ad.data`` calls.
+
+    The returned arrays stay on the GPU.  ``ad.data`` is deliberately used for
+    both derived and native fields: it is the common data-function interface
+    and avoids a Python/HDF5 load for every block.
+    """
+    fields = {}
+    for mbl, mbh in _iter_contiguous_block_runs(block_indices):
+        scalar = xp.asarray(ad.data(iso_field, mbl=mbl, mbh=mbh), dtype=xp.float64)
+        fields[(mbl, mbh)] = {
+            'scalar': xp.log10(scalar) if log_iso_field else scalar,
+            'vector0': xp.asarray(ad.data(vector_fields[0], mbl=mbl, mbh=mbh), dtype=xp.float64),
+            'vector1': xp.asarray(ad.data(vector_fields[1], mbl=mbl, mbh=mbh), dtype=xp.float64),
+            'vector2': xp.asarray(ad.data(vector_fields[2], mbl=mbl, mbh=mbh), dtype=xp.float64),
+        }
+    return fields
+
+
+def _alignment_gather_blocks(field_runs, indices, field):
+    """Gather selected meshblocks from contiguous-range GPU loads."""
+    pieces = []
+    for index in indices:
+        for (mbl, mbh), values in field_runs.items():
+            if mbl <= index < mbh:
+                pieces.append(values[field][index - mbl])
+                break
+        else:
+            raise RuntimeError(f'alignment batch omitted required meshblock {index}')
+    return xp.stack(pieces, axis=0)
+
+
+def _build_alignment_padded_batch(field_runs, centers, neighbors, s_ghost, field):
+    """Build GPU-resident padded arrays for a batch of center meshblocks."""
+    nx3, nx2, nx1 = next(iter(field_runs.values()))[field].shape[1:]
+    ncenters = len(centers)
+    out = xp.empty((ncenters, nx3 + s_ghost, nx2 + s_ghost, nx1 + s_ghost),
+                   dtype=xp.float64)
+
+    center = _alignment_gather_blocks(field_runs, centers, field)
+    x_plus = _alignment_gather_blocks(field_runs, [neighbors[m][0] for m in centers], field)
+    y_plus = _alignment_gather_blocks(field_runs, [neighbors[m][1] for m in centers], field)
+    xy_plus = _alignment_gather_blocks(
+        field_runs, [neighbors[neighbors[m][1]][0] for m in centers], field)
+    out[:, :nx3, :nx2, :nx1] = center
+    out[:, :nx3, :nx2, nx1:] = x_plus[:, :, :, :s_ghost]
+    out[:, :nx3, nx2:, :nx1] = y_plus[:, :, :s_ghost, :]
+    out[:, :nx3, nx2:, nx1:] = xy_plus[:, :, :s_ghost, :s_ghost]
+
+    has_z = [i for i, m in enumerate(centers) if neighbors[m][2] is not None]
+    no_z = [i for i, m in enumerate(centers) if neighbors[m][2] is None]
+    if has_z:
+        z_indices = [neighbors[centers[i]][2] for i in has_z]
+        z_plus = _alignment_gather_blocks(field_runs, z_indices, field)
+        zx_plus = _alignment_gather_blocks(field_runs, [neighbors[m][0] for m in z_indices], field)
+        zy_plus = _alignment_gather_blocks(field_runs, [neighbors[m][1] for m in z_indices], field)
+        zxy_plus = _alignment_gather_blocks(
+            field_runs, [neighbors[neighbors[m][1]][0] for m in z_indices], field)
+        out[has_z, nx3:, :nx2, :nx1] = z_plus[:, :s_ghost, :, :]
+        out[has_z, nx3:, :nx2, nx1:] = zx_plus[:, :s_ghost, :, :s_ghost]
+        out[has_z, nx3:, nx2:, :nx1] = zy_plus[:, :s_ghost, :s_ghost, :]
+        out[has_z, nx3:, nx2:, nx1:] = zxy_plus[:, :s_ghost, :s_ghost, :s_ghost]
+    if no_z:
+        out[no_z, nx3:, :, :] = out[no_z, nx3 - 1:nx3, :, :]
+    return out
+
+
+def _alignment_required_blocks(centers, neighbors):
+    """Return center blocks and the +direction blocks needed for their padding."""
+    required = set()
+    for m in centers:
+        x_plus, y_plus, z_plus = neighbors[m]
+        required.update((m, x_plus, y_plus, neighbors[y_plus][0]))
+        if z_plus is not None:
+            required.update((z_plus, neighbors[z_plus][0], neighbors[z_plus][1],
+                             neighbors[neighbors[z_plus][1]][0]))
+    return sorted(required)
+
+
+def _release_alignment_gpu_memory():
+    """Return unused batch allocations before the next (possibly larger) phase."""
+    if cupy_enabled:
+        xp.cuda.Stream.null.synchronize()
+        xp.get_default_memory_pool().free_all_blocks()
+        xp.get_default_pinned_memory_pool().free_all_blocks()
+
+
+def _alignment_gpu_budget_bytes():
+    """Return a conservative usable allocation budget for alignment batches.
+
+    The value deliberately depends on the *currently free* device memory, not
+    on an assumed GPU model.  This lets the calculation coexist with another
+    process and makes the batching safe for meshblocks of any shape.
+    """
+    if not cupy_enabled:
+        return 0
+    free_bytes, total_bytes = xp.cuda.runtime.memGetInfo()
+    # Reserve half of the currently free memory for CUDA/CuPy workspaces and
+    # allocations owned by ad.data().  A fractional reserve scales with the
+    # device capacity and its current level of sharing.
+    del total_bytes
+    return max(0, int(0.50 * free_bytes))
+
+
+def _alignment_blocks_per_batch(nx3, nx2, nx1, max_ghost, max_blocks=None):
+    """Choose a local alignment batch from actual block and GPU memory sizes.
+
+    Four double-precision input fields are resident, together with four
+    padded fields and their gather temporaries.  This is an intentionally
+    conservative upper bound so a smaller launch is selected before an
+    allocation failure can abort a snapshot.
+    """
+    cells = int(nx3) * int(nx2) * int(nx1)
+    padded_cells = (int(nx3) + int(max_ghost)) * (int(nx2) + int(max_ghost)) \
+        * (int(nx1) + int(max_ghost))
+    # The largest padding stencil uses eight neighbour blocks per centre.  The
+    # factor accounts for stack/gather copies, the CuPy allocator's size
+    # classes, and work arrays associated with all requested smoothing scales.
+    # It is deliberately measured in bytes per *actual* block, not calibrated
+    # to a particular mesh layout.
+    bytes_per_block = int(2.5 * 4 * 8 * (8 * cells + padded_cells))
+    budget = _alignment_gpu_budget_bytes()
+    if budget <= 0:
+        return 1
+    result = max(1, budget // max(1, bytes_per_block))
+    return min(int(max_blocks), result) if max_blocks is not None else result
+
+
+def _alignment_coarse_groups_per_batch(nx3, nx2, nx1, blocks_per_group,
+                                        max_groups=None):
+    """Choose a meshblock-spanning-scale batch from actual array sizes."""
+    cells = int(nx3) * int(nx2) * int(nx1)
+    # Four resident double fields plus one full-group gather used by the
+    # sequential vector reductions.  Extra headroom covers non-contiguous
+    # ad.data() runs and CuPy's reduction workspace.
+    # A cube also needs its eight vertices; at small grouped scales those can
+    # lie outside the blocks used for the vector average, so include them in
+    # the bound as well.
+    resident_blocks = int(blocks_per_group) + 8
+    bytes_per_group = int(1.5 * 5 * resident_blocks * cells * 8)
+    budget = _alignment_gpu_budget_bytes()
+    if budget <= 0:
+        return 1
+    result = max(1, budget // max(1, bytes_per_group))
+    return min(int(max_groups), result) if max_groups is not None else result
+
+
+def _alignment_cpu_triangles(verts, faces, bx, by, bz):
+    """Return area and area-weighted alignment from CPU MC triangles.
+
+    ``verts`` use scikit-image's (x3, x2, x1) ordering, whereas Athena's
+    bcc1/2/3 are (x1, x2, x3), hence the deliberately reversed normal indices.
+    """
+    tri = verts[faces]
+    normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    norm = np.linalg.norm(normal, axis=1)
+    area = 0.5 * norm
+    valid = norm > 1.0e-30
+    if not np.any(valid):
+        return 0.0, 0.0
+    normal = normal[valid]
+    norm = norm[valid]
+    area = area[valid]
+    bx, by, bz = bx[valid], by[valid], bz[valid]
+    bnorm = np.sqrt(bx*bx + by*by + bz*bz)
+    valid_b = bnorm > 1.0e-30
+    dot = (bx[valid_b] * normal[valid_b, 2]
+           + by[valid_b] * normal[valid_b, 1]
+           + bz[valid_b] * normal[valid_b, 0]) / (bnorm[valid_b] * norm[valid_b])
+    return float(area.sum()), float(np.sum(area[valid_b] * dot * dot))
+
+
+def _alignment_cpu_block(log_pad, bx_pad, by_pad, bz_pad, iso, s, dz, dy, dx,
+                         nx3, nx2, nx1):
+    """CPU fallback for one padded meshblock at one local smoothing scale."""
+    coarse = np.asarray(log_pad[::s, ::s, ::s], dtype=np.float64)
+    if coarse.max() <= iso or coarse.min() >= iso:
+        return 0.0, 0.0
+    verts, faces, _, _ = skimage.measure.marching_cubes(
+        coarse, level=iso, spacing=(s * dz, s * dy, s * dx), allow_degenerate=False)
+    centroid = np.mean(verts[faces], axis=1)
+    kk = np.clip((centroid[:, 0] / (s * dz)).astype(int), 0, nx3 // s - 1)
+    jj = np.clip((centroid[:, 1] / (s * dy)).astype(int), 0, nx2 // s - 1)
+    ii = np.clip((centroid[:, 2] / (s * dx)).astype(int), 0, nx1 // s - 1)
+
+    def coarse_b(field):
+        core = np.asarray(field[:nx3, :nx2, :nx1], dtype=np.float64)
+        return core.reshape(nx3 // s, s, nx2 // s, s, nx1 // s, s).mean(axis=(1, 3, 5))
+
+    bxc, byc, bzc = coarse_b(bx_pad), coarse_b(by_pad), coarse_b(bz_pad)
+    return _alignment_cpu_triangles(verts, faces, bxc[kk, jj, ii], byc[kk, jj, ii], bzc[kk, jj, ii])
+
+
+def _calc_vector_nhat_alignment_cpu_local(ad, iso, centers, neighbors, step_sizes,
+                                          dz, dy, dx, iso_field, vector_fields,
+                                          log_iso_field):
+    """CPU fallback using the same batched ``ad.data`` and padding path."""
+    nx3, nx2, nx1 = ad.nx3, ad.nx2, ad.nx1
+    area = {s: 0.0 for s in step_sizes}
+    align = {s: 0.0 for s in step_sizes}
+    blocks_per_batch = 4
+    for first in range(0, len(centers), blocks_per_batch):
+        batch = [int(m) for m in centers[first:first + blocks_per_batch]]
+        fields = _alignment_batch_fields(ad, _alignment_required_blocks(batch, neighbors),
+                                         iso_field, vector_fields, log_iso_field)
+        for s in step_sizes:
+            log = asnumpy(_build_alignment_padded_batch(fields, batch, neighbors, s, 'scalar'))
+            bx = asnumpy(_build_alignment_padded_batch(fields, batch, neighbors, s, 'vector0'))
+            by = asnumpy(_build_alignment_padded_batch(fields, batch, neighbors, s, 'vector1'))
+            bz = asnumpy(_build_alignment_padded_batch(fields, batch, neighbors, s, 'vector2'))
+            for index in range(len(batch)):
+                da, dalign = _alignment_cpu_block(log[index], bx[index], by[index], bz[index],
+                                                   iso, s, dz, dy, dx, nx3, nx2, nx1)
+                area[s] += da
+                align[s] += dalign
+    return area, align
+
+
+def _find_interface_z_levels_for_field(ad, iso_field, iso_value, log_iso_field,
+                                       n_buffer=1):
+    """Find the interface slab for an arbitrary scalar through ``ad.data``."""
+    zstarts = np.sort(np.unique(ad.mb_geometry[:, 4]))
+    profile = np.empty(len(zstarts), dtype=float)
+    for iz, zstart in enumerate(zstarts):
+        blocks = np.where(ad.mb_geometry[:, 4] == zstart)[0].tolist()
+        total = 0.0
+        count = 0
+        for mbl, mbh in _iter_contiguous_block_runs(blocks):
+            values = xp.asarray(ad.data(iso_field, mbl=mbl, mbh=mbh), dtype=xp.float64)
+            if log_iso_field:
+                values = xp.log10(values)
+            total += float(asnumpy(xp.sum(values)))
+            count += int(values.size)
+        profile[iz] = total / count
+    target = float(np.log10(iso_value)) if log_iso_field else float(iso_value)
+    crossing = int(np.argmin(np.abs(profile - target)))
+    return zstarts[max(0, crossing - n_buffer):min(len(zstarts), crossing + n_buffer + 1)], crossing
+
+
+def _calc_vector_nhat_alignment_grouped_mb(ad, iso, z_selected, step_sizes,
+                                            iso_field, vector_fields,
+                                            log_iso_field):
+    """Evaluate meshblock-spanning scales with batched GPU data/reductions."""
+    nx3, nx2, nx1 = ad.nx3, ad.nx2, ad.nx1
+    if any(s % nx1 or s % nx2 or s % nx3 for s in step_sizes):
+        raise ValueError(
+            'grouped alignment scales must be integer multiples of each '
+            f'meshblock dimension {(nx1, nx2, nx3)}: {step_sizes}'
+        )
+
+    kernel = _get_kernel_align_coarse()
+    if kernel is None:
+        raise RuntimeError('mc_align_kernel_coarse GPU kernel not available.')
+
+    nblk1, nblk2, nblk3 = ad.Nx1 // nx1, ad.Nx2 // nx2, ad.Nx3 // nx3
+    lookup = _build_meshblock_lookup(ad)
+    zstarts = np.sort(np.unique(ad.mb_geometry[:, 4]))
+    slab_bz = set(np.where(np.isin(zstarts, z_selected))[0].tolist())
+    dz = (ad.x3max - ad.x3min) / ad.Nx3
+    dy = (ad.x2max - ad.x2min) / ad.Nx2
+    dx = (ad.x1max - ad.x1min) / ad.Nx1
+    out = {}
+
+    for s in step_sizes:
+        q1, q2, q3 = s // nx1, s // nx2, s // nx3
+        cube_starts = []
+        for bk in range(0, nblk3, q3):
+            if not slab_bz.intersection(range(bk, bk + q3)):
+                continue
+            for bj in range(0, nblk2, q2):
+                for bi in range(0, nblk1, q1):
+                    gi, gj, gk = bi * nx1, bj * nx2, bk * nx3
+                    cube_starts.append((gi, gj, gk))
+
+        if not cube_starts:
+            out[s] = (0.0, 0.0)
+            continue
+
+        # This scale covers all blocks in each selected coarse cube.  A single
+        # contiguous range load is much faster than block-at-a-time H2D copies;
+        # the box averages are reductions on the GPU, not host ``.sum`` calls.
+        logical_to_mb = lookup
+        vertex_mb, vertex_k, vertex_j, vertex_i, group_mb = [], [], [], [], []
+        for gi, gj, gk in cube_starts:
+            group = []
+            for bk in range(gk // nx3, gk // nx3 + q3):
+                for bj in range(gj // nx2, gj // nx2 + q2):
+                    for bi in range(gi // nx1, gi // nx1 + q1):
+                        group.append(logical_to_mb[(bi, bj, bk)])
+            group_mb.append(group)
+            for dk, dj, di in ((0, 0, 0), (0, 0, s), (0, s, s), (0, s, 0),
+                               (s, 0, 0), (s, 0, s), (s, s, s), (s, s, 0)):
+                ii, jj, kk = (gi + di) % ad.Nx1, (gj + dj) % ad.Nx2, min(gk + dk, ad.Nx3 - 1)
+                bi, li = divmod(ii, nx1)
+                bj, lj = divmod(jj, nx2)
+                bk, lk = divmod(kk, nx3)
+                vertex_mb.append(logical_to_mb[(bi, bj, bk)])
+                vertex_k.append(lk)
+                vertex_j.append(lj)
+                vertex_i.append(li)
+
+        # Loading every selected coarse cube at once can make the resident
+        # field arrays and indexed temporaries exceed device memory.  Chunk
+        # coarse cubes according to their true block shape and free each chunk
+        # before the next one.
+        # Each chunk still uses contiguous ad.data() ranges and one flattened
+        # kernel launch, rather than a meshblock-at-a-time data path.
+        groups_per_batch = _alignment_coarse_groups_per_batch(
+            nx3, nx2, nx1, max(len(group) for group in group_mb))
+        total_area = 0.0
+        total_align = 0.0
+        for first in range(0, len(cube_starts), groups_per_batch):
+            last = min(first + groups_per_batch, len(cube_starts))
+            batch_groups = group_mb[first:last]
+            batch_vertex_mb = vertex_mb[8 * first:8 * last]
+            batch_vertex_k = vertex_k[8 * first:8 * last]
+            batch_vertex_j = vertex_j[8 * first:8 * last]
+            batch_vertex_i = vertex_i[8 * first:8 * last]
+            blocks = sorted({m for group in batch_groups for m in group}
+                            | set(batch_vertex_mb))
+            field_runs = _alignment_batch_fields(
+                ad, blocks, iso_field, vector_fields, log_iso_field)
+            temp = _alignment_gather_blocks(field_runs, batch_vertex_mb, 'scalar')
+            values = temp[xp.arange(len(batch_vertex_mb)), xp.asarray(batch_vertex_k),
+                          xp.asarray(batch_vertex_j), xp.asarray(batch_vertex_i)]
+            cubes_gpu = values.reshape(last - first, 8) - iso
+
+            # Materialize only one component's group gather at a time.  Its
+            # lifetime ends before the next component is reduced.
+            def reduce_groups(field):
+                means = []
+                for group in batch_groups:
+                    group_values = _alignment_gather_blocks(field_runs, group, field)
+                    means.append(xp.mean(group_values, axis=(0, 1, 2, 3)))
+                    del group_values
+                    _release_alignment_gpu_memory()
+                return xp.stack(means)
+
+            bx_gpu = reduce_groups('vector0')
+            by_gpu = reduce_groups('vector1')
+            bz_gpu = reduce_groups('vector2')
+            area_gpu = xp.zeros(1, dtype=xp.float64)
+            align_gpu = xp.zeros(1, dtype=xp.float64)
+            ncubes = last - first
+            kernel(
+                ((ncubes + 127) // 128,), (128,),
+                (cubes_gpu, bx_gpu, by_gpu, bz_gpu, area_gpu, align_gpu,
+                 np.int32(ncubes), np.float64(s * dz), np.float64(s * dy), np.float64(s * dx)),
+            )
+            total_area += float(asnumpy(area_gpu)[0])
+            total_align += float(asnumpy(align_gpu)[0])
+            del field_runs, temp, values, cubes_gpu, bx_gpu, by_gpu, bz_gpu, area_gpu, align_gpu
+            _release_alignment_gpu_memory()
+        out[s] = (total_area, total_align)
+
+    return out
+
+
+def calc_vector_nhat_alignment_mb_based(ad, iso_value, iso_field, vector_fields,
+                                        n_mb_buffer=1, step_sizes=None,
+                                        log_iso_field=False, use_gpu=True,
+                                        verbose=True, mpi_manager=None,
+                                        redo=False, cache_attr='vector_nhat_alignment'):
+    """
+    Compute area-weighted <(v̂·n̂)²> for a scalar isosurface and vector field.
+
+    Requires a uniform mesh with periodic x1/x2 and outflow x3 boundaries.
+    MPI work sharing requires a full-domain input on every rank.
+
+    Processes batches of slab meshblocks.  For each batch and step size s:
+      1. Load ``iso_field`` and ``vector_fields`` via contiguous-range ``ad.data`` calls.
+      2. Build GPU-resident padded blocks (ghost cells from neighbours).
+      3. Run one flattened CUDA kernel which, for every MC triangle at scale s:
+           - n̂: from the cross product of the coarsened triangle edges
+           - v̂: from the box average of the vector over the s×s×s cell block
+         and accumulates both area and area*(v̂·n̂)² atomically.
+
+    v̂ = the supplied three-component vector, box-averaged at scale s.
+    n̂ = unit normal to the triangle, at spatial scale s*dx.
+    Isotropic (random) expectation: <(v̂·n̂)²> = 1/3.
+
+    Results are cached in ``getattr(ad, cache_attr)`` after computation.  The caller is
+    responsible for calling ad.save() to persist to the h5data file.
+
+    Parameters
+    ----------
+    ad          : AthenaData
+    iso_value   : float
+    iso_field   : str
+                 scalar field name accepted by ``ad.data``.
+    vector_fields : sequence of three str
+                 x1/x2/x3 component field names accepted by ``ad.data``.
+    n_mb_buffer : int         extra meshblock z-levels around the interface slab
+    step_sizes  : list of int  smoothing scales (default [1] = native resolution)
+    log_iso_field : bool
+                 take log10 of the scalar and iso_value before marching cubes.
+    use_gpu     : bool
+    verbose     : bool
+    mpi_manager : MPIManager or None
+    redo        : bool        ignore cached ad.align_mc and recompute
+
+    Returns
+    -------
+    mean_cos2  : float   area-weighted <(v̂·n̂)²> at step_sizes[0]  (nan if no isosurface)
+    total_area : float   total isosurface area at step_sizes[0]
+
+    Full multi-scale results are stored under ``cache_attr``.
+    """
+    if not isinstance(iso_field, str):
+        raise TypeError('iso_field must be an ad.data field name')
+    if len(vector_fields) != 3 or not all(isinstance(v, str) for v in vector_fields):
+        raise ValueError('vector_fields must contain exactly three ad.data field names')
+    vector_fields = tuple(vector_fields)
+    if step_sizes is None:
+        step_sizes = [1]
+    step_sizes = sorted(set(int(s) for s in step_sizes))
+    if not step_sizes or any(s <= 0 for s in step_sizes):
+        raise ValueError('step_sizes must contain positive integers')
+    if not getattr(ad, 'has_full_data', True):
+        raise ValueError('alignment requires all meshblocks on each rank, including neighbor halos')
+
+    rank = mpi_manager.rank if mpi_manager is not None else 0
+
+    # Return cached result if available and compatible.
+    if not redo:
+        cached = getattr(ad, cache_attr, None)
+        if (cached is not None
+                and np.isclose(float(cached.get('iso_value', cached.get('T_peak', np.nan))), float(iso_value))
+                and int(cached.get('n_mb_buffer', -1)) == int(n_mb_buffer)
+                and list(cached.get('step_sizes', [])) == step_sizes
+                and cached.get('iso_field', iso_field) == iso_field
+                and tuple(cached.get('vector_fields', vector_fields)) == vector_fields
+                and bool(cached.get('log_iso_field', log_iso_field)) == bool(log_iso_field)):
+            if rank == 0 and verbose:
+                print('  Using cached alignment from ad.align_mc')
+            cos2_list = cached['mean_cos2']
+            area_list = cached['total_area']
+            return float(cos2_list[0]), float(area_list[0])
+
+    n_mb = ad.n_mbs
+    nx3, nx2, nx1 = ad.nx3, ad.nx2, ad.nx1
+
+    dz = (ad.x3max - ad.x3min) / ad.Nx3
+    dy = (ad.x2max - ad.x2min) / ad.Nx2
+    dx = (ad.x1max - ad.x1min) / ad.Nx1
+    iso = float(np.log10(iso_value)) if log_iso_field else float(iso_value)
+
+    use_kernel = use_gpu and cupy_enabled and _get_module() is not None
+
+    kernel = _get_kernel_align_mb_batch() if use_kernel else None
+    if use_kernel and kernel is None:
+        raise RuntimeError('mc_align_kernel_mb_batch GPU kernel not available.')
+
+    # Retain the established temperature slab selector bit-for-bit for the
+    # legacy B/T wrapper.  Other fields use the same z-profile criterion via
+    # contiguous-range ``ad.data`` loads.
+    if iso_field == 'temp' and log_iso_field:
+        z_selected, iz_cross = find_interface_z_levels(ad, iso_value, n_buffer=n_mb_buffer)
+    else:
+        z_selected, iz_cross = _find_interface_z_levels_for_field(
+            ad, iso_field, iso_value, log_iso_field, n_buffer=n_mb_buffer)
+    slab_indices = np.where(np.isin(ad.mb_geometry[:, 4], z_selected))[0]
+    n_slab = len(slab_indices)
+
+    if mpi_manager is not None and mpi_manager.size > 1:
+        my_slab = slab_indices[rank::mpi_manager.size]
+    else:
+        my_slab = slab_indices
+
+    if rank == 0 and verbose:
+        print(
+            f'  Vector-normal alignment: {n_slab}/{n_mb} slab meshblocks '
+            f'(z-level {iz_cross}, buffer={n_mb_buffer}), '
+            f'step_sizes={step_sizes}'
+        )
+
+    neighbors = _find_mc_neighbors(ad)
+    # Accumulators for each step size.
+    results_area  = {s: 0.0 for s in step_sizes}
+    results_align = {s: 0.0 for s in step_sizes}
+    # A meshblock-local scale must tile every local dimension.  Otherwise the
+    # integer cube counts in the CUDA kernel would drop remainder cells.  A
+    # non-local scale is handled below only when it is an integral multiple of
+    # the full meshblock shape; all other requests are rejected there.
+    local_steps = [
+        s for s in step_sizes
+        if s <= min(nx1, nx2, nx3)
+        and nx1 % s == 0 and nx2 % s == 0 and nx3 % s == 0
+    ]
+    grouped_steps = [s for s in step_sizes if s not in local_steps]
+    if grouped_steps and mpi_manager is not None and mpi_manager.size > 1:
+        raise RuntimeError(
+            'meshblock-grouped alignment scales require one rank; distribute '
+            'snapshots, not the same grouped coarse cubes, across ranks.'
+        )
+    if not use_kernel:
+        if grouped_steps:
+            raise RuntimeError(
+                'The portable CPU alignment backend currently supports step sizes '
+                f'up to one meshblock ({min(nx1, nx2, nx3)} cells).'
+            )
+        if rank == 0 and verbose:
+            print('  GPU unavailable; using the portable scikit-image CPU alignment backend.')
+        results_area, results_align = _calc_vector_nhat_alignment_cpu_local(
+            ad, iso, my_slab, neighbors, local_steps, dz, dy, dx,
+            iso_field, vector_fields, log_iso_field)
+        if mpi_manager is not None and mpi_manager.size > 1:
+            for s in step_sizes:
+                results_area[s] = mpi_manager.comm.allreduce(results_area[s], op=mpi_manager.MPI.SUM)
+                results_align[s] = mpi_manager.comm.allreduce(results_align[s], op=mpi_manager.MPI.SUM)
+        cos2_list = [float(results_align[s] / results_area[s]) if results_area[s] else np.nan
+                     for s in step_sizes]
+        area_list = [float(results_area[s]) for s in step_sizes]
+        setattr(ad, cache_attr, {
+            'step_sizes': step_sizes, 'mean_cos2': cos2_list, 'total_area': area_list,
+            'iso_value': float(iso_value), 'iso_field': iso_field,
+            'vector_fields': list(vector_fields), 'log_iso_field': bool(log_iso_field),
+            'n_mb_buffer': int(n_mb_buffer),
+        })
+        return cos2_list[0], area_list[0]
+    # Keep one device accumulator per scale for the entire slab.  Blocks are
+    # loaded in contiguous ``ad.data`` ranges and a single flat kernel launch
+    # covers every cube in each GPU-resident batch.
+    local_area_gpu = {s: xp.zeros(1, dtype=xp.float64) for s in local_steps}
+    local_align_gpu = {s: xp.zeros(1, dtype=xp.float64) for s in local_steps}
+    # The launch size follows both the actual meshblock dimensions and the
+    # currently available device memory.  This supports arbitrary block shapes
+    # and device capacities without a machine-specific tuning constant.
+    blocks_per_batch = _alignment_blocks_per_batch(
+        nx3, nx2, nx1, max(local_steps, default=1))
+    if rank == 0 and verbose:
+        print(f'  Alignment batch size: {blocks_per_batch} meshblocks '
+              f'(block shape {nx3}x{nx2}x{nx1})')
+    n_active = 0
+    for batch_start in range(0, len(my_slab), blocks_per_batch):
+        centers = [int(m) for m in my_slab[batch_start:batch_start + blocks_per_batch]]
+        field_runs = _alignment_batch_fields(
+            ad, _alignment_required_blocks(centers, neighbors),
+            iso_field, vector_fields, log_iso_field)
+        center_log = _alignment_gather_blocks(field_runs, centers, 'scalar')
+        active = xp.any(center_log < iso, axis=(1, 2, 3)) & xp.any(
+            center_log > iso, axis=(1, 2, 3))
+        n_active += int(asnumpy(xp.count_nonzero(active)))
+
+        for s in local_steps:
+            log_gpu = _build_alignment_padded_batch(
+                field_runs, centers, neighbors, s, 'scalar')
+            bx_gpu = _build_alignment_padded_batch(
+                field_runs, centers, neighbors, s, 'vector0')
+            by_gpu = _build_alignment_padded_batch(
+                field_runs, centers, neighbors, s, 'vector1')
+            bz_gpu = _build_alignment_padded_batch(
+                field_runs, centers, neighbors, s, 'vector2')
+            cubes_per_block = (nx1 // s) * (nx2 // s) * (nx3 // s)
+            nthreads = len(centers) * cubes_per_block
+            kernel(
+                ((nthreads + 255) // 256,), (256,),
+                (
+                    log_gpu, bx_gpu, by_gpu, bz_gpu,
+                    local_area_gpu[s], local_align_gpu[s],
+                    np.int32(len(centers)), np.int32(nx3), np.int32(nx2), np.int32(nx1),
+                    np.int32(s), np.int32(s), np.float64(iso),
+                    np.float64(dz), np.float64(dy), np.float64(dx),
+                ),
+            )
+            # Every smoothing scale has a distinct padded shape.  Synchronize
+            # and release it now, instead of allowing the CuPy pool to retain
+            # all of those size classes until the end of the batch.  The two
+            # scalar accumulators remain resident, so this changes neither the
+            # arithmetic nor the one-flat-launch-per-scale design.
+            del log_gpu, bx_gpu, by_gpu, bz_gpu
+            _release_alignment_gpu_memory()
+
+        if rank == 0 and verbose:
+            print(f'    queued {min(batch_start + len(centers), len(my_slab)):4d}/{len(my_slab)} slab blocks')
+        del field_runs, center_log, active
+        _release_alignment_gpu_memory()
+
+    # Exactly one synchronization per smoothing scale after all slab kernels
+    # have been enqueued.
+    for s in local_steps:
+        results_area[s] += float(asnumpy(local_area_gpu[s])[0])
+        results_align[s] += float(asnumpy(local_align_gpu[s])[0])
+
+    # Coarse scales spanning several meshblocks use globally aligned cubes,
+    # avoiding both zero-cube launches and duplicate inter-meshblock faces.
+    if grouped_steps:
+        grouped = _calc_vector_nhat_alignment_grouped_mb(
+            ad, iso, z_selected, grouped_steps, iso_field, vector_fields, log_iso_field,
+        )
+        for s, (area, alignment) in grouped.items():
+            results_area[s] += area
+            results_align[s] += alignment
+
+    # MPI reduction across ranks.
+    if mpi_manager is not None and mpi_manager.size > 1:
+        for s in step_sizes:
+            results_area[s]  = mpi_manager.comm.allreduce(results_area[s],  op=mpi_manager.MPI.SUM)
+            results_align[s] = mpi_manager.comm.allreduce(results_align[s], op=mpi_manager.MPI.SUM)
+
+    cos2_list = []
+    area_list = []
+    for s in step_sizes:
+        tot_area  = results_area[s]
+        tot_align = results_align[s]
+        mc2 = (tot_align / tot_area) if tot_area > 0.0 else np.nan
+        cos2_list.append(float(mc2))
+        area_list.append(float(tot_area))
+
+    if rank == 0 and verbose:
+        for s, mc2, tot_area in zip(step_sizes, cos2_list, area_list):
+            print(
+                f'    s={s}: {n_active}/{len(my_slab)} active; '
+                f'area={tot_area:.6g}  <(v̂·n̂)²>={mc2:.4f}'
+            )
+
+    setattr(ad, cache_attr, {
+        'step_sizes':  step_sizes,
+        'mean_cos2':   cos2_list,
+        'total_area':  area_list,
+        'iso_value':   float(iso_value),
+        'iso_field':   iso_field,
+        'vector_fields': list(vector_fields),
+        'log_iso_field': bool(log_iso_field),
+        'n_mb_buffer': int(n_mb_buffer),
+    })
+
+    return cos2_list[0], area_list[0]

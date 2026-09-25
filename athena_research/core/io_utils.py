@@ -173,10 +173,11 @@ def save_dict_to_hdf5(dic, filename):
     filename:
         desired name of hdf5 file
     """
+    exclude_keys = {'data_raw', 'mb_data'} if (str(filename).endswith('.h5data') or '.h5data.' in str(filename)) else set()
     with h5py.File(filename, 'w') as h5file:
-        _recursively_save_dict_contents_to_group(h5file, '/', dic)
+        _recursively_save_dict_contents_to_group(h5file, '/', dic, exclude_keys=exclude_keys)
 
-def _recursively_save_dict_contents_to_group(h5file, path, dic):
+def _recursively_save_dict_contents_to_group(h5file, path, dic, exclude_keys=None):
     """
     Helper function to save dictionary contents to HDF5 group.
     
@@ -193,7 +194,14 @@ def _recursively_save_dict_contents_to_group(h5file, path, dic):
     from .utils import asnumpy, cupy_enabled
     import numpy as np
     
+    if exclude_keys is None:
+        exclude_keys = set()
+
     for key, item in dic.items():
+        if str(key) in exclude_keys:
+            continue
+        if isinstance(item, np.ndarray) and item.dtype.kind == 'U':
+            item = item.astype('S')
         if isinstance(item, (np.ndarray, np.int64, np.float64, np.bool_, str, int, float,
                              bytes, tuple, list, np.float32)):
             h5file[path + str(key)] = item
@@ -201,13 +209,15 @@ def _recursively_save_dict_contents_to_group(h5file, path, dic):
             h5file[path + str(key)] = asnumpy(item.astype(xp.float32))
         elif isinstance(item, dict):
             try:
-                _recursively_save_dict_contents_to_group(h5file, path + key + '/', item)
+                _recursively_save_dict_contents_to_group(
+                    h5file, path + key + '/', item, exclude_keys=exclude_keys
+                )
             except Exception as e:
                 print('Error: ', key, ":", item)
                 raise e
         
 
-def load_dict_from_hdf5(filename, mode='r'):
+def load_dict_from_hdf5(filename, mode='r', exclude_keys=None):
     """
     Load dictionary from HDF5 file.
     
@@ -225,10 +235,16 @@ def load_dict_from_hdf5(filename, mode='r'):
     """
     if mode not in ['r', 'r+', 'a+']:
         raise Exception('>>> read mode error')
+    if exclude_keys is None and (str(filename).endswith('.h5data') or '.h5data.' in str(filename)):
+        exclude_keys = {'data_raw', 'mb_data'}
+    elif exclude_keys is None:
+        exclude_keys = set()
+    else:
+        exclude_keys = set(exclude_keys)
     with h5py.File(filename, mode) as h5file:
-        return _recursively_load_dict_contents_from_group(h5file, '/')
+        return _recursively_load_dict_contents_from_group(h5file, '/', exclude_keys=exclude_keys)
 
-def _recursively_load_dict_contents_from_group(h5file, path):
+def _recursively_load_dict_contents_from_group(h5file, path, exclude_keys=None):
     """
     Helper function to load dictionary contents from HDF5 group.
     
@@ -244,8 +260,13 @@ def _recursively_load_dict_contents_from_group(h5file, path):
     dict:
         dictionary containing the HDF5 group contents
     """
+    if exclude_keys is None:
+        exclude_keys = set()
+
     dic = {}
     for key, item in h5file[path].items():
+        if str(key) in exclude_keys:
+            continue
         if isinstance(item, h5py.Dataset):
             v = item[()]
             # h5py returns byte strings for string datasets saved without
@@ -257,5 +278,7 @@ def _recursively_load_dict_contents_from_group(h5file, path):
                 v = v.astype(str)
             dic[key] = v
         elif isinstance(item, h5py.Group):
-            dic[key] = _recursively_load_dict_contents_from_group(h5file, path + key + '/')
+            dic[key] = _recursively_load_dict_contents_from_group(
+                h5file, path + key + '/', exclude_keys=exclude_keys
+            )
     return dic

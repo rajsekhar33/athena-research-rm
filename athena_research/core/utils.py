@@ -61,6 +61,34 @@ def clear_backend_memory():
         pass
 
 
+
+
+def get_mpi_block_owner(global_block_index, total_blocks, mpi_size):
+    """Return the MPI rank that owns a globally indexed meshblock."""
+    if mpi_size <= 1:
+        return 0
+    mbs_per_rank = total_blocks // mpi_size
+    remainder = total_blocks % mpi_size
+    split = remainder * (mbs_per_rank + 1)
+    if global_block_index < split:
+        return global_block_index // (mbs_per_rank + 1)
+    if mbs_per_rank == 0:
+        return remainder
+    return remainder + (global_block_index - split) // mbs_per_rank
+
+
+def build_owner_tiled_mpi_pairs(total_blocks, mpi_size, rank):
+    """Build a balanced list of upper-triangular block pairs for one MPI rank."""
+    assigned_pairs = []
+    pair_index = 0
+    for block_i in range(total_blocks):
+        for block_j in range(block_i, total_blocks):
+            if pair_index % mpi_size == rank:
+                assigned_pairs.append((block_i, block_j))
+            pair_index += 1
+    return assigned_pairs
+
+
 def get_distributed_block_bounds(ad):
     """Return the global meshblock span and local count for the current rank."""
     if getattr(ad, 'has_full_data', True):

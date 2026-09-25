@@ -201,6 +201,27 @@ Notes
 - Optional functionality (CuPy, mpi4py, numba) is summarized in `QUICKSTART.md` and `examples/README.md`. If an optional backend is not available, the package falls back to CPU code where implemented.
 - Known limitation: The Helmholtz-decomposed structure functions and Helmholtz power spectra are not yet supported in MPI+GPU (multi-rank GPU) mode. When invoked in MPI+GPU runs with GPUs enabled, these functions will raise an error asking you to run the analysis on a single GPU (no MPI) or to use CPU mode. We are actively working to add robust MPI+GPU support for these routines.
 
+## Shared analysis updates
+
+Analysis caches exclude raw meshblock arrays, including temporary `.h5data.*`
+files used for atomic replacement. Loading a cache preserves the receiving
+process's MPI rank and meshblock ownership. Velocity and magnetic fluctuations
+use volume-weighted plane means independent of the first meshblock requested.
+
+Structure-function batching uses contiguous meshblock loads, synchronized MPI
+exchanges, and phase-aware sampling. Every assigned block pair is retained,
+including pairs with both blocks remote to the computing rank. Anisotropic MHD
+structure functions currently require CuPy and a working GPU; CPU calls raise
+an explicit error.
+
+`calc_vector_nhat_alignment_mb_based` in `operations.area_functions` computes
+area-weighted squared vector/normal alignment for caller-selected scalar and
+vector fields. It supports CPU and GPU meshblock-local scales; scales spanning
+meshblocks require a single GPU rank. It currently assumes a uniform mesh,
+periodic x1/x2, and outflow x3 boundaries. MPI work sharing requires all input
+meshblocks on each rank because neighbor halos are read locally. This does not
+provide distributed halo exchange. Marching-cubes headers ship with the package.
+
 ## Running the test suite
 
 ```bash
