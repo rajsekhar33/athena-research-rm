@@ -222,6 +222,11 @@ periodic x1/x2, and outflow x3 boundaries. MPI work sharing requires all input
 meshblocks on each rank because neighbor halos are read locally. This does not
 provide distributed halo exchange. Marching-cubes headers ship with the package.
 
+Meshblock area culling includes padded boundary vertices, so interfaces
+between otherwise uniform blocks are retained. Neighbor lookup also supports
+periodic self-neighbors in single-block directions. See
+[boundary-fix validation and scope](docs/AREA_BOUNDARY_FIX.md).
+
 ## Running the test suite
 
 ```bash

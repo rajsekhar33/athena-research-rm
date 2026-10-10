@@ -105,8 +105,8 @@ def _planar_interface_T_iso_at_z_midplane(ad, lateral_rtol=0.05):
     property of the mesh decomposition, but any specific temperature value
     for where an interface sits is data-specific and must come from the
     loaded snapshot itself, not a hardcoded constant."""
-    z = asnumpy(ad.data("z"))
-    temp = asnumpy(ad.data("temp"))
+    z = asnumpy(ad.data("z", 0, ad.n_mbs))
+    temp = asnumpy(ad.data("temp", 0, ad.n_mbs))
     mid = 0.5 * (ad.x3min + ad.x3max)
     z_unique = np.unique(z)
     below = z_unique[z_unique < mid]
@@ -127,10 +127,8 @@ def _planar_interface_T_iso_at_z_midplane(ad, lateral_rtol=0.05):
 
 @pytest.mark.data
 class TestMeshblockFaceEdgeCase:
-    """Documents a known limitation: calc_area_mb_based's per-block
-    quick-skip check operates on each block's own (unpadded) data range, so
-    an isosurface that lies exactly on a meshblock face -- with zero
-    crossing in either block's interior -- is missed entirely. Demonstrating
+    """Check that an interface crossing only padded boundary cubes is found.
+    The old interior-only culling missed such surfaces. Demonstrating
     this requires a snapshot with a laterally-uniform (planar) interface
     positioned exactly on the domain's z mid-plane, which
     _planar_interface_T_iso_at_z_midplane() detects generically from
@@ -139,7 +137,7 @@ class TestMeshblockFaceEdgeCase:
     smoothed-indicator/global-coarse methods, which don't rely on a
     per-block interior range check, correctly find the interface."""
 
-    def test_mb_based_misses_interface_exactly_on_a_meshblock_face(self, ad_t0):
+    def test_mb_based_finds_interface_exactly_on_a_meshblock_face(self, ad_t0):
         T_iso = _planar_interface_T_iso_at_z_midplane(ad_t0)
         if T_iso is None:
             pytest.skip("loaded snapshot has no laterally-uniform interface "
@@ -148,7 +146,7 @@ class TestMeshblockFaceEdgeCase:
         s_mb, a_mb = af.calc_area_mb_based(
             ad_t0, T_iso, step_sizes=[1], use_gpu=af.cupy_enabled, verbose=False
         )
-        assert float(a_mb[0]) == 0.0  # current (limited) behavior
+        assert np.isfinite(a_mb[0]) and float(a_mb[0]) > 0.0
 
     def test_smoothed_indicator_correctly_finds_that_interface(self, ad_t0):
         T_iso = _planar_interface_T_iso_at_z_midplane(ad_t0)

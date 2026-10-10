@@ -141,6 +141,8 @@ def find_neighbour_blocks(ad, block_idx, direction):
     list
         List of mesh block indices that neighbor the source block in the specified
         direction. May contain multiple blocks if neighbors have different refinement levels.
+        A block is its own neighbor when a periodic direction contains just
+        one block at its refinement level.
     """
     # Validate inputs
     if block_idx < 0 or block_idx >= ad.n_mbs:
@@ -207,9 +209,9 @@ def find_neighbour_blocks(ad, block_idx, direction):
     
     # Find potential neighbor blocks at same refinement level
     for i in range(ad.n_mbs):
-        if i == block_idx:
-            continue  # Skip the source block
-            
+        # Do not exclude the source: periodic wrapping can legitimately map
+        # the target back to this block. Without wrapping its coordinates
+        # cannot match the displaced target.
         # Get logical coordinates of potential neighbor block
         block_x, block_y, block_z, block_level = ad.mb_logical[i]
         

@@ -942,16 +942,10 @@ def calc_area_mb_based(ad, T_ref, step_sizes=None, n_mb_buffer=1, use_gpu=True,
 
     for m in my_slab:
         m = int(m)
-        # Quick skip: isosurface cannot pass through this block. Fetches
-        # only this one meshblock (see _fetch_log_temp_mb), not the whole
-        # domain.
-        block_log = _fetch_log_temp_mb(ad, m)
-        if block_log.max() <= iso or block_log.min() >= iso:
-            continue
-
-        n_active += 1
-
-        # Build padded CPU array, transfer once to GPU for all valid steps.
+        # Include the positive-side face/edge/corner vertices before culling.
+        # A uniform block can still own cubes crossing into a neighboring
+        # block. The padded array stays bounded to one meshblock and its
+        # ghosts; _build_padded_block fetches explicit meshblock ranges.
         padded = _build_padded_block(
             ad,
             m,
@@ -961,6 +955,11 @@ def calc_area_mb_based(ad, T_ref, step_sizes=None, n_mb_buffer=1, use_gpu=True,
             nx2,
             nx1,
         )
+        # The cube kernel classifies strictly negative vertices as cold;
+        # an exact-level vertex belongs to the warm side.
+        if not (padded.min() < iso <= padded.max()):
+            continue
+        n_active += 1
         padded_gpu = xp.asarray(padded)
 
         for k, s in enumerate(valid_steps):
