@@ -373,7 +373,8 @@ def _build_cuda_source() -> str:
     with open(_MC_HPP) as f:
         mc_src = _preprocess_cpp_for_cuda(f.read())
 
-    # Remove process_cube from mc_src – we will add process_cube_phys instead
+    # Derive a physically-scaled process_cube_phys from mc_src; the original
+    # process_cube it's derived from stays in mc_src too (unused, harmless).
     proc_cube_phys = _build_process_cube_phys(mc_src)
     proc_cube_align = _build_process_cube_align(proc_cube_phys)
 
@@ -1822,8 +1823,12 @@ def _area_cache_metadata_matches(area_mc, requested_metadata):
 
     for key in ('T_ref', 'smoothing_sigma_factor'):
         if key in requested_metadata:
+            cached_value = area_mc.get(key)
+            if cached_value is None and key == 'T_ref':
+                # Caches written before the T_peak -> T_ref rename.
+                cached_value = area_mc.get('T_peak')
             try:
-                if not np.isclose(float(area_mc.get(key)), float(requested_metadata[key])):
+                if not np.isclose(float(cached_value), float(requested_metadata[key])):
                     return False
             except Exception:
                 return False
@@ -3060,3 +3065,23 @@ def calc_vector_nhat_alignment_mb_based(ad, iso_value, iso_field, vector_fields,
     })
 
     return cos2_list[0], area_list[0]
+
+
+def calc_bhat_nhat_alignment_mb_based(ad, T_peak, n_mb_buffer=1,
+                                      step_sizes=None, use_gpu=True,
+                                      verbose=True, mpi_manager=None,
+                                      redo=False):
+    """Backward-compatible T=T_peak magnetic-field alignment wrapper.
+
+    New callers needing another scalar isosurface or vector should use
+    :func:`calc_vector_nhat_alignment_mb_based` directly.
+    """
+    result = calc_vector_nhat_alignment_mb_based(
+        ad, T_peak, iso_field='temp', vector_fields=('bcc1', 'bcc2', 'bcc3'),
+        n_mb_buffer=n_mb_buffer, step_sizes=step_sizes, log_iso_field=True,
+        use_gpu=use_gpu, verbose=verbose, mpi_manager=mpi_manager, redo=redo,
+        cache_attr='align_mc')
+    # Preserve the pre-generalization cache schema consumed by the plotting
+    # script, while retaining the explicit generic-field metadata.
+    ad.align_mc['T_peak'] = float(T_peak)
+    return result
