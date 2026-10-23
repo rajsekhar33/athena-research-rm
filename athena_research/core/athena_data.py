@@ -98,6 +98,9 @@ class AthenaData:
         elif (filename.endswith('.athdf')):
             self.athdf_name = filename
             self.load_athdf(filename, **kwargs)
+        elif (filename.endswith('.vtk') or filename.endswith('.tar')):
+            self.vtk_name = filename
+            self.load_vtk(filename, **kwargs)
         elif is_hdf5:
             self.hdf5_name = filename
             self.load_hdf5(filename, **kwargs)
@@ -197,18 +200,71 @@ class AthenaData:
     def load_athdf(self, filename):
         """
         Load data from an Athena++ HDF5 file.
-        
+
         Parameters
         ----------
         filename : str
             Path to the HDF5 file
-            
+
         Returns
         -------
         None
         """
         self._load_from_athdf(filename)
-        
+
+    def load_vtk(self, filename, **kwargs):
+        """
+        Load data from an Athena 4.2 (classic Athena++) VTK file.
+
+        The VTK file supplies per-meshblock geometry and field arrays; the
+        mesh layout, meshblock decomposition, gamma, and EOS come from an
+        Athena 4.2 ``athinput`` file. See
+        :func:`athena_research.core.io_utils.read_athena_vtk` for the
+        accepted keyword arguments (``athinput``, ``header_overrides``,
+        ``id0_only``, ``problem_id``, ``layout``, ``extra_vtk_files``).
+
+        Parameters
+        ----------
+        filename : str
+            Path to the ``.vtk`` (or ``.tar``) file.
+        units : str or dict or None, optional
+            Default unit conventions. ``'tigress'`` (default) injects the
+            TIGRESS-classic defaults (length=1 pc, time=1 s*pc/km,
+            mass=mu_H*m_H per pc^3) into the synthesised ``<units>`` block
+            and registers a ``temp_K`` derived variable with T-dependent mu.
+            ``None`` skips both. A custom dict (e.g. ``{'length_cgs': ...,
+            'mass_cgs': ..., 'time_cgs': ..., 'mu': ...}``) is injected as
+            the ``<units>`` block but no ``temp_K`` is attached.
+            An explicit ``<units>`` entry in ``header_overrides`` overrides
+            whichever default this kwarg would set.
+        **kwargs : dict
+            Forwarded to :func:`read_athena_vtk`.
+
+        Returns
+        -------
+        None
+        """
+        from .io_utils import (read_athena_vtk, TIGRESS_DEFAULT_UNITS)
+
+        units_choice = kwargs.pop('units', 'tigress')
+        header_overrides = kwargs.get('header_overrides') or {}
+        # Inject the default <units> block when the user hasn't already.
+        if 'units' not in header_overrides:
+            if units_choice == 'tigress':
+                header_overrides = {**header_overrides,
+                                    'units': dict(TIGRESS_DEFAULT_UNITS)}
+            elif isinstance(units_choice, dict):
+                header_overrides = {**header_overrides,
+                                    'units': dict(units_choice)}
+            # units_choice is None / something else => no defaults injected.
+        kwargs['header_overrides'] = header_overrides
+
+        # Mark the object so config() can register the TIGRESS temp_K hook
+        # after data_func is populated.
+        self._tigress_post_config = (units_choice == 'tigress')
+
+        self._load_from_binary(read_athena_vtk(filename, **kwargs))
+
     def load_pickle(self, filename, **kwargs):
         """
         Load data from a pickle file.
@@ -569,10 +625,17 @@ class AthenaData:
         -------
         None
         """
-        if (self.data_raw and not self.coord): 
+        if (self.data_raw and not self.coord):
             self.set_coord()
         from .data_functions import config_data_functions
         config_data_functions(self)
+
+        # VTK loads request a TIGRESS-style temp_K derived variable; data_func
+        # only exists after config_data_functions() above, so register here.
+        if getattr(self, '_tigress_post_config', False):
+            from .io_utils import attach_tigress_temperature
+            attach_tigress_temperature(self)
+            self._tigress_post_config = False
         
         # Ensure filename is a str (some h5data may store a bytes 'filename' field)
         if isinstance(self.filename, (bytes, bytearray)):
@@ -582,7 +645,17 @@ class AthenaData:
                 self.filename = str(self.filename)
 
         self.path = str(Path(self.filename).parent)
-        self.num = int(self.filename.split('.')[-2])
+        # Most snapshots are <problem>.<num>.<ext>, so split('.')[-2] works.
+        # Athena 4.2 per-variable VTKs add a suffix (<problem>.<num>.<suffix>.<ext>)
+        # so we fall back to scanning right-to-left for the first all-digit part.
+        try:
+            self.num = int(self.filename.split('.')[-2])
+        except ValueError:
+            self.num = 0
+            for part in reversed(Path(self.filename).name.split('.')):
+                if part.isdigit():
+                    self.num = int(part)
+                    break
         self.is_mhd = 'mhd' in self._header.keys()
         # set up vertical/radial profile functions
         try:
