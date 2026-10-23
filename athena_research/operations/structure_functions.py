@@ -141,6 +141,16 @@ __device__ unsigned int simple_rand(unsigned int* seed) {
     return *seed;
 }
 
+// Independent, well-mixed per-thread draws. Two consecutive simple_rand()
+// values reduced modulo a power-of-two point count are correlated
+// (i2 - i1 == 1 mod 4 for this LCG), so every sampled pair had an odd x-offset
+// and small-separation structure functions in thin masked regions were
+// strongly biased.
+__device__ unsigned int hash32(unsigned int x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
+}
+
 // Binary search function for finding bin
 __device__ int binary_search_bin(const double* rbins, const double r, const int nbins) {
     int left = 0;
@@ -167,14 +177,14 @@ void structure_function_kernel(const double* data1, const double* data2,
                             const double* x2, const double* y2, const double* z2,
                             const double* rbins, 
                             double* sf, double* num_bin_points, 
-                            double* weight_sum_bin, const int n_pairs, 
+                            double* weight_sum_bin, const long long n_pairs, 
                             const int n_points1, const int n_points2,
                             const double Lx, const double Ly, const double Lz,
                             const int nbins, const int max_order,
                             const bool periodic_x, const bool periodic_y, const bool periodic_z,
                             const unsigned int base_seed)
 {
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     
     if (idx < n_pairs) {
         // Initialize simple random number generator with deterministic seed
@@ -182,8 +192,9 @@ void structure_function_kernel(const double* data1, const double* data2,
         unsigned int seed = base_seed + idx * 1664525;
         
         // Randomly select points
-        int i1 = simple_rand(&seed) % n_points1;
-        int i2 = simple_rand(&seed) % n_points2;
+        unsigned int h = hash32(seed ^ 0x9e3779b9u);
+        int i1 = hash32(h) % n_points1;
+        int i2 = hash32(h ^ 0x68e31da4u) % n_points2;
         
         // Skip if same point in same block
         if ((data1 == data2 && i1 == i2) || weight1[i1] == 0 || weight2[i2] == 0) return;
@@ -211,7 +222,7 @@ void structure_function_kernel(const double* data1, const double* data2,
         }
         // Find bin and update atomically
         int bin_idx = binary_search_bin(rbins, r, nbins);
-        if (bin_idx >= 0 && bin_idx<nbins-1) {
+        if (bin_idx >= 0 && bin_idx < nbins) {
             atomicAdd(&num_bin_points[bin_idx], 1.0);
             atomicAdd(&weight_sum_bin[bin_idx], weight1[i1] + weight2[i2]);
             for(int p = 0; p < max_order; p++) {
@@ -270,7 +281,7 @@ void structure_function_kernel_exhaustive(const double* data1, const double* dat
         // Convert linear index to upper triangular matrix indices
         // We're computing pairs (i1,i2) where i1 < i2
         int k = idx;
-        i1 = n_points1 - 2 - floor(sqrt((double)(-8.*k + 4.*n_points1*(n_points1-1.)-7.)/2.0 - 0.5));
+        i1 = n_points1 - 2 - floor(sqrt(-8.*k + 4.*n_points1*(n_points1-1.)-7.)/2.0 - 0.5);
         i2 = k + i1 + 1 - n_points1*(n_points1-1)/2 + (n_points1-i1)*((n_points1-i1)-1)/2;
         
         // Check if we're within bounds of valid pairs
@@ -308,7 +319,7 @@ void structure_function_kernel_exhaustive(const double* data1, const double* dat
     
     // Find bin and update atomically
     int bin_idx = binary_search_bin(rbins, r, nbins);
-    if (bin_idx >= 0 && bin_idx < nbins-1) {
+    if (bin_idx >= 0 && bin_idx < nbins) {
         atomicAdd(&num_bin_points[bin_idx], 1.0);
         atomicAdd(&weight_sum_bin[bin_idx], weight1[i1] + weight2[i2]);
         for(int p = 0; p < max_order; p++) {
@@ -329,6 +340,16 @@ void structure_function_kernel_exhaustive(const double* data1, const double* dat
 __device__ unsigned int simple_rand(unsigned int* seed) {
     *seed = (*seed * 1103515245 + 12345) & 0x7fffffff;
     return *seed;
+}
+
+// Independent, well-mixed per-thread draws. Two consecutive simple_rand()
+// values reduced modulo a power-of-two point count are correlated
+// (i2 - i1 == 1 mod 4 for this LCG), so every sampled pair had an odd x-offset
+// and small-separation structure functions in thin masked regions were
+// strongly biased.
+__device__ unsigned int hash32(unsigned int x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
 }
 
 // Binary search function for finding bin
@@ -357,14 +378,14 @@ void structure_function_varlist_kernel(const double* data1, const double* data2,
                             const double* x2, const double* y2, const double* z2,
                             const double* rbins, 
                             double* sf, double* num_bin_points, 
-                            double* weight_sum_bin, const int n_pairs, 
+                            double* weight_sum_bin, const long long n_pairs, 
                             const int n_points1, const int n_points2,
                             const double Lx, const double Ly, const double Lz,
                             const int nbins, const int max_order,
                             const bool periodic_x, const bool periodic_y, const bool periodic_z,
                             const unsigned int base_seed)
 {
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     
     if (idx < n_pairs) {
         // Initialize simple random number generator with deterministic seed
@@ -372,8 +393,9 @@ void structure_function_varlist_kernel(const double* data1, const double* data2,
         unsigned int seed = base_seed + idx * 1664525;
         
         // Randomly select points
-        int i1 = simple_rand(&seed) % n_points1;
-        int i2 = simple_rand(&seed) % n_points2;
+        unsigned int h = hash32(seed ^ 0x9e3779b9u);
+        int i1 = hash32(h) % n_points1;
+        int i2 = hash32(h ^ 0x68e31da4u) % n_points2;
         
         // Skip if same point in same block
         if ((data1 == data2 && i1 == i2) || weight1[i1] == 0 || weight2[i2] == 0) return;
@@ -392,7 +414,7 @@ void structure_function_varlist_kernel(const double* data1, const double* data2,
         // Find bin
         int bin_idx = binary_search_bin(rbins, r, nbins);
         // Update atomically
-        if (bin_idx >= 0 && bin_idx<nbins-1) {
+        if (bin_idx >= 0 && bin_idx < nbins) {
             atomicAdd(&num_bin_points[bin_idx], 1.0);
             atomicAdd(&weight_sum_bin[bin_idx], weight1[i1] + weight2[i2]);
         }
@@ -411,7 +433,7 @@ void structure_function_varlist_kernel(const double* data1, const double* data2,
             }
             // Update atomically
             int sf_bin_offset = ivar * nbins * max_order;
-            if (bin_idx >= 0 && bin_idx<nbins-1) {
+            if (bin_idx >= 0 && bin_idx < nbins) {
                 for(int p = 0; p < max_order; p++) {
                     atomicAdd(&sf[sf_bin_offset + p * nbins + bin_idx], sf_value[p]);
                 }
@@ -469,7 +491,7 @@ void structure_function_varlist_kernel_exhaustive(const double* data1, const dou
         // Convert linear index to upper triangular matrix indices
         // We're computing pairs (i1,i2) where i1 < i2
         int k = idx;
-        i1 = n_points1 - 2 - floor(sqrt((double)(-8.*k + 4.*n_points1*(n_points1-1.)-7.)/2.0 - 0.5));
+        i1 = n_points1 - 2 - floor(sqrt(-8.*k + 4.*n_points1*(n_points1-1.)-7.)/2.0 - 0.5);
         i2 = k + i1 + 1 - n_points1*(n_points1-1)/2 + (n_points1-i1)*((n_points1-i1)-1)/2;
         
         // Check if we're within bounds of valid pairs
@@ -501,7 +523,7 @@ void structure_function_varlist_kernel_exhaustive(const double* data1, const dou
     int bin_idx = binary_search_bin(rbins, r, nbins);
     
     // Update atomically
-    if (bin_idx >= 0 && bin_idx < nbins-1) {
+    if (bin_idx >= 0 && bin_idx < nbins) {
         atomicAdd(&num_bin_points[bin_idx], 1.0);
         atomicAdd(&weight_sum_bin[bin_idx], weight1[i1] + weight2[i2]);
     
@@ -542,6 +564,16 @@ __device__ unsigned int simple_rand(unsigned int* seed) {
     return *seed;
 }
 
+// Independent, well-mixed per-thread draws. Two consecutive simple_rand()
+// values reduced modulo a power-of-two point count are correlated
+// (i2 - i1 == 1 mod 4 for this LCG), so every sampled pair had an odd x-offset
+// and small-separation structure functions in thin masked regions were
+// strongly biased.
+__device__ unsigned int hash32(unsigned int x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
+}
+
 // Binary search function for finding bin
 __device__ int binary_search_bin(const double* rbins, const double r, const int nbins) {
     int left = 0;
@@ -571,14 +603,14 @@ void structure_function_helmholtz_kernel(
                              const double* rbins, 
                              double* sf_comp, double* sf_sol,
                              double* num_bin_points, 
-                             double* weight_sum_bin, const int n_pairs, 
+                             double* weight_sum_bin, const long long n_pairs, 
                              const int n_points1, const int n_points2,
                              const double Lx, const double Ly, const double Lz,
                              const int nbins, const int max_order,
                              const bool periodic_x, const bool periodic_y, const bool periodic_z,
                              const unsigned int base_seed)
 {
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     
     if (idx < n_pairs) {
         // Initialize simple random number generator with deterministic seed
@@ -586,8 +618,9 @@ void structure_function_helmholtz_kernel(
         unsigned int seed = base_seed + idx * 1664525;
         
         // Randomly select points
-        int i1 = simple_rand(&seed) % n_points1;
-        int i2 = simple_rand(&seed) % n_points2;
+        unsigned int h = hash32(seed ^ 0x9e3779b9u);
+        int i1 = hash32(h) % n_points1;
+        int i2 = hash32(h ^ 0x68e31da4u) % n_points2;
         
         // Skip if same point in same block
         if ((data1_x == data2_x && i1 == i2) || weight1[i1] == 0 || weight2[i2] == 0) return;
@@ -645,7 +678,7 @@ void structure_function_helmholtz_kernel(
         }
         // Find bin and update atomically
         int bin_idx = binary_search_bin(rbins, r, nbins);
-        if (bin_idx >= 0 && bin_idx<nbins-1) {
+        if (bin_idx >= 0 && bin_idx < nbins) {
             atomicAdd(&num_bin_points[bin_idx], 1.0);
             atomicAdd(&weight_sum_bin[bin_idx], weight1[i1] + weight2[i2]);
             for(int p = 0; p < max_order; p++) {
@@ -708,7 +741,7 @@ void structure_function_helmholtz_kernel_exhaustive(
         // Convert linear index to upper triangular matrix indices
         // We're computing pairs (i1,i2) where i1 < i2
         int k = idx;
-        i1 = n_points1 - 2 - floor(sqrt(-8*k + 4*n_points1*(n_points1-1)-7)/2.0 - 0.5);
+        i1 = n_points1 - 2 - floor(sqrt(-8.*k + 4.*n_points1*(n_points1-1.)-7.)/2.0 - 0.5);
         i2 = k + i1 + 1 - n_points1*(n_points1-1)/2 + (n_points1-i1)*((n_points1-i1)-1)/2;
         
         // Check if we are within bounds of valid pairs
@@ -781,7 +814,7 @@ void structure_function_helmholtz_kernel_exhaustive(
     // Find bin and update atomically
     int bin_idx = binary_search_bin(rbins, r, nbins);
     
-    if (bin_idx >= 0 && bin_idx < nbins-1) {
+    if (bin_idx >= 0 && bin_idx < nbins) {
         atomicAdd(&num_bin_points[bin_idx], 1.0);
         atomicAdd(&weight_sum_bin[bin_idx], weight1[i1] + weight2[i2]);
         
@@ -805,6 +838,16 @@ void structure_function_helmholtz_kernel_exhaustive(
 __device__ unsigned int simple_rand(unsigned int* seed) {
     *seed = (*seed * 1103515245 + 12345) & 0x7fffffff;
     return *seed;
+}
+
+// Independent, well-mixed per-thread draws. Two consecutive simple_rand()
+// values reduced modulo a power-of-two point count are correlated
+// (i2 - i1 == 1 mod 4 for this LCG), so every sampled pair had an odd x-offset
+// and small-separation structure functions in thin masked regions were
+// strongly biased.
+__device__ unsigned int hash32(unsigned int x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
 }
 
 __device__ int binary_search_bin(const double* bins, const double val, const int nbins) {
@@ -834,19 +877,20 @@ void structure_function_aniso_mhd_kernel(
         double* sf_l_bcc_perp, double* sf_prll_bcc_perp, double* sf_perp_bcc_perp,
         double* num_l, double* num_prll, double* num_perp,
         double* wsum_l, double* wsum_prll, double* wsum_perp,
-        const int n_pairs, const int n_points1, const int n_points2,
+        const long long n_pairs, const int n_points1, const int n_points2,
         const double Lx, const double Ly, const double Lz,
         const int nbins, const int nbins_prll, const int nbins_perp, const int max_order,
         const double cos_theta_prll_min, const double cos_theta_perp_max,
         const bool periodic_x, const bool periodic_y, const bool periodic_z,
         const unsigned int base_seed)
 {
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= n_pairs) return;
 
     unsigned int seed = base_seed + idx * 1664525u;
-    int i1 = simple_rand(&seed) % n_points1;
-    int i2 = simple_rand(&seed) % n_points2;
+    unsigned int h = hash32(seed ^ 0x9e3779b9u);
+    int i1 = hash32(h) % n_points1;
+    int i2 = hash32(h ^ 0x68e31da4u) % n_points2;
 
     if (weight1[i1] == 0 || weight2[i2] == 0) return;
 
@@ -1000,7 +1044,7 @@ void structure_function_aniso_mhd_kernel_exhaustive(
     int i1, i2;
     if (vel1_x == vel2_x) {
         int k = idx;
-        i1 = n_points1 - 2 - (int)floor(sqrt((double)(-8*k + 4*n_points1*(n_points1-1)-7))/2.0 - 0.5);
+        i1 = n_points1 - 2 - (int)floor(sqrt(-8.*k + 4.*n_points1*(n_points1-1.)-7.)/2.0 - 0.5);
         i2 = k + i1 + 1 - n_points1*(n_points1-1)/2 + (n_points1-i1)*((n_points1-i1)-1)/2;
         if (idx >= (n_points1*(n_points1-1)/2) || i1 < 0 || i2 >= n_points1) return;
     } else {
@@ -1569,7 +1613,7 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', category=RuntimeWarning)
             n_samples2_blocks = n_samples2_norm * xp.where(block_distances == 0, n_samples1, xp.power(block_distances/rmax, -2.0))
-        n_samples2_blocks = xp.clip(n_samples2_blocks, nsamples_block_min, n_samples1).astype(int)
+        n_samples2_blocks = xp.clip(n_samples2_blocks, min(nsamples_block_min, n_samples1), n_samples1).astype(int)
         if debug:
             print(f"Debug: Successfully calculated sampling weights")
         
@@ -1609,6 +1653,12 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
             threadsperblock = 256
             n_pairs = int(asnumpy(n_samples1 * n_samples2_blocks[idx]))  # Convert to host integer
             blockspergrid = (n_pairs + threadsperblock - 1) // threadsperblock
+            # Each block pair holds _distinct_pair_count point pairs but contributes
+            # n_pairs samples (distance dependent): weight its sums so the binned mean
+            # is a uniform average over all pairs rather than favouring nearby blocks.
+            if int(b1) == int(b2):
+                data2, weight2, x2, y2, z2 = data1, weight1, x1, y1, z1
+            pair_weight = _distinct_pair_count(n_points_per_block, n_points_per_block, int(b1) == int(b2)) / max(n_pairs, 1)
 
             if debug and idx < 5:  # Print kernel info for first few iterations
                 if debug:
@@ -1653,9 +1703,9 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
                 )
                 
                 # Accumulate results - flatten sf_cpu to match sf shape
-                sf += sf_cpu.flatten()
+                sf += pair_weight * sf_cpu.flatten()
                 num_bin_points += num_cpu
-                weight_sum_bin += weights_cpu
+                weight_sum_bin += pair_weight * weights_cpu
                 
                 if debug:
                     print(f"Debug: CPU fallback computation completed for block pair {idx}")
@@ -1664,6 +1714,9 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
                 # Use idx (block pair index) as base seed for reproducibility,
                 # wrapped to uint32 range to match the kernel's native arithmetic.
                 base_seed = np.uint32((int(idx) * 1013904223) % (2**32))
+                local_sf = xp.zeros_like(sf)
+                local_num = xp.zeros_like(num_bin_points)
+                local_weight = xp.zeros_like(weight_sum_bin)
                 structure_function_kernel(
                     (blockspergrid,), (threadsperblock,),
                     (data1, data2,
@@ -1671,17 +1724,21 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
                     x1, y1, z1,
                     x2, y2, z2,
                     rbins, 
-                    sf, num_bin_points,
-                    weight_sum_bin, n_pairs, 
+                    local_sf, local_num,
+                    local_weight, n_pairs, 
                     n_points_per_block, n_points_per_block,
                     float(Lx), float(Ly), float(Lz),
                     nbins, max_order,
                     periodic_x, periodic_y, periodic_z,
                     base_seed))
                     
-                # Keep the hot path asynchronous unless debug asks for eager synchronization.
+                # Keep the hot path asynchronous unless debug asks for eager synchronization;
+                # the accumulation below is queued on the same stream as the kernel.
                 if debug:
                     xp.cuda.Stream.null.synchronize()
+                sf += pair_weight * local_sf
+                num_bin_points += local_num
+                weight_sum_bin += pair_weight * local_weight
         
         if debug:
             print(f"Debug: Completed processing all block pairs")
@@ -3279,6 +3336,34 @@ def _load_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, varlis
         block_cache[global_idx] = _rebuild_remote_block_cache_entry(
             ad, global_idx, block_data, xyzlim)
             
+def _distinct_pair_count(n1, n2, same_block) -> float:
+    """Number of distinct point pairs a block pair holds: n(n-1)/2 when a block
+    is paired with itself, n1*n2 otherwise. The samplers draw ordered pairs, so
+    weighting a block pair by n1*n2 would count same-block pairs twice."""
+    n1, n2 = float(n1), float(n2)
+    return 0.5 * n1 * (n1 - 1.0) if same_block else n1 * n2
+
+
+def _sparse_block_view(block_cache, b, weight_name, varlist):
+    """Masked-cell coordinates, weights and stacked variables of block `b`,
+    built once per block and reused by every block pair it joins (filtering
+    per pair would re-scan the full block for each of its ~n_blocks pairs).
+    Returns None when the block has no masked cell."""
+    key = ('sparse_view', weight_name, tuple(varlist))
+    entry = block_cache[b]
+    if key not in entry:
+        weight = entry['weights'][weight_name]
+        valid = weight > 0
+        if int(xp.sum(valid)) == 0:
+            entry[key] = None
+        else:
+            data = xp.concatenate([xp.asarray(entry['vars'][var][valid], dtype=xp.float64)
+                                   for var in varlist])
+            entry[key] = (entry['coords']['x'][valid], entry['coords']['y'][valid],
+                          entry['coords']['z'][valid], weight[valid], xp.ascontiguousarray(data))
+    return entry[key]
+
+
 def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, varlist,
                     sf, num_bin_points, weight_sum_bin, 
                     rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
@@ -3331,7 +3416,7 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
         # Calculate sample count based on distance
         n_samples2_norm = n_samples1/rmax/(rmax/rmin-1.0)
         n_samples2 = n_samples2_norm * (n_samples1 if block_distance == 0 else (block_distance/rmax)**-2.0)
-        n_samples2 = int(np.clip(n_samples2, nsamples_block_min, n_samples1))
+        n_samples2 = int(np.clip(n_samples2, min(nsamples_block_min, n_samples1), n_samples1))
         
         if debug:
             print(f"Debug: n_samples2 = {n_samples2}")
@@ -3380,61 +3465,20 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
             
             # Process data differently based on sparse_data flag
             if sparse_data:
-                if debug:
-                    print(f"Debug: Using sparse data processing")
-                
-                # Filter out points with zero or negative weights
-                valid_points1 = weight1 > 0
-                valid_points2 = weight2 > 0
-                
-                # Convert array sum to host scalar safely
-                if cupy_enabled:
-                    valid_count1 = int(xp.sum(valid_points1).get())
-                    valid_count2 = int(xp.sum(valid_points2).get())
-                else:
-                    valid_count1 = int(xp.sum(valid_points1))
-                    valid_count2 = int(xp.sum(valid_points2))
-                
-                if debug:
-                    print(f"Debug: Valid points - block {b1}: {valid_count1}/{weight1.size}, block {b2}: {valid_count2}/{weight2.size}")
-                
-                # Skip if no valid points - break to skip entire block pair, not just this weight
-                if valid_count1 == 0 or valid_count2 == 0:
-                    if debug:
-                        print(f"Debug: Skipping pair ({b1}, {b2}) for weight {weight_name} - no valid points")
-                    continue  # Skip to next weight scheme
-                
-                if debug:
-                    print(f"Debug: Extracting valid points")
-                
-                # Extract only valid points
-                x1_valid = x1[valid_points1]
-                y1_valid = y1[valid_points1]
-                z1_valid = z1[valid_points1]
-                weight1_valid = weight1[valid_points1]
-                
-                x2_valid = x2[valid_points2]
-                y2_valid = y2[valid_points2]
-                z2_valid = z2[valid_points2]
-                weight2_valid = weight2[valid_points2]
-                
+                view1 = _sparse_block_view(block_cache, b1, weight_name, varlist)
+                view2 = _sparse_block_view(block_cache, b2, weight_name, varlist)
+                if view1 is None or view2 is None:
+                    continue  # no masked cell in one of the blocks for this weight
+                x1_valid, y1_valid, z1_valid, weight1_valid, data1_valid = view1
+                x2_valid, y2_valid, z2_valid, weight2_valid, data2_valid = view2
                 n_valid1 = x1_valid.size
                 n_valid2 = x2_valid.size
-                
-                if debug:
-                    print(f"Debug: Valid arrays created, sizes: {n_valid1}, {n_valid2}")
-                
-                data1_valid = _pack_sparse_var_stack(
-                    block_cache[b1]['var_stack'], block_cache[b1]['n_var_points'], no_vars, valid_points1)
-                data2_valid = _pack_sparse_var_stack(
-                    block_cache[b2]['var_stack'], block_cache[b2]['n_var_points'], no_vars, valid_points2)
-
                 n_samples1_adj = min(scaled_n_samples1, n_valid1)
                 n_samples2_adj = min(scaled_n_samples2, n_valid2)
-                
+
                 if debug:
                     print(f"Debug: Adjusted samples: n_samples1_adj={n_samples1_adj}, n_samples2_adj={n_samples2_adj}")
-                
+
             else:
                 # Use all points, regardless of weight
                 if debug:
@@ -3510,10 +3554,20 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                 if debug:
                     print(f"Debug: Reduced sampling - n_samples1_adj={n_samples1_adj}, n_samples2_adj={n_samples2_adj}, n_pairs={n_pairs}")
             
+            # Weight this block pair's sums by (valid pairs) / (sampled pairs) so the
+            # binned mean is a uniform average over ALL valid pairs, independent of the
+            # per-block-pair sample counts (distance-dependent n_samples2, sparse
+            # truncation). num_bin_points stays a raw count of sampled pairs.
+            if b1 == b2:
+                x2_valid, y2_valid, z2_valid = x1_valid, y1_valid, z1_valid
+                weight2_valid, data2_valid = weight1_valid, data1_valid
+            pair_weight = _distinct_pair_count(n_valid1, n_valid2, b1 == b2) / max(n_pairs, 1)
             # Exhaustive-kernel path is currently disabled; always uses random sampling.
             use_exhaustive = False
 
-            if use_exhaustive and n_valid_pairs < 5 * n_samples1_adj * n_samples2_adj:
+            if (use_exhaustive and n_valid_pairs < 5 * n_samples1_adj * n_samples2_adj
+                    and n_valid_pairs <= np.iinfo(np.int32).max // 4):
+                pair_weight = 1.0  # every distinct pair visited once
                 if debug:
                     print(f"Debug: Would use exhaustive kernel (DISABLED)")
             else:
@@ -3579,12 +3633,12 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                             )
                             
                             # Accumulate results
-                            sf[iw, ivar] += var_sf_cpu
+                            sf[iw, ivar] += pair_weight * var_sf_cpu
                             
                             # Accumulate weights (only once per weight)
                             if ivar == 0:
                                 num_bin_points[iw] += num_cpu
-                                weight_sum_bin[iw] += weights_cpu
+                                weight_sum_bin[iw] += pair_weight * weights_cpu
                         
                         if debug:
                             print(f"Debug: CPU fallback computation completed")
@@ -3631,10 +3685,10 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                 for ivar, var in enumerate(varlist):
                     sf_offset = ivar * max_order * nbins
                     var_sf = local_sf[sf_offset:sf_offset + max_order * nbins].reshape(max_order, nbins)
-                    sf[iw, ivar] += var_sf
+                    sf[iw, ivar] += pair_weight * var_sf
 
                 num_bin_points[iw] += local_num_bin_points
-                weight_sum_bin[iw] += local_weight_sum_bin
+                weight_sum_bin[iw] += pair_weight * local_weight_sum_bin
             
             if debug:
                 points_added = int(local_num_bin_points.sum())
@@ -3923,7 +3977,7 @@ def get_sf_helmholtz(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7
             n_samples2_blocks = n_samples2_norm * xp.where(block_distances == 0, 
                                                          n_samples1, 
                                                          xp.power(block_distances/float(rmax), -2.0))
-            n_samples2_blocks = xp.clip(n_samples2_blocks, nsamples_block_min, n_samples1).astype(xp.int32)
+            n_samples2_blocks = xp.clip(n_samples2_blocks, min(nsamples_block_min, n_samples1), n_samples1).astype(xp.int32)
             if debug:
                 print(f"Debug: Successfully calculated sampling weights")
         except Exception as e:
@@ -3989,9 +4043,16 @@ def get_sf_helmholtz(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7
                     threadsperblock = 256
                     n_pairs = int(n_samples1 * int(n_samples2_blocks[idx]))
                     blockspergrid = (n_pairs + threadsperblock - 1) // threadsperblock
+                    # Uniform average over all point pairs: weight this block pair's sums by
+                    # (point pairs it holds) / (pairs sampled from it).
+                    pair_weight = _distinct_pair_count(n_points_per_block, n_points_per_block, int(b1) == int(b2)) / max(n_pairs, 1)
 
                     # Launch kernel with deterministic seed based on block index
                     base_seed = idx * 12345 + 67890
+                    local_sf_comp = xp.zeros_like(sf_comp_flat_contiguous)
+                    local_sf_sol = xp.zeros_like(sf_sol_flat_contiguous)
+                    local_num = xp.zeros_like(num_bin_points_contiguous)
+                    local_weight = xp.zeros_like(weight_sum_bin_contiguous)
                     structure_function_helmholtz_kernel(
                         (blockspergrid,), (threadsperblock,),
                         (data1_x, data1_y, data1_z, 
@@ -4000,23 +4061,21 @@ def get_sf_helmholtz(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7
                         x1, y1, z1,
                         x2, y2, z2,
                         rbins, 
-                        sf_comp_flat_contiguous, sf_sol_flat_contiguous, 
-                        num_bin_points_contiguous,
-                        weight_sum_bin_contiguous, n_pairs, 
+                        local_sf_comp, local_sf_sol,
+                        local_num,
+                        local_weight, n_pairs, 
                         n_points_per_block, n_points_per_block,
                         float(Lx), float(Ly), float(Lz),
                         nbins, max_order,
                         periodic_x, periodic_y, periodic_z, base_seed))
                         
-                    # Copy back updated results
-                    sf_comp_flat = sf_comp_flat_contiguous
-                    sf_sol_flat = sf_sol_flat_contiguous
-                    num_bin_points = num_bin_points_contiguous
-                    weight_sum_bin = weight_sum_bin_contiguous
-                    
                     # Keep the hot path asynchronous unless debug asks for eager synchronization.
                     if debug and cupy_enabled:
                         xp.cuda.Stream.null.synchronize()
+                    sf_comp_flat = sf_comp_flat_contiguous + pair_weight * local_sf_comp
+                    sf_sol_flat = sf_sol_flat_contiguous + pair_weight * local_sf_sol
+                    num_bin_points = num_bin_points_contiguous + local_num
+                    weight_sum_bin = weight_sum_bin_contiguous + pair_weight * local_weight
                 
                     if debug:
                         print(f"Debug: Successfully processed block pair {idx}")
@@ -4270,7 +4329,7 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
         if debug:
             print(f"Debug: Rank {mpi_manager.rank}: Total global pairs: {total_global_pairs}")
 
-        my_pairs = build_locality_balanced_mpi_pairs(
+        my_pairs = build_owner_tiled_mpi_pairs(
             total_global_blocks, mpi_manager.size, mpi_manager.rank)
         
         if debug:
@@ -4778,7 +4837,7 @@ def _process_block_pair_helmholtz(ad, b1, b2, block_cache, block_centers, weight
     # Calculate sample count based on distance
     n_samples2_norm = n_samples1/rmax/(rmax/rmin-1.0)
     n_samples2 = n_samples2_norm * (n_samples1 if block_distance == 0 else (block_distance/rmax)**-2.0)
-    n_samples2 = int(np.clip(n_samples2, nsamples_block_min, n_samples1))
+    n_samples2 = int(np.clip(n_samples2, min(nsamples_block_min, n_samples1), n_samples1))
     
     if debug:
         print(f"Debug: Block distance: {block_distance:.3f}, n_samples2: {n_samples2}")
@@ -4918,8 +4977,19 @@ def _process_block_pair_helmholtz(ad, b1, b2, block_cache, block_centers, weight
             if debug:
                 print(f"Debug: Kernel configuration - n_pairs: {n_pairs}, n_valid_pairs: {n_valid_pairs}")
             
+            # Weight this block pair's sums by (valid pairs) / (sampled pairs) so the
+            # binned mean is a uniform average over ALL valid pairs, independent of the
+            # per-block-pair sample counts (distance-dependent n_samples2, sparse
+            # truncation). num_bin_points stays a raw count of sampled pairs.
+            if b1 == b2:
+                x2_valid, y2_valid, z2_valid = x1_valid, y1_valid, z1_valid
+                weight2_valid = weight1_valid
+                vx2_valid, vy2_valid, vz2_valid = vx1_valid, vy1_valid, vz1_valid
+            pair_weight = _distinct_pair_count(n_valid1, n_valid2, b1 == b2) / max(n_pairs, 1)
             # Choose appropriate kernel based on number of valid pairs
-            if n_valid_pairs < 5 * n_samples1_adj * n_samples2_adj:
+            if (n_valid_pairs < 5 * n_samples1_adj * n_samples2_adj
+                    and n_valid_pairs <= np.iinfo(np.int32).max // 4):
+                pair_weight = 1.0  # every distinct pair visited once
                 if debug:
                     print(f"Debug: Using exhaustive Helmholtz kernel for small dataset")
                 # Use exhaustive kernel for small datasets
@@ -4934,7 +5004,7 @@ def _process_block_pair_helmholtz(ad, b1, b2, block_cache, block_centers, weight
                     x2_valid, y2_valid, z2_valid,
                     rbins, 
                     local_sf_comp_flat, local_sf_sol_flat, local_num_bin_points,
-                    local_weight_sum_bin,
+                    local_weight_sum_bin, n_valid_pairs,
                     n_valid1, n_valid2,
                     float(Lx), float(Ly), float(Lz),
                     nbins, max_order,
@@ -4967,12 +5037,12 @@ def _process_block_pair_helmholtz(ad, b1, b2, block_cache, block_centers, weight
             local_sf_comp = local_sf_comp_flat.reshape((max_order, nbins))
             local_sf_sol = local_sf_sol_flat.reshape((max_order, nbins))
             
-            sf_comp[iw] += local_sf_comp
-            sf_sol[iw] += local_sf_sol
+            sf_comp[iw] += pair_weight * local_sf_comp
+            sf_sol[iw] += pair_weight * local_sf_sol
             
             # Add to weight statistics once per weight
             num_bin_points[iw] += local_num_bin_points
-            weight_sum_bin[iw] += local_weight_sum_bin
+            weight_sum_bin[iw] += pair_weight * local_weight_sum_bin
             
             if debug:
                 points_added = int(local_num_bin_points.sum())
@@ -5089,7 +5159,9 @@ def set_sf(ad, varl=['dens','velx','vely','velz'], varsuf='', redo=False, auto_s
     try:
         # Choose the appropriate method based on memory assessment
         # CRITICAL: When MPI is enabled, ALWAYS use get_sf_mb (never get_sf)
-        if use_mb_method or len(vars_to_process) > 1 or (use_mpi and mpi_manager is not None):
+        # Sparse (masked-cell) sampling exists only in the block-pair path.
+        if (use_mb_method or len(vars_to_process) > 1 or kwargs.get('sparse_data')
+                or (use_mpi and mpi_manager is not None)):
             # Memory-efficient batch method with multiple variables
             # Pass mpi_manager to get_sf_mb
             if rank == 0 and debug:
@@ -5264,7 +5336,8 @@ def set_sf_helmholtz(ad, var='vel', varsuf='', redo=False, auto_select=True, use
     try:
         # Choose the appropriate method based on memory assessment
         # CRITICAL: When MPI is enabled, ALWAYS use get_sf_helmholtz_mb (never get_sf_helmholtz)
-        if use_mb_method or (use_mpi and mpi_manager is not None):
+        # Sparse (masked-cell) sampling exists only in the block-pair path.
+        if use_mb_method or kwargs.get('sparse_data') or (use_mpi and mpi_manager is not None):
             # Memory-efficient batch method
             # Pass mpi_manager to get_sf_helmholtz_mb
             if rank == 0 and debug:
@@ -5546,9 +5619,9 @@ def _process_block_pair_aniso_mhd(ad, b1, b2, block_cache, block_centers,
         if debug:
             print(f'Debug: Skipping aniso_mhd pair ({b1}, {b2}) due to outside block')
         return
-    pair_sparse_data = sparse_data and (
-        (region_status1 == 'partial' and not region_trimmed1) or
-        (region_status2 == 'partial' and not region_trimmed2))
+    # sparse_data samples only cells with non-zero weight (masked weights and
+    # xyz-region masks alike), as the scalar and Helmholtz paths do.
+    pair_sparse_data = sparse_data
 
     dist_x = abs(block_centers[b1, 0] - block_centers[b2, 0])
     dist_y = abs(block_centers[b1, 1] - block_centers[b2, 1])
@@ -5575,7 +5648,7 @@ def _process_block_pair_aniso_mhd(ad, b1, b2, block_cache, block_centers,
 
     n_samples2_norm = n_samples1 / rmax / (rmax / rmin - 1.0)
     n_samples2 = n_samples2_norm * (n_samples1 if block_distance == 0 else (block_distance / rmax)**-2.0)
-    n_samples2 = int(np.clip(n_samples2, nsamples_block_min, n_samples1))
+    n_samples2 = int(np.clip(n_samples2, min(nsamples_block_min, n_samples1), n_samples1))
 
     x1 = block_cache[b1]['coords']['x']
     y1 = block_cache[b1]['coords']['y']
@@ -5695,6 +5768,7 @@ def _process_block_pair_aniso_mhd(ad, b1, b2, block_cache, block_centers,
                     n_exhaustive_pairs <= max_exhaustive_pairs and
                     n_exhaustive_pairs < 5 * baseline_pairs):
                 blockspergrid = (n_exhaustive_pairs + threadsperblock - 1) // threadsperblock
+                pair_weight = 1.0  # every distinct pair visited once
                 structure_function_aniso_mhd_kernel_exhaustive(
                     (blockspergrid,), (threadsperblock,),
                     (vx1v, vy1v, vz1v, vx2v, vy2v, vz2v,
@@ -5718,6 +5792,9 @@ def _process_block_pair_aniso_mhd(ad, b1, b2, block_cache, block_centers,
                 if n_pairs <= 0:
                     continue
                 blockspergrid = (n_pairs + threadsperblock - 1) // threadsperblock
+                # Uniform average over all distinct pairs: undo the per-block-pair
+                # sampling rate (distance- and topology-dependent target_pairs).
+                pair_weight = float(n_exhaustive_pairs) / n_pairs
                 seed = random_seed if random_seed is not None else (b1 * 10000 + b2)
                 structure_function_aniso_mhd_kernel(
                     (blockspergrid,), (threadsperblock,),
@@ -5738,24 +5815,24 @@ def _process_block_pair_aniso_mhd(ad, b1, b2, block_cache, block_centers,
                      float(cos_theta_prll_min), float(cos_theta_perp_max),
                      periodic_x, periodic_y, periodic_z, seed))
 
-            sf_accum['vel']['sf'][iw] += loc_vel_sf
-            sf_accum['vel']['sf_prll'][iw] += loc_vel_sf_prll
-            sf_accum['vel']['sf_perp'][iw] += loc_vel_sf_perp
-            sf_accum['vel_perp']['sf'][iw] += loc_vel_perp_sf
-            sf_accum['vel_perp']['sf_prll'][iw] += loc_vel_perp_sf_prll
-            sf_accum['vel_perp']['sf_perp'][iw] += loc_vel_perp_sf_perp
-            sf_accum['bcc']['sf'][iw] += loc_bcc_sf
-            sf_accum['bcc']['sf_prll'][iw] += loc_bcc_sf_prll
-            sf_accum['bcc']['sf_perp'][iw] += loc_bcc_sf_perp
-            sf_accum['bcc_perp']['sf'][iw] += loc_bcc_perp_sf
-            sf_accum['bcc_perp']['sf_prll'][iw] += loc_bcc_perp_sf_prll
-            sf_accum['bcc_perp']['sf_perp'][iw] += loc_bcc_perp_sf_perp
+            sf_accum['vel']['sf'][iw] += pair_weight * loc_vel_sf
+            sf_accum['vel']['sf_prll'][iw] += pair_weight * loc_vel_sf_prll
+            sf_accum['vel']['sf_perp'][iw] += pair_weight * loc_vel_sf_perp
+            sf_accum['vel_perp']['sf'][iw] += pair_weight * loc_vel_perp_sf
+            sf_accum['vel_perp']['sf_prll'][iw] += pair_weight * loc_vel_perp_sf_prll
+            sf_accum['vel_perp']['sf_perp'][iw] += pair_weight * loc_vel_perp_sf_perp
+            sf_accum['bcc']['sf'][iw] += pair_weight * loc_bcc_sf
+            sf_accum['bcc']['sf_prll'][iw] += pair_weight * loc_bcc_sf_prll
+            sf_accum['bcc']['sf_perp'][iw] += pair_weight * loc_bcc_sf_perp
+            sf_accum['bcc_perp']['sf'][iw] += pair_weight * loc_bcc_perp_sf
+            sf_accum['bcc_perp']['sf_prll'][iw] += pair_weight * loc_bcc_perp_sf_prll
+            sf_accum['bcc_perp']['sf_perp'][iw] += pair_weight * loc_bcc_perp_sf_perp
             sf_accum['counts']['num'][iw] += loc_num
             sf_accum['counts']['num_prll'][iw] += loc_num_prll
             sf_accum['counts']['num_perp'][iw] += loc_num_perp
-            sf_accum['weights']['wsum'][iw] += loc_wsum
-            sf_accum['weights']['wsum_prll'][iw] += loc_wsum_prll
-            sf_accum['weights']['wsum_perp'][iw] += loc_wsum_perp
+            sf_accum['weights']['wsum'][iw] += pair_weight * loc_wsum
+            sf_accum['weights']['wsum_prll'][iw] += pair_weight * loc_wsum_prll
+            sf_accum['weights']['wsum_perp'][iw] += pair_weight * loc_wsum_perp
 
         except Exception as e:
             import warnings
@@ -6354,3 +6431,23 @@ def set_sf_aniso_mhd(ad, vel_var='vel', bcc_var='bcc', varsuf='',
         raise
 
     return ad.sf
+
+
+# Identifies SFs from the corrected pair sampler (independent hashed draws,
+# sparse masked-cell sampling, per-block-pair importance weights, last bin
+# filled). Cached SFs without this tag came from the old sampler, whose
+# correlated draws bias small-separation SFs in thin masked regions, and are
+# treated as missing so they get recomputed.
+SF_SAMPLER_VERSION = 'hashed_sparse_importance_v2'
+
+
+def sf_entry_is_current(entry) -> bool:
+    """True when a cached SF dict was written by the current pair sampler."""
+    if not isinstance(entry, dict) or 'sampler' not in entry:
+        return False
+    tag = entry['sampler']
+    if hasattr(tag, 'item'):
+        tag = tag.item()
+    if isinstance(tag, bytes):
+        tag = tag.decode()
+    return str(tag) == SF_SAMPLER_VERSION
