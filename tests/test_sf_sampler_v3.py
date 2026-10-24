@@ -95,7 +95,8 @@ def test_gpu_kernel_draws_match_cpu_twin(same):
     pos1, data1 = _block(37, 11)
     pos2, data2 = (pos1, data1) if same else _block(23, 12)
     rbins = np.array([0.0, 0.2, 0.5, 1.0, 2.0])
-    edges = np.array([0.05, 0.5, 2.0])
+    # A different edge row per variable exercises the per-variable indexing.
+    edges = np.array([[0.05, 0.5, 2.0], [0.1, 1.0, 3.0]])
     n_pairs, seed = 50000, sfm._pair_seed(5, 5 if same else 9)
     sf_c, num_c, w_c, pdf_c = _cpu_pair(pos1, data1, pos2, data2, rbins, n_pairs, seed, same, edges)
     g = lambda a: xp.ascontiguousarray(xp.asarray(a, dtype=xp.float64))
@@ -109,12 +110,12 @@ def test_gpu_kernel_draws_match_cpu_twin(same):
     sf = xp.zeros(2 * 2 * nb)
     num = xp.zeros(nb)
     wsum = xp.zeros(nb)
-    pdf = xp.zeros(2 * nb * (len(edges) + 1))
+    pdf = xp.zeros(2 * nb * (edges.shape[1] + 1))
     sfm.structure_function_varlist_kernel(
         ((n_pairs + 255) // 256,), (256,),
         (d1, d2, 2, w1, w2, *c1, *c2, g(rbins), sf, num, wsum, n_pairs,
          pos1.shape[1], pos2.shape[1], 1.0, 1.0, 1.0, nb, 2, False, False, False,
-         seed, pdf, g(edges), len(edges)))
+         seed, pdf, g(edges.ravel()), edges.shape[1]))
     np.testing.assert_array_equal(asnumpy(num), num_c)
     np.testing.assert_allclose(asnumpy(sf).reshape(2, 2, nb), sf_c, rtol=1e-12)
     np.testing.assert_allclose(asnumpy(wsum), w_c, rtol=1e-12)
@@ -273,3 +274,48 @@ def test_use_exhaustive_matches_brute_force(sparse):
     np.testing.assert_allclose(asnumpy(sf)[0], want_sf, rtol=1e-10, atol=1e-12)
     np.testing.assert_allclose(asnumpy(wsum), want_w, rtol=1e-12)
     np.testing.assert_allclose(asnumpy(pdf)[0], want_pdf, rtol=1e-12)
+
+
+@pytest.mark.parametrize('sparse', [False, True])
+def test_per_variable_edges_match_brute_force(sparse):
+    ad = AnalyticMesh(n=4)
+    edges = np.array([[0.05, 0.3, 1.0, 2.0], [0.01, 0.05, 0.2, 0.6]])
+    r, sf, wsum, num, pdf = sfm.get_sf_mb(ad, ['dens', 'velx'], weights='phase', max_order=2, npairs=1e8,
+                                          nbins=6, sparse_data=sparse, use_exhaustive=True, delta_edges=edges)
+    rbins = asnumpy(sfm.radial_bin_edges(0.125, np.sqrt(0.75), 6, True)[0])
+    for i, var in enumerate(['dens', 'velx']):
+        _, _, want_pdf = _scalar_brute_force(ad, var, 'phase', rbins, edges[i])
+        np.testing.assert_allclose(asnumpy(pdf)[i], want_pdf, rtol=1e-12)
+
+
+def test_masked_increment_scales_and_normalized_edges():
+    ad = AnalyticMesh(n=4)
+    sig = sfm.masked_increment_scales(ad, ['dens', 'velx'], 'phase', batch=3)
+    w = np.asarray(ad.fields['phase']).ravel()
+    for i, var in enumerate(['dens', 'velx']):
+        q = np.asarray(ad.fields[var]).ravel()
+        m = np.sum(w * q) / np.sum(w)
+        np.testing.assert_allclose(sig[i], np.sqrt(np.sum(w * (q - m) ** 2) / np.sum(w)), rtol=1e-10)
+    edges = sfm.normalized_delta_edges([2.0, 0.0])
+    np.testing.assert_allclose(edges[0], 2.0 * sfm.DEFAULT_NORMALIZED_DELTA_EDGES)
+    np.testing.assert_allclose(edges[1], sfm.DEFAULT_NORMALIZED_DELTA_EDGES)
+    assert np.all(np.diff(sfm.DEFAULT_NORMALIZED_SIGNED_DELTA_EDGES) > 0)
+
+
+def test_set_sf_stores_each_variables_edge_row():
+    ad = AnalyticMesh(n=4)
+    edges = np.array([[0.05, 0.3, 1.0, 2.0], [0.01, 0.05, 0.2, 0.6]])
+    sfm.set_sf(ad, ['dens', 'velx'], weights='phase', sparse_data=True, delta_edges=edges, **_set_sf_kw())
+    np.testing.assert_array_equal(ad.sf['dens']['delta_edges'], edges[0])
+    np.testing.assert_array_equal(ad.sf['velx']['delta_edges'], edges[1])
+    with pytest.raises(ValueError):
+        sfm.get_sf_mb(AnalyticMesh(n=4), ['dens', 'velx'], delta_edges=np.ones((3, 4)))
+
+
+def test_sf_entry_complete_requires_histograms():
+    tag = sfm.SF_SAMPLER_VERSION
+    assert not sfm.sf_entry_complete({'sf': 0, 'sampler': tag})
+    assert sfm.sf_entry_complete({'sf': 0, 'sampler': tag, 'delta_pdf': 0})
+    assert not sfm.sf_entry_complete({'sf_comp': 0, 'sampler': tag, 'delta_pdf_comp': 0})
+    assert sfm.sf_entry_complete({'sf_comp': 0, 'sampler': tag, 'delta_pdf_comp': 0, 'delta_pdf_sol': 0})
+    assert not sfm.sf_entry_complete({'sf': 0, 'sampler': 'old', 'delta_pdf': 0})

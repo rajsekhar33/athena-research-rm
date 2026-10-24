@@ -476,7 +476,7 @@ void structure_function_varlist_kernel(const double* data1, const double* data2,
                 if (n_delta_edges > 0) {
                     int ncol = n_delta_edges + 1;
                     atomicAdd(&delta_pdf[(ivar * nbins + bin_idx) * ncol
-                                         + delta_column(delta_edges, n_delta_edges, diff)], 1.0);
+                                         + delta_column(delta_edges + ivar * n_delta_edges, n_delta_edges, diff)], 1.0);
                 }
             }
         }
@@ -602,7 +602,7 @@ void structure_function_varlist_kernel_exhaustive(const double* data1, const dou
             if (n_delta_edges > 0) {
                 int ncol = n_delta_edges + 1;
                 atomicAdd(&delta_pdf[(ivar * nbins + bin_idx) * ncol
-                                     + delta_column(delta_edges, n_delta_edges, diff)], 1.0);
+                                     + delta_column(delta_edges + ivar * n_delta_edges, n_delta_edges, diff)], 1.0);
             }
         }
     }
@@ -1353,7 +1353,8 @@ def _compute_sf_cpu_vectorized(data1, data2, no_vars, weight1, weight2,
 
     Returns sf (no_vars, max_order, nbins), num_bin_points (nbins),
     weight_sum_bin (nbins) and, when delta_edges is given, the increment
-    histogram (no_vars, nbins, len(delta_edges) + 1) with underflow and
+    histogram (no_vars, nbins, n_edges + 1), one edge row per variable
+    (delta_edges of shape (no_vars, n_edges), or 1-D for all), with underflow and
     overflow columns; otherwise None.
     """
     nbins = len(rbins) - 1
@@ -1362,7 +1363,11 @@ def _compute_sf_cpu_vectorized(data1, data2, no_vars, weight1, weight2,
     sf = np.zeros((no_vars, max_order, nbins))
     num_bin_points = np.zeros(nbins)
     weight_sum_bin = np.zeros(nbins)
-    pdf = None if delta_edges is None else np.zeros((no_vars, nbins, len(delta_edges) + 1))
+    if delta_edges is not None:
+        delta_edges = np.asarray(delta_edges, dtype=np.float64)
+        if delta_edges.ndim == 1:
+            delta_edges = np.tile(delta_edges, (no_vars, 1))
+    pdf = None if delta_edges is None else np.zeros((no_vars, nbins, delta_edges.shape[1] + 1))
     if n_points1 == 0 or n_points2 == 0:
         return sf, num_bin_points, weight_sum_bin, pdf
     data1 = np.asarray(data1, dtype=np.float64).reshape(no_vars, n_points1)
@@ -1404,7 +1409,7 @@ def _compute_sf_cpu_vectorized(data1, data2, no_vars, weight1, weight2,
                 sf[ivar, p] += np.bincount(bins, weights=power, minlength=nbins)
                 power *= diff
             if pdf is not None:
-                cols = _delta_bin_index(diff, delta_edges)
+                cols = _delta_bin_index(diff, delta_edges[ivar])
                 pdf[ivar] += np.bincount(bins * pdf.shape[2] + cols,
                                          minlength=nbins * pdf.shape[2]).reshape(nbins, -1)
     return sf, num_bin_points, weight_sum_bin, pdf
@@ -1803,7 +1808,8 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
         Number of blocks to process per batch. If None, automatically determined based on 
         available memory. Default=None
     delta_edges : array-like, optional
-        Strictly increasing edges for a per-separation-bin histogram of the
+        Strictly increasing edges, (n_edges,) for every variable or
+        (n_vars, n_edges) per variable, for a per-separation-bin histogram of the
         increment |w2*q2 - w1*q1| (the quantity whose powers form the moment
         sums), e.g. from delta_edges_from_dist. Column 0 counts increments
         below the first edge and the last column those at or above the last
@@ -1825,7 +1831,7 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
         Number of point pairs in each radial bin for each weighting scheme
     delta_pdf : xp.ndarray, only with delta_edges
         Importance-weighted pair counts of shape ([n_weights,] n_vars, nbins,
-        len(delta_edges) + 1); summing over the last axis gives the weighted
+        n_edges + 1); summing over the last axis gives the weighted
         pair count of each separation bin
     """
     
@@ -1938,8 +1944,8 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
     pair_options = dict(use_exhaustive=bool(use_exhaustive))
     delta_pdf = None
     if delta_edges is not None:
-        delta_edges = _validated_delta_edges(delta_edges)
-        delta_pdf = xp.zeros((n_weights, no_vars, nbins, len(delta_edges) + 1), dtype=xp.float64)
+        delta_edges = _validated_delta_edges(delta_edges, no_vars)
+        delta_pdf = xp.zeros((n_weights, no_vars, nbins, delta_edges.shape[1] + 1), dtype=xp.float64)
         pair_options.update(delta_edges=delta_edges, delta_pdf=delta_pdf)
     if debug:
         print(f"Debug: Successfully initialized result arrays with shapes:")
@@ -3206,13 +3212,84 @@ def delta_edges_from_dist(ad, dist_key, scale='linear', n_delta=64, signed=False
     return edges, sigma
 
 
-def _validated_delta_edges(delta_edges):
-    """Increment-histogram edges as a contiguous float64 backend array;
-    they must be finite and strictly increasing."""
-    edges = np.asarray(asnumpy(delta_edges), dtype=np.float64).ravel()
-    if edges.size < 2 or not np.all(np.isfinite(edges)) or np.any(np.diff(edges) <= 0):
+def _validated_delta_edges(delta_edges, n_vars=None):
+    """Increment-histogram edges as a contiguous float64 backend array.
+
+    A 1-D array is one edge set; with n_vars it is repeated so every
+    variable has a row, and a 2-D (n_vars, n_edges) array gives each variable
+    its own edges (variables differ in scale). Rows must be finite and
+    strictly increasing.
+    """
+    edges = np.asarray(asnumpy(delta_edges), dtype=np.float64)
+    if edges.ndim == 1 and n_vars is not None:
+        edges = np.tile(edges, (n_vars, 1))
+    if edges.ndim == 2 and n_vars is not None and edges.shape[0] != n_vars:
+        raise ValueError(f'delta_edges has {edges.shape[0]} rows for {n_vars} variables')
+    if (edges.ndim not in ((1,) if n_vars is None else (2,)) or edges.shape[-1] < 2
+            or not np.all(np.isfinite(edges)) or np.any(np.diff(edges, axis=-1) <= 0)):
         raise ValueError('delta_edges must be finite, strictly increasing, with at least two edges')
     return xp.ascontiguousarray(xp.asarray(edges))
+
+
+# Fixed increment edges in units of each variable's standard deviation:
+# 96 logarithmic |delta|/sigma bins from 1e-4 to 1e2 (underflow and overflow
+# columns catch the rest). Fixed in sigma units, histograms of different
+# snapshots and resolutions can be stacked.
+DEFAULT_NORMALIZED_DELTA_EDGES = np.logspace(-4.0, 2.0, 97)
+# Signed version for the longitudinal Helmholtz increment, with one central
+# bin [-1e-4, 1e-4) sigma.
+DEFAULT_NORMALIZED_SIGNED_DELTA_EDGES = np.concatenate(
+    [-np.logspace(-4.0, 2.0, 49)[::-1], np.logspace(-4.0, 2.0, 49)])
+
+
+def masked_increment_scales(ad, variables, weight, batch=16, mpi_manager=None):
+    """Weighted standard deviation of each variable over the cells where
+    ``weight`` is positive, accumulated per meshblock range. Used to place
+    increment-histogram edges.
+
+    With distributed data each rank sums its own meshblocks and the sums are
+    allreduced (an MPIManager is created if none is given). Rounded to 12
+    significant digits so a resumed run rebuilds identical edges from the
+    same data.
+    """
+    distributed = getattr(ad, 'has_full_data', True) is False
+    if distributed:
+        lo_mb, hi_mb = int(ad.local_mb_start), int(ad.local_mb_end)
+        if mpi_manager is None:
+            mpi_manager = MPIManager()
+    else:
+        lo_mb, hi_mb = 0, int(ad.n_mbs)
+    n = len(variables)
+    s0 = 0.0
+    s1 = np.zeros(n)
+    s2 = np.zeros(n)
+    for lo in range(lo_mb, hi_mb, batch):
+        hi = min(hi_mb, lo + batch)
+        w = xp.asarray(ad.data(weight, lo, hi), dtype=xp.float64)
+        w = xp.where(w > 0, w, 0.0)
+        s0 += float(xp.sum(w))
+        for i, var in enumerate(variables):
+            q = xp.asarray(ad.data(var, lo, hi), dtype=xp.float64)
+            s1[i] += float(xp.sum(w * q))
+            s2[i] += float(xp.sum(w * q * q))
+    if distributed:
+        sums = mpi_manager.allreduce(np.concatenate([[s0], s1, s2]), 'sum')
+        s0, s1, s2 = float(sums[0]), sums[1:n + 1], sums[n + 1:]
+    if s0 <= 0:
+        return np.zeros(n)
+    mean = s1 / s0
+    sigma = np.sqrt(np.maximum(s2 / s0 - mean * mean, 0.0))
+    return np.array([float(f'{v:.12g}') for v in sigma])
+
+
+def normalized_delta_edges(sigma, template=None):
+    """Per-variable absolute edges template * sigma, shape (n_vars, n_edges).
+    A zero (empty-region) or non-finite sigma falls back to sigma = 1 so the
+    edges stay valid; such a row only fills the underflow column."""
+    template = DEFAULT_NORMALIZED_DELTA_EDGES if template is None else np.asarray(template, dtype=np.float64)
+    sigma = np.atleast_1d(np.asarray(sigma, dtype=np.float64))
+    sigma = np.where(np.isfinite(sigma) & (sigma > 0), sigma, 1.0)
+    return sigma[:, None] * template[None, :]
 
 
 # Placeholder device buffer for kernels launched without an increment histogram.
@@ -3370,7 +3447,7 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
 
     With delta_edges (ascending increment edges, on the backend of sf) the
     per-bin increment histogram is accumulated into delta_pdf, shape
-    (n_weights, n_vars, nbins, len(delta_edges) + 1), with the same
+    (n_weights, n_vars, nbins, n_edges + 1), with the same
     importance weights as the moment sums.
     """
     if (delta_edges is None) != (delta_pdf is None):
@@ -3532,12 +3609,14 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
             local_num_bin_points = workspace['num']
             local_weight_sum_bin = workspace['wsum']
             if delta_edges is not None:
-                pdf_size = no_vars * nbins * (len(delta_edges) + 1)
+                pdf_size = no_vars * nbins * (delta_edges.shape[-1] + 1)
                 if workspace.get('pdf') is None or workspace['pdf'].size != pdf_size:
                     workspace['pdf'] = xp.zeros(pdf_size, dtype=xp.float64)
                 else:
                     workspace['pdf'].fill(0)
-                local_pdf, n_delta_edges = workspace['pdf'], len(delta_edges)
+                local_pdf, n_delta_edges = workspace['pdf'], delta_edges.shape[-1]
+                if delta_edges.ndim == 1:
+                    delta_edges = xp.ascontiguousarray(xp.tile(delta_edges, (no_vars, 1)))
             else:
                 local_pdf, n_delta_edges = _NO_DELTA_PDF, 0
             
@@ -5156,7 +5235,8 @@ def set_sf(ad, varl=['dens','velx','vely','velz'], varsuf='', redo=False, auto_s
                 }
                 if delta_pdf is not None:
                     ad.sf[varname]['delta_pdf'] = np.take(asnumpy(delta_pdf), i, axis=var_axis)
-                    ad.sf[varname]['delta_edges'] = np.asarray(kwargs['delta_edges'], dtype=np.float64)
+                    edges = np.asarray(kwargs['delta_edges'], dtype=np.float64)
+                    ad.sf[varname]['delta_edges'] = edges[i] if edges.ndim == 2 else edges
         else:
             # Single variable case - use standard method (only when MPI is NOT enabled)
             # This branch should never be reached when use_mpi=True
@@ -6409,3 +6489,13 @@ def sf_entry_is_current(entry) -> bool:
     if isinstance(tag, bytes):
         tag = tag.decode()
     return str(tag) == SF_SAMPLER_VERSION
+
+
+def sf_entry_complete(entry) -> bool:
+    """Current sampler tag and the per-separation-bin increment histogram(s):
+    'delta_pdf' for scalar SFs, 'delta_pdf_comp'/'delta_pdf_sol' for
+    Helmholtz SFs."""
+    if not sf_entry_is_current(entry):
+        return False
+    keys = ('delta_pdf_comp', 'delta_pdf_sol') if 'sf_comp' in entry else ('delta_pdf',)
+    return all(key in entry for key in keys)

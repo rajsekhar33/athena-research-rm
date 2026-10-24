@@ -52,3 +52,11 @@ def test_mixed_scalar_and_dtype_reductions_agree(mpi):
     np.testing.assert_array_equal(mpi.allreduce(arr, 'sum'), np.full(3, float(mpi.size)))
     with pytest.raises(ValueError):
         mpi.allreduce(np.zeros(2 + mpi.rank), 'sum')
+
+
+def test_masked_increment_scales_distributed_matches_serial(mpi):
+    from athena_research.operations.structure_functions import masked_increment_scales
+    full = masked_increment_scales(make_ad(), ['dens', 'temp'], 'vol')
+    part = masked_increment_scales(make_ad(rank=mpi.rank, size=mpi.size), ['dens', 'temp'], 'vol',
+                                   mpi_manager=mpi)
+    np.testing.assert_allclose(part, full, rtol=1e-10)

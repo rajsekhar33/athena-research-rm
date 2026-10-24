@@ -59,3 +59,12 @@ class CheckpointV3Tests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipIf(cupy_enabled, 'CPU fixture suite')
+class CheckpointPerVariableEdgeTests(unittest.TestCase):
+    def test_each_key_gets_its_edge_row(self):
+        edges = np.array([[0.01, 0.1, 0.5, 1.0], [0.02, 0.2, 0.6, 1.2]])
+        ad = ToyData(); self.assertTrue(run(ad, delta_edges=edges))
+        np.testing.assert_array_equal(ad.sf['dens_p']['delta_edges'], edges[0])
+        np.testing.assert_array_equal(ad.sf['velx_p']['delta_edges'], edges[1])

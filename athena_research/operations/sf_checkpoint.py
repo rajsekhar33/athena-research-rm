@@ -89,7 +89,7 @@ def _signature(ad,source,name,variables,weights,npairs,nbins,order,log_bins,batc
         kernel_source_sha256=hashlib.sha256(Path(legacy.__file__).read_bytes()).hexdigest(),
         engine_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         sampling=legacy.SF_SAMPLER_VERSION,
-        delta_edges=None if delta_edges is None else [float(e) for e in np.asarray(delta_edges).ravel()])
+        delta_edges=None if delta_edges is None else np.asarray(asnumpy(delta_edges),dtype=float).tolist())
 
 
 def _validate_state(state,signature,shape,total,pdf_shape=None):
@@ -160,7 +160,7 @@ def checkpointed_sf(ad,name,variables,*,weights,npairs=1e10,nbins=100,max_order=
         # Sums from another sampler cannot be continued by this one.
         previous=None
     if delta_edges is not None:
-        delta_edges=legacy._validated_delta_edges(delta_edges)
+        delta_edges=legacy._validated_delta_edges(delta_edges,len(variables))
     n=int(ad.n_mbs);total=n*(n+1)//2;points=int(ad.nx1*ad.nx2*ad.nx3)
     if n<1:
         raise ValueError('SF needs at least one meshblock')
@@ -180,7 +180,7 @@ def checkpointed_sf(ad,name,variables,*,weights,npairs=1e10,nbins=100,max_order=
         print(f'SF {name}: checkpoint written by an earlier revision of the same sampler; continuing',flush=True)
         previous={**previous,'signature_json':json.dumps(signature,sort_keys=True)}
     shape=(len(weights),len(variables),max_order,nbins)
-    pdf_shape=None if delta_edges is None else (len(weights),len(variables),nbins,len(delta_edges)+1)
+    pdf_shape=None if delta_edges is None else (len(weights),len(variables),nbins,delta_edges.shape[1]+1)
     L=np.array([ad.x1max-ad.x1min,ad.x2max-ad.x2min,ad.x3max-ad.x3min],float)
     geom=np.asarray(ad.mb_geometry);first=geom[0]
     cell=(first[1::2]-first[::2])/np.array([ad.nx1,ad.nx2,ad.nx3])
@@ -248,7 +248,7 @@ def checkpointed_sf(ad,name,variables,*,weights,npairs=1e10,nbins=100,max_order=
                         sampler=legacy.SF_SAMPLER_VERSION)
                     if delta_pdf is not None:
                         ad.sf[key]['delta_pdf']=np.asarray(state['delta_pdf'][:,i]).squeeze().copy()
-                        ad.sf[key]['delta_edges']=asnumpy(delta_edges).copy()
+                        ad.sf[key]['delta_edges']=asnumpy(delta_edges[i]).copy()
         checkpoint(ad,f'SF {name} '+('complete' if complete else 'partial'))
         last_save=time.monotonic()
         print(f'SF {name}: durable pairs {state["completed_pairs"]}/{total}; '
