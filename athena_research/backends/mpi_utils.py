@@ -145,6 +145,90 @@ class MPIManager:
             return self.comm.allgather(data)
         return [data]
     
+    _OP_NAMES = ('sum', 'prod', 'max', 'min')
+
+    def _mpi_op(self, op):
+        if op not in self._OP_NAMES:
+            raise ValueError(f"unknown reduction op {op!r}; expected one of "
+                             f"{self._OP_NAMES}")
+        return {'sum': self.MPI.SUM, 'prod': self.MPI.PROD,
+                'max': self.MPI.MAX, 'min': self.MPI.MIN}[op]
+
+    def _reduce_impl(self, data, op, root):
+        """Reduce ``data`` over all ranks; ``root=None`` means allreduce.
+
+        Arrays and NumPy scalars are reduced elementwise. The pickle-based
+        mpi4py reductions apply MIN/MAX with Python's ``min``/``max``, which
+        raise on multi-element arrays on one rank while the others wait
+        forever, so arrays go through the buffer interface (numeric dtypes)
+        or an allgather plus the matching NumPy ufunc (anything else).
+        Ranks may pass different numeric types for the same quantity (a Python
+        float on a rank without meshblocks, np.float64 elsewhere): every rank
+        first shares its kind, dtype and shape, so all of them take the same
+        path and reduce in the common dtype. Mismatched shapes, or arrays on
+        some ranks and other objects on others, raise on every rank.
+        """
+        mpi_op = self._mpi_op(op)
+        to_device = None
+        if self.backend_manager and self.backend_manager.backend_type == 'gpu':
+            host = self.backend_manager.asnumpy(data)
+            to_device = self.backend_manager.to_device
+        elif type(data).__module__.split('.')[0] == 'cupy':
+            import cupy
+            host, to_device = cupy.asnumpy(data), cupy.asarray
+        else:
+            host = data
+        numeric = isinstance(host, (np.ndarray, np.generic, bool, int, float, complex))
+        if numeric:
+            arr = np.array(host, order='C', copy=True)
+            meta = ('array', arr.dtype.str, arr.shape)
+        else:
+            meta = ('object', None, None)
+        metas = self.comm.allgather(meta)
+        kinds = {m[0] for m in metas}
+        if len(kinds) > 1:
+            raise ValueError(f'MPI reduce: ranks passed incompatible values {metas}')
+        if numeric:
+            if len({m[2] for m in metas}) > 1:
+                raise ValueError(f'MPI reduce: ranks passed different shapes {[m[2] for m in metas]}')
+            arr = arr.astype(np.result_type(*[np.dtype(m[1]) for m in metas]), copy=False)
+            is_scalar = arr.ndim == 0
+            # MPI has no MIN/MAX for complex and no float16 datatype.
+            buffer_ok = (arr.dtype.kind in 'iu'
+                         or (arr.dtype.kind == 'f' and arr.dtype.itemsize >= 4)
+                         or (arr.dtype.kind == 'c' and op in ('sum', 'prod')))
+            if buffer_ok:
+                flat = arr.reshape(-1)
+                out = np.empty_like(flat)
+                if root is None:
+                    self.comm.Allreduce(flat, out, op=mpi_op)
+                else:
+                    self.comm.Reduce(flat, out if self.rank == root else None,
+                                     op=mpi_op, root=root)
+                    if self.rank != root:
+                        return None
+                result = out.reshape(arr.shape)
+            else:
+                ufunc = {'sum': np.add, 'prod': np.multiply,
+                         'max': np.maximum, 'min': np.minimum}[op]
+                if root is None:
+                    parts = self.comm.allgather(arr)
+                else:
+                    parts = self.comm.gather(arr, root=root)
+                    if self.rank != root:
+                        return None
+                result = ufunc.reduce(np.stack(parts), axis=0)
+            if is_scalar:
+                result = result[()]
+            return to_device(result) if to_device is not None else result
+        if root is None:
+            result = self.comm.allreduce(host, op=mpi_op)
+        else:
+            result = self.comm.reduce(host, op=mpi_op, root=root)
+            if self.rank != root:
+                return None
+        return to_device(result) if to_device is not None else result
+
     def reduce(self, data, op='sum', root=0):
         """
         Reduce data from all processes using specified operation.
@@ -161,29 +245,11 @@ class MPIManager:
         Returns
         -------
         array-like or scalar
-            Reduced result (only at root)
+            Reduced result (only at root; None elsewhere)
         """
         if not self.is_initialized:
             return data
-        
-        op_map = {
-            'sum': self.MPI.SUM,
-            'prod': self.MPI.PROD,
-            'max': self.MPI.MAX,
-            'min': self.MPI.MIN
-        }
-        
-        mpi_op = op_map.get(op, self.MPI.SUM)
-        
-        # Handle CuPy arrays if present
-        if self.backend_manager and self.backend_manager.backend_type == 'gpu':
-            data_cpu = self.backend_manager.asnumpy(data)
-            result = self.comm.reduce(data_cpu, op=mpi_op, root=root)
-            if self.rank == root and result is not None:
-                return self.backend_manager.to_device(result)
-            return result
-        else:
-            return self.comm.reduce(data, op=mpi_op, root=root)
+        return self._reduce_impl(data, op, root)
     
     def allreduce(self, data, op='sum'):
         """
@@ -203,23 +269,7 @@ class MPIManager:
         """
         if not self.is_initialized:
             return data
-        
-        op_map = {
-            'sum': self.MPI.SUM,
-            'prod': self.MPI.PROD,
-            'max': self.MPI.MAX,
-            'min': self.MPI.MIN
-        }
-        
-        mpi_op = op_map.get(op, self.MPI.SUM)
-        
-        # Handle CuPy arrays if present
-        if self.backend_manager and self.backend_manager.backend_type == 'gpu':
-            data_cpu = self.backend_manager.asnumpy(data)
-            result = self.comm.allreduce(data_cpu, op=mpi_op)
-            return self.backend_manager.to_device(result)
-        else:
-            return self.comm.allreduce(data, op=mpi_op)
+        return self._reduce_impl(data, op, None)
     
     def send(self, data, dest, tag=0):
         """

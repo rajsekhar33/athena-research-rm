@@ -99,9 +99,12 @@ def set_profile(ad, varl=['dens','temp','pres','mdot'], varsuf='',
         else:
             vert_range = (ad.x3min, ad.x3max)
     
+    # Results are always stored under the axis-suffixed key (see below), so
+    # the cache check must use it too; the bare legacy key is only an alias
+    # for axis='z'.
     for var in varl:
         varname = var + varsuf
-        if redo or varname not in ad.vert.keys():
+        if redo or f"{varname}_{axis}" not in ad.vert.keys():
             varl_to_do.append(varname)
             var_to_do.append(var)
     
@@ -383,6 +386,9 @@ def set_radial(ad, varl=['dens','temp','pres','mdot'], varsuf='',
     hist_r = [xp.zeros(bins) for _ in range(len(varl_to_do))]
     hist_sq_r = [xp.zeros(bins) for _ in range(len(varl_to_do))]
     weight_sum_r = xp.zeros(bins)
+    # Per-variable weight sums over cells where that variable is finite; the
+    # profile mean/sigma divide by these so excluded cells carry no weight.
+    weight_var_r = [xp.zeros(bins) for _ in range(len(varl_to_do))]
     
     # Compute bin edges and centers once (independent of data, same for all ranks)
     if rad_scale == 'log':
@@ -459,16 +465,21 @@ def set_radial(ad, varl=['dens','temp','pres','mdot'], varsuf='',
             if var in log_scale:
                 data = xp.log10(data)
             
-            # Handle NaN or inf values
-            xp.nan_to_num(data, copy=False, posinf=0.0, neginf=0.0)
+            # Non-finite cells (NaN, log of zero/negative) get zero weight.
+            # ``data`` may be a view of the cached raw array: never modify it.
+            finite = xp.isfinite(data)
+            data = xp.where(finite, data, 0.0)
+            weinorm_var = xp.where(finite, weinorm, 0.0)
             
             # Calculate histograms for this variable and batch using pre-computed bin edges
-            hist_vals, _ = xp.histogram(var_r, bins=bin_edges, weights=data * weinorm, density=False)
-            hist_sq_vals, _ = xp.histogram(var_r, bins=bin_edges, weights=data**2 * weinorm, density=False)
+            hist_vals, _ = xp.histogram(var_r, bins=bin_edges, weights=data * weinorm_var, density=False)
+            hist_sq_vals, _ = xp.histogram(var_r, bins=bin_edges, weights=data**2 * weinorm_var, density=False)
+            wvar_vals, _ = xp.histogram(var_r, bins=bin_edges, weights=weinorm_var, density=False)
             
             # Accumulate results
             hist_r[ivar] += hist_vals
             hist_sq_r[ivar] += hist_sq_vals
+            weight_var_r[ivar] += wvar_vals
         
         # Free memory after each batch if using GPU
         if cupy_enabled:
@@ -493,6 +504,7 @@ def set_radial(ad, varl=['dens','temp','pres','mdot'], varsuf='',
             
             hist_r[ivar] = xp.asarray(hist_total)
             hist_sq_r[ivar] = xp.asarray(hist_sq_total)
+            weight_var_r[ivar] = xp.asarray(mpi_manager.allreduce(asnumpy(weight_var_r[ivar]), op='sum'))
     
     # Compute final statistics for each variable
     for ivar, var in enumerate(var_to_do):
@@ -507,20 +519,23 @@ def set_radial(ad, varl=['dens','temp','pres','mdot'], varsuf='',
             is_flux = any(flux_var in var for flux_var in flux_vars)
         
         # Filter out bins with no data
-        valid_bins = weight_sum_r > 0
+        weight_r = weight_var_r[ivar]
+        valid_bins = weight_r > 0
         
         # Calculate mean and standard deviation for valid bins
         mean_r = xp.zeros_like(weight_sum_r)
         ms_r = xp.zeros_like(weight_sum_r)
         
         if xp.any(valid_bins):
-            mean_r[valid_bins] = hist_r[ivar][valid_bins] / weight_sum_r[valid_bins]
-            ms_r[valid_bins] = hist_sq_r[ivar][valid_bins] / weight_sum_r[valid_bins]
+            mean_r[valid_bins] = hist_r[ivar][valid_bins] / weight_r[valid_bins]
+            ms_r[valid_bins] = hist_sq_r[ivar][valid_bins] / weight_r[valid_bins]
             
-            # Apply flux correction if needed
+            # Apply flux correction if needed: the profile scales by 4 pi r^2,
+            # so the second moment scales by its square.
             if is_flux:
-                mean_r[valid_bins] *= 4.0 * xp.pi * rad_r[valid_bins]**2
-                ms_r[valid_bins] *= 4.0 * xp.pi * rad_r[valid_bins]**2
+                area = 4.0 * xp.pi * rad_r[valid_bins]**2
+                mean_r[valid_bins] *= area
+                ms_r[valid_bins] *= area**2
             
             # Calculate standard deviation, with numerical stability safeguards
             variance = xp.maximum(0, ms_r - mean_r**2)

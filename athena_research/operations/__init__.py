@@ -2,8 +2,8 @@
 Operations module for Athenak data analysis.
 
 This module provides various operations for analyzing Athenak simulation data,
-including basic operations, histograms, profiles, spectral analysis, and
-structure functions.
+including basic operations, histograms, profiles, spectral analysis,
+structure functions, and correlation functions.
 """
 
 # Import operation submodules
@@ -15,6 +15,7 @@ try:
     from .weighted_projection import *
     from .spectra import *
     from .structure_functions import *
+    from .correlation_functions import get_cf, set_cf, cf_entry_is_current
     from .area_functions import set_area, calc_area_mb_based, calc_areas_all_steps, STEP_SIZES
 except ImportError as e:
     import warnings
@@ -38,6 +39,9 @@ __all__ = [
 
     # Structure function operations
     'set_sf', 'set_sf_helmholtz', 'set_sf_aniso_mhd',
+
+    # Correlation function operations
+    'get_cf', 'set_cf', 'cf_entry_is_current',
 
     # Gradient, divergence, and curl operations
     'gradient', 'divergence', 'curl',

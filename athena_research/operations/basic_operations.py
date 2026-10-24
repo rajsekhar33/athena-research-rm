@@ -56,7 +56,11 @@ def calc_data(ad, varl=['mass', 'eint', 'ekin'], varsuf='', operation='sum', sca
     -----
     - For 'sum' and 'average' operations, values are weighted by the specified weights parameter
     - For 'min' and 'max' operations, weights are ignored
-    - NaN and infinite values are handled by replacing them with zeros
+    - NaN and infinite values (including log of zero/negative data) are
+      excluded: they get zero weight in 'sum'/'average' and are ignored by
+      'min'/'max'
+    - Cached results are reused only when they were computed with the same
+      scale and (string) weights; otherwise they are recomputed
     - Memory usage is optimized through batch processing for large datasets
     """
     # Initialize MPI if requested
@@ -120,10 +124,22 @@ def calc_data(ad, varl=['mass', 'eint', 'ekin'], varsuf='', operation='sum', sca
     
     # Process blocks in optimized batches
     num_batches = (total_mbs + simultaneous_blocks - 1) // simultaneous_blocks
+
+    # Results are keyed by variable name only, so remember the settings each
+    # was computed with and recompute on mismatch. Array weights cannot be
+    # compared cheaply and always force a recompute.
+    if not hasattr(ad, '_calc_data_settings'):
+        ad._calc_data_settings = {}
+    if operation in ('sum', 'average'):
+        settings = (scale, weights) if (weights is None or isinstance(weights, str)) else None
+    else:
+        settings = (scale,)
     
     for var in varl:
         varname = var + varsuf
-        if redo or varname not in target_dict:
+        cached_settings = ad._calc_data_settings.get((operation, varname))
+        if (redo or varname not in target_dict or settings is None
+                or cached_settings != settings):
             result_value = initial_value
             
             for batch_idx in range(num_batches):
@@ -145,24 +161,25 @@ def calc_data(ad, varl=['mass', 'eint', 'ekin'], varsuf='', operation='sum', sca
                 else:
                     data = ad.data(var, batch_start_global, batch_end_global)
                 
-                # Handle NaN and infinite values
-                xp.nan_to_num(data, copy=False, posinf=0.0, neginf=0.0)
+                # Exclude non-finite cells without writing into ``data``,
+                # which may be a view of the cached raw array.
+                finite = xp.isfinite(data)
                 
                 # Perform the requested operation
                 if operation == 'sum':
-                    weinorm = ad.data(weights, batch_start_global, batch_end_global)
-                    batch_result = xp.sum(data * weinorm)
+                    weinorm = xp.where(finite, ad.data(weights, batch_start_global, batch_end_global), 0.0)
+                    batch_result = xp.sum(xp.where(finite, data, 0.0) * weinorm)
                     result_value += batch_result
                 elif operation == 'min':
-                    batch_result = xp.min(data)
+                    batch_result = xp.min(xp.where(finite, data, xp.inf))
                     result_value = min(result_value, batch_result)
                 elif operation == 'max':
-                    batch_result = xp.max(data)
+                    batch_result = xp.max(xp.where(finite, data, -xp.inf))
                     result_value = max(result_value, batch_result)
                 elif operation == 'average':
-                    weinorm = ad.data(weights, batch_start_global, batch_end_global)
+                    weinorm = xp.where(finite, ad.data(weights, batch_start_global, batch_end_global), 0.0)
                     # Calculate weighted sum and total weights for this batch
-                    weighted_sum = xp.sum(data * weinorm)
+                    weighted_sum = xp.sum(xp.where(finite, data, 0.0) * weinorm)
                     total_weight = xp.sum(weinorm)
                     # Add to the running total
                     result_value = (result_value[0] + weighted_sum, result_value[1] + total_weight)
@@ -194,6 +211,7 @@ def calc_data(ad, varl=['mass', 'eint', 'ekin'], varsuf='', operation='sum', sca
                     target_dict[varname] = 0.0
             else:
                 target_dict[varname] = result_value
+            ad._calc_data_settings[(operation, varname)] = settings
     
     # Return the target dictionary
     return target_dict

@@ -7,6 +7,7 @@ This module provides functions to read particle data from various formats:
 - VTK particle files (.vtk)
 """
 
+import re
 import numpy as np
 import h5py
 from pathlib import Path
@@ -384,7 +385,16 @@ def read_particle_hdf5(filename):
 
 def read_particle_vtk(filename):
     """
-    Read legacy VTK particle file
+    Read an AthenaK legacy VTK particle file.
+
+    The layout (``outputs/vtk_prtcl.cpp``) is: a ``# vtk DataFile`` line, a
+    comment line carrying ``time= <t>`` and ``cycle=<n>``, ``BINARY``,
+    ``DATASET UNSTRUCTURED_GRID``, then ``POINTS <n> float`` followed by
+    3n big-endian positions, ``POINT_DATA <n>``, and one
+    ``SCALARS <name> <type>`` / ``LOOKUP_TABLE default`` record per
+    integer particle field (``gid``, ``ptag``). AthenaK writes those
+    integer fields as float32, so they are converted back to int64 here
+    (exact below 2**24).
     
     Parameters
     ----------
@@ -396,46 +406,57 @@ def read_particle_vtk(filename):
     dict
         Dictionary containing particle data
     """
+    dtypes = {'float': '>f4', 'double': '>f8', 'int': '>i4'}
     with open(filename, 'rb') as f:
-        # Skip header lines
-        for _ in range(4):
-            f.readline()
-        
-        # Read time and cycle
-        time_line = f.readline().decode('ascii')
-        time = float(time_line.split()[1])
-        cycle_line = f.readline().decode('ascii')
-        cycle = int(cycle_line.split()[1])
-        
-        # Read number of particles
-        points_line = f.readline().decode('ascii')
-        nparticles = int(points_line.split()[1])
-        
-        # Read positions
-        positions = np.fromfile(f, dtype='>f4', count=nparticles*3)
-        positions = positions.reshape((nparticles, 3))
-        
-        # Skip to particle data
-        f.readline()
-        f.readline()
-        
-        # Read gid
-        f.readline()
-        gid = np.fromfile(f, dtype='>i4', count=nparticles)
-        
-        # Read ptag
-        f.readline()
-        f.readline()
-        ptag = np.fromfile(f, dtype='>i4', count=nparticles)
-    
-    return {
+        if not f.readline().startswith(b'# vtk DataFile'):
+            raise ValueError(f"{filename}: not a legacy VTK file")
+        comment = f.readline().decode('ascii', errors='replace')
+        time_match = re.search(r'time=\s*([-+0-9.eE]+)', comment)
+        cycle_match = re.search(r'cycle=\s*(-?\d+)', comment)
+        if time_match is None or cycle_match is None:
+            raise ValueError(f"{filename}: no 'time=' / 'cycle=' in header line {comment!r}")
+        time = float(time_match.group(1))
+        cycle = int(cycle_match.group(1))
+
+        nparticles = None
+        positions = None
+        scalars = {}
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            sp = line.split()
+            if not sp:
+                continue
+            if sp[0] == b'POINTS':
+                nparticles = int(sp[1])
+                dt = np.dtype(dtypes[sp[2].decode()])
+                positions = np.frombuffer(f.read(3 * nparticles * dt.itemsize),
+                                          dtype=dt).reshape(nparticles, 3)
+            elif sp[0] == b'SCALARS':
+                if nparticles is None:
+                    raise ValueError(f"{filename}: SCALARS before POINTS")
+                name = sp[1].decode()
+                dt = np.dtype(dtypes[sp[2].decode()])
+                if f.readline().split()[:1] != [b'LOOKUP_TABLE']:
+                    raise ValueError(f"{filename}: SCALARS {name} without LOOKUP_TABLE")
+                scalars[name] = np.frombuffer(f.read(nparticles * dt.itemsize), dtype=dt)
+        if positions is None:
+            raise ValueError(f"{filename}: no POINTS record")
+
+    out = {
         'time': time,
         'ncycle': cycle,
         'nparticles': nparticles,
-        'x': positions[:, 0],
-        'y': positions[:, 1],
-        'z': positions[:, 2],
-        'gid': gid,
-        'tag': ptag,
+        'x': positions[:, 0].astype(np.float64),
+        'y': positions[:, 1].astype(np.float64),
+        'z': positions[:, 2].astype(np.float64),
         'var_names': []
     }
+    for name, values in scalars.items():
+        key = 'tag' if name == 'ptag' else name
+        if name in ('gid', 'ptag'):
+            out[key] = np.rint(values).astype(np.int64)
+        else:
+            out[key] = values.astype(np.float64)
+    return out

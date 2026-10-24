@@ -201,12 +201,14 @@ def cell_info(self, level=0, xyz=None):
     nx2_fac = 2**level * self.Nx2 / (self.x2max - self.x2min)
     nx3_fac = 2**level * self.Nx3 / (self.x3max - self.x3min)
     
+    # Same (truncating) index convention as get_refined_data, so the
+    # coordinates returned here match the shape of the data it returns.
     i_min = int((xyz[0] - self.x1min) * nx1_fac)
-    i_max = int(np.ceil((xyz[1] - self.x1min) * nx1_fac))
+    i_max = int((xyz[1] - self.x1min) * nx1_fac)
     j_min = int((xyz[2] - self.x2min) * nx2_fac)
-    j_max = int(np.ceil((xyz[3] - self.x2min) * nx2_fac))
+    j_max = int((xyz[3] - self.x2min) * nx2_fac)
     k_min = int((xyz[4] - self.x3min) * nx3_fac)
-    k_max = int(np.ceil((xyz[5] - self.x3min) * nx3_fac))
+    k_max = int((xyz[5] - self.x3min) * nx3_fac)
     
     dx = (xyz[1] - xyz[0]) / (i_max - i_min)
     dy = (xyz[3] - xyz[2]) / (j_max - j_min)
@@ -624,21 +626,15 @@ def get_refined_data(self, var, level=0, xyz=None):
     k_max = int((xyz[5]-self.x3min)*nx3_fac)
     data = xp.zeros((k_max-k_min, j_max-j_min, i_max-i_min))
     
-    # Use get_data function from data_functions module
+    # Fetch exactly this rank's blocks with an explicit range, so raw and
+    # derived variables (coordinates included) index the same blocks.
     from .data_functions import get_data
-    raw = get_data(self, var)
+    mb_start, mb_end, _ = get_distributed_block_bounds(self)
+    raw = get_data(self, var, mb_start, mb_end)
     
-    # In MPI mode, iterate over ALL meshblocks but only process ones this rank owns
-    # In non-MPI mode, iterate over local meshblocks
-    total_blocks = len(self.mb_logical)
-    
-    for nmb in range(total_blocks):
-        # Check if this rank owns this meshblock
-        if nmb < self.local_mb_start or nmb >= self.local_mb_end:
-            continue  # Skip blocks not owned by this rank
-        
+    for nmb in range(mb_start, mb_end):
         # Local index for accessing this rank's data arrays
-        local_idx = nmb - self.local_mb_start
+        local_idx = nmb - mb_start
         
         block_level = self.mb_logical[nmb,-1]
         block_loc = self.mb_logical[nmb,:3]
@@ -744,6 +740,14 @@ def get_refined_data(self, var, level=0, xyz=None):
                                                                 kl_s+ko:ku_s:s,
                                                                 jl_s+jo:ju_s:s,
                                                                 il_s+io:iu_s:s] / (s**num_extended_dims)
+
+    # Each rank filled only the cells of its own blocks (zeros elsewhere);
+    # summing over ranks assembles the full region on every rank.
+    if not getattr(self, 'has_full_data', True):
+        from ..backends.mpi_utils import MPIManager
+        mpi_manager = MPIManager()
+        if mpi_manager.is_initialized and mpi_manager.size > 1:
+            data = xp.asarray(mpi_manager.allreduce(asnumpy(data), op='sum'))
     return data
 
 
@@ -945,7 +949,9 @@ def get_refined_data_mb(self, var, level=0, xyz=None, use_mpi_gather=True):
     # Use allreduce with SUM to combine contributions from all ranks
     # This correctly reconstructs any spatial region, not just full domain
     # UNLESS use_mpi_gather=False (for spectrum slab decomposition)
-    if use_mpi_gather:
+    # Only distributed objects hold partial data; a rank holding every block
+    # would multiply the result by the number of ranks.
+    if use_mpi_gather and not getattr(self, 'has_full_data', True):
         try:
             from ..backends.mpi_utils import MPIManager
             mpi_manager = MPIManager()

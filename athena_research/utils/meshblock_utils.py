@@ -28,7 +28,8 @@ def get_block_coords(mb_geometry, mb_id, nx1, nx2, nx3):
     Returns
     -------
     tuple
-        x, y, z coordinate arrays for the meshblock
+        x, y, z coordinate arrays for the meshblock, each of shape
+        (nx3, nx2, nx1) like AthenaK meshblock data
     """
     x1min, x1max, x2min, x2max, x3min, x3max = mb_geometry[mb_id]
 
@@ -41,7 +42,7 @@ def get_block_coords(mb_geometry, mb_id, nx1, nx2, nx3):
     x2 = xp.linspace(x2min + dx2/2, x2max - dx2/2, nx2)
     x3 = xp.linspace(x3min + dx3/2, x3max - dx3/2, nx3)
 
-    x, y, z = xp.meshgrid(x1, x2, x3, indexing='ij')
+    z, y, x = xp.meshgrid(x3, x2, x1, indexing='ij')
     
     return x, y, z
 
@@ -318,23 +319,24 @@ def find_neighbour_blocks(ad, block_idx, direction):
         child_pos_y = block_y % 2
         child_pos_z = block_z % 2
         
-        # Check if the potential child is on the correct side of the source block
-        if direction == 'x+' and child_parent_x == source_x and child_pos_x == 0:
+        # A finer neighbour is a child of the (periodically wrapped) target
+        # block, on the face that touches the source block.
+        if direction == 'x+' and child_parent_x == target_x and child_pos_x == 0:
             if child_parent_y == source_y and child_parent_z == source_z:
                 neighbors.append(i)
-        elif direction == 'x-' and child_parent_x == source_x - 1 and child_pos_x == 1:
+        elif direction == 'x-' and child_parent_x == target_x and child_pos_x == 1:
             if child_parent_y == source_y and child_parent_z == source_z:
                 neighbors.append(i)
-        elif direction == 'y+' and child_parent_y == source_y and child_pos_y == 0:
+        elif direction == 'y+' and child_parent_y == target_y and child_pos_y == 0:
             if child_parent_x == source_x and child_parent_z == source_z:
                 neighbors.append(i)
-        elif direction == 'y-' and child_parent_y == source_y - 1 and child_pos_y == 1:
+        elif direction == 'y-' and child_parent_y == target_y and child_pos_y == 1:
             if child_parent_x == source_x and child_parent_z == source_z:
                 neighbors.append(i)
-        elif direction == 'z+' and child_parent_z == source_z and child_pos_z == 0:
+        elif direction == 'z+' and child_parent_z == target_z and child_pos_z == 0:
             if child_parent_x == source_x and child_parent_y == source_y:
                 neighbors.append(i)
-        elif direction == 'z-' and child_parent_z == source_z - 1 and child_pos_z == 1:
+        elif direction == 'z-' and child_parent_z == target_z and child_pos_z == 1:
             if child_parent_x == source_x and child_parent_y == source_y:
                 neighbors.append(i)
     

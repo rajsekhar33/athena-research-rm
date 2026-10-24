@@ -12,7 +12,7 @@ import h5py
 from .base import xp, cupy_enabled, asnumpy
 
 
-def read_binary(filename):
+def read_binary(filename, mb_range=None):
     """
     Reads a bin file from filename to dictionary.
 
@@ -22,10 +22,17 @@ def read_binary(filename):
     args:
       filename - string
           filename of bin file to read
+      mb_range - None, (start, end) tuple, or callable
+          Meshblocks whose field data is read. Metadata (index, logical
+          location, geometry) is always returned for every block, but field
+          data only for blocks ``start <= mb < end``; the other blocks are
+          skipped with a seek. A callable is called with the total block
+          count and must return the ``(start, end)`` tuple. None reads all.
 
     returns:
       filedata - dict
-          dictionary of fluid file data
+          dictionary of fluid file data. ``filedata['mb_data'][var][i]`` is
+          global meshblock ``filedata['mb_data_start'] + i``.
     """
 
     filedata = {}
@@ -70,7 +77,7 @@ def read_binary(filename):
         raise ValueError(f"unsupported variable size (in bytes) {varsizebytes}")
 
     locfmt = 'd' if locsizebytes == 8 else 'f'
-    varfmt = 'd' if varsizebytes == 8 else 'f'
+    vardtype = np.dtype('=f8' if varsizebytes == 8 else '=f4')
 
     # load grid information from header and validate
     def get_from_header(header, blockname, keyname):
@@ -112,11 +119,15 @@ def read_binary(filename):
     mb_index = []
     mb_logical = []
     mb_geometry = []
+    mb_data_offset = []
 
     mb_data = {}
     for var in var_list:
         mb_data[var] = []
 
+    # Pass 1: per-block metadata only; field data is skipped with a seek so
+    # the block count (needed to resolve a callable mb_range) is known
+    # before any field data is read.
     while fp.tell() < filesize:
         mb_index.append(np.array(struct.unpack('@6i', fp.read(24))) - nghost)
         nx1_out = (mb_index[mb_count][1] - mb_index[mb_count][0])+1
@@ -126,14 +137,36 @@ def read_binary(filename):
         mb_logical.append(np.array(struct.unpack('@4i', fp.read(16))))
         mb_geometry.append(np.array(struct.unpack('=6'+locfmt,
                                     fp.read(6*locsizebytes))))
+        mb_data_offset.append(fp.tell())
+        fp.seek(varsizebytes * nx1_out*nx2_out*nx3_out*n_vars, 1)
+        mb_count += 1
 
-        data = np.array(struct.unpack(f"={nx1_out*nx2_out*nx3_out*n_vars}" + varfmt,
-                                      fp.read(varsizebytes *
-                                              nx1_out*nx2_out*nx3_out*n_vars)))
+    if mb_range is None:
+        mb_start, mb_end = 0, mb_count
+    elif callable(mb_range):
+        mb_start, mb_end = mb_range(mb_count)
+    else:
+        mb_start, mb_end = mb_range
+    mb_start, mb_end = int(mb_start), int(mb_end)
+    if not 0 <= mb_start <= mb_end <= mb_count:
+        fp.close()
+        raise ValueError(f"mb_range ({mb_start}, {mb_end}) outside the "
+                         f"{mb_count} meshblocks in {filename}")
+
+    # Pass 2: field data for the selected blocks. Values are returned as
+    # float64 (exact for float32 files), the dtype callers expect.
+    for mb in range(mb_start, mb_end):
+        idx = mb_index[mb]
+        nx1_out = idx[1] - idx[0] + 1
+        nx2_out = idx[3] - idx[2] + 1
+        nx3_out = idx[5] - idx[4] + 1
+        count = nx1_out*nx2_out*nx3_out*n_vars
+        fp.seek(mb_data_offset[mb])
+        data = np.frombuffer(fp.read(varsizebytes * count), dtype=vardtype,
+                             count=count).astype(np.float64)
         data = data.reshape(nvars, nx3_out, nx2_out, nx1_out)
         for vari, var in enumerate(var_list):
             mb_data[var].append(data[vari])
-        mb_count += 1
 
     fp.close()
 
@@ -166,13 +199,48 @@ def read_binary(filename):
     filedata['mb_logical'] = np.array(mb_logical)
     filedata['mb_geometry'] = np.array(mb_geometry)
     filedata['mb_data'] = mb_data
+    filedata['mb_data_start'] = mb_start
 
     return filedata
+
+def atomic_write(filename, writer):
+    """Write ``filename`` via a temporary file in the same directory.
+
+    ``writer(path)`` writes the complete file to ``path``; only after it
+    returns is the result moved over ``filename`` with ``os.replace``, so an
+    interrupted or failed write never leaves a truncated file behind. The
+    permission bits of an existing ``filename`` are kept (otherwise the
+    process umask applies, as for a plain ``open``).
+    """
+    import tempfile
+    filename = os.fspath(filename)
+    directory = osp.dirname(osp.abspath(filename))
+    fd, temporary = tempfile.mkstemp(prefix='.' + osp.basename(filename) + '.',
+                                     suffix='.tmp', dir=directory)
+    os.close(fd)
+    try:
+        if osp.exists(filename):
+            mode = os.stat(filename).st_mode & 0o7777
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        writer(temporary)
+        os.chmod(temporary, mode)
+        os.replace(temporary, filename)
+    finally:
+        if osp.exists(temporary):
+            os.unlink(temporary)
+
 
 def save_dict_to_hdf5(dic, filename):
     """
     Save dictionary to HDF5 file.
-    
+
+    The file is written to a temporary name in the same directory and moved
+    into place only once complete (see :func:`atomic_write`), so a crash
+    mid-write never truncates an existing cache.
+
     Parameters
     ----------
     dic:
@@ -181,13 +249,54 @@ def save_dict_to_hdf5(dic, filename):
         desired name of hdf5 file
     """
     exclude_keys = {'data_raw', 'mb_data'} if (str(filename).endswith('.h5data') or '.h5data.' in str(filename)) else set()
-    with h5py.File(filename, 'w') as h5file:
-        _recursively_save_dict_contents_to_group(h5file, '/', dic, exclude_keys=exclude_keys)
+
+    def _write(path):
+        with h5py.File(path, 'w') as h5file:
+            _recursively_save_dict_contents_to_group(h5file, '/', dic, exclude_keys=exclude_keys)
+
+    atomic_write(filename, _write)
+
+
+def hdf5_value_supported(item):
+    """True if :func:`_recursively_save_dict_contents_to_group` can store
+    ``item`` (as a dataset, an empty marker for None, or a group)."""
+    if item is None or isinstance(item, dict):
+        return True
+    if isinstance(item, np.ndarray):
+        return item.dtype.kind not in ('O', 'V', 'M', 'm')
+    if cupy_enabled and isinstance(item, xp.ndarray):
+        return True
+    if isinstance(item, np.generic):
+        return item.dtype.kind not in ('O', 'V', 'M', 'm')
+    return isinstance(item, (str, bytes, bool, int, float, complex,
+                             tuple, list, os.PathLike))
+
+
+def _to_hdf5_value(item):
+    """Convert a leaf value to something h5py stores without loss."""
+    if cupy_enabled and isinstance(item, xp.ndarray):
+        item = asnumpy(item)
+    if isinstance(item, np.ndarray) and item.dtype.kind == 'U':
+        item = item.astype('S')
+    elif isinstance(item, os.PathLike):
+        item = os.fspath(item)
+    elif isinstance(item, np.str_):
+        item = str(item)
+    elif isinstance(item, np.bytes_):
+        item = bytes(item)
+    return item
+
 
 def _recursively_save_dict_contents_to_group(h5file, path, dic, exclude_keys=None):
     """
     Helper function to save dictionary contents to HDF5 group.
-    
+
+    Keys are stored as ``str(key)``; a key containing ``'/'`` is rejected
+    because HDF5 would silently turn it into nested groups. ``None`` is
+    stored as an empty (shape-less) dataset and loads back as ``None``; an
+    empty dict is stored as an empty group. Values of any other unsupported
+    type raise ``TypeError`` instead of being dropped.
+
     Parameters
     ----------
     h5file:
@@ -197,32 +306,35 @@ def _recursively_save_dict_contents_to_group(h5file, path, dic, exclude_keys=Non
     dic:
         python dictionary to be converted to hdf5 format
     """
-    # Import inside function to avoid circular imports
-    from .utils import asnumpy, cupy_enabled
-    import numpy as np
-    
     if exclude_keys is None:
         exclude_keys = set()
 
     for key, item in dic.items():
-        if str(key) in exclude_keys:
+        key = str(key)
+        if key in exclude_keys:
             continue
-        if isinstance(item, np.ndarray) and item.dtype.kind == 'U':
-            item = item.astype('S')
-        if isinstance(item, (np.ndarray, np.int64, np.float64, np.bool_, str, int, float,
-                             bytes, tuple, list, np.float32)):
-            h5file[path + str(key)] = item
-        elif (cupy_enabled and isinstance(item, xp.ndarray)):
-            h5file[path + str(key)] = asnumpy(item.astype(xp.float32))
-        elif isinstance(item, dict):
-            try:
-                _recursively_save_dict_contents_to_group(
-                    h5file, path + key + '/', item, exclude_keys=exclude_keys
-                )
-            except Exception as e:
-                print('Error: ', key, ":", item)
-                raise e
-        
+        if '/' in key:
+            raise ValueError(f"cannot save key {key!r} under {path!r}: HDF5 "
+                             f"names may not contain '/'")
+        name = path + key
+        if isinstance(item, dict):
+            h5file.require_group(name)
+            _recursively_save_dict_contents_to_group(
+                h5file, name + '/', item, exclude_keys=exclude_keys
+            )
+            continue
+        if item is None:
+            h5file.create_dataset(name, data=h5py.Empty('f'))
+            continue
+        if not hdf5_value_supported(item):
+            raise TypeError(f"cannot save {name!r}: unsupported type "
+                            f"{type(item).__name__}")
+        try:
+            h5file[name] = _to_hdf5_value(item)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"cannot save {name!r} ({type(item).__name__}): "
+                            f"{exc}") from exc
+
 
 def load_dict_from_hdf5(filename, mode='r', exclude_keys=None):
     """
@@ -275,6 +387,10 @@ def _recursively_load_dict_contents_from_group(h5file, path, exclude_keys=None):
         if str(key) in exclude_keys:
             continue
         if isinstance(item, h5py.Dataset):
+            if item.shape is None:
+                # Empty dataset: how None is stored.
+                dic[key] = None
+                continue
             v = item[()]
             # h5py returns byte strings for string datasets saved without
             # special_dtype; decode them to str so callers never see bytes.
@@ -467,8 +583,11 @@ def _vtk_set_grid(source):
                 raise IOError(f'{label}: reached EOF before any field marker')
             _vtk_parse_line(line, g)
     g['Nx'] = np.asarray(g['Nx']) - 1
-    g['Nx'][g['Nx'] == 0] = 1
-    g['dx'][g['Nx'] == 1] = 1.0
+    # A node count of 1 marks a collapsed (2D/1D) axis whose SPACING carries
+    # no geometry; a one-cell axis of a 3D grid keeps its real spacing.
+    collapsed = g['Nx'] == 0
+    g['Nx'][collapsed] = 1
+    g['dx'][collapsed] = 1.0
     g['re'] = g['le'] + g['Nx'] * g['dx']
     return g
 
@@ -672,24 +791,36 @@ def _read_athena_par(filename):
     return par
 
 
+_ATHINPUT_MAX_PARENTS = 2
+
+
 def _discover_athinput(vtk_path, problem_id):
     """Search for an Athena 4.2 parameter file alongside the VTK output.
 
     Real datasets place the parameter file in surprising spots — next to the
     rundir, inside an ``input/<config>/`` directory, or as a runtime ``.par``
-    dump. We walk up from the VTK file's directory (capped at eight levels)
-    looking for, in priority order:
+    dump. The search covers the VTK file's directory and at most
+    ``_ATHINPUT_MAX_PARENTS`` parents (plus their ``input/``-style
+    subdirectories) and looks for, in priority order:
 
     1. ``athinput.<problem_id>`` exactly,
     2. ``<problem_id>.par`` exactly (runtime dump),
-    3. any ``athinput.*`` in the directory,
-    4. any ``*.par`` in the directory.
+    3. the single ``athinput.*`` or ``*.par`` file in the run directory
+       itself (the VTK directory, or the parent of an ``idN/`` directory).
+
+    Wildcard matches are never taken from parent directories and never
+    when several candidates exist, so an unrelated parameter file further
+    up the tree cannot be picked silently.
 
     Returns the absolute path or ``None`` if nothing matches.
     """
     candidate_dirs = []
     cur = osp.dirname(osp.abspath(vtk_path))
-    for _ in range(8):
+    run_dirs = [cur]
+    last = osp.basename(cur)
+    if last.startswith('id') and last[2:].isdigit():
+        run_dirs.append(osp.dirname(cur))
+    for _ in range(_ATHINPUT_MAX_PARENTS + 1):
         candidate_dirs.append(cur)
         parent = osp.dirname(cur)
         if parent == cur:
@@ -717,12 +848,13 @@ def _discover_athinput(vtk_path, problem_id):
             path = osp.join(d, name)
             if osp.exists(path):
                 return path
-    # Pass 2: any matching pattern, first sorted match wins.
-    for d in candidate_dirs:
-        for pattern in ('athinput.*', '*.par'):
-            matches = sorted(glob.glob(osp.join(d, pattern)))
-            if matches:
-                return matches[0]
+    # Pass 2: an unambiguous wildcard match in the run directory only.
+    for d in run_dirs:
+        matches = sorted(set(glob.glob(osp.join(d, 'athinput.*')))
+                         | set(glob.glob(osp.join(d, '*.par'))))
+        matches = [m for m in matches if osp.isfile(m)]
+        if len(matches) == 1:
+            return matches[0]
     return None
 
 
@@ -900,6 +1032,7 @@ def _resolve_athinput(athinput, filename, problem_id):
             f"pass `athinput=...` explicitly or place an athinput / .par "
             f"file alongside the simulation output"
         )
+    print(f"read_athena_vtk: using athinput {osp.abspath(path)}")
     return _read_athena_par(path)
 
 

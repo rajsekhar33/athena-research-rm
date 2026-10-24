@@ -65,6 +65,15 @@ if cupy_enabled:
 else:
     print("CUDA not available. Using CPU for calculations.")
 
+def _dc_power(field):
+    """
+    Power of the k=0 mode of a spectrum divided by the cell count: the square
+    of the field's uniform mean. The lowest k bin also holds the k=1/L modes,
+    so the mean is removed by subtracting this rather than dropping a bin.
+    """
+    return xp.mean(xp.asarray(field)) ** 2
+
+
 class ParsevalVerification:
     """Class to handle all Parseval's theorem verification tests."""
     
@@ -156,9 +165,9 @@ class ParsevalVerification:
         
         # E_spectrum already holds the total power in each bin (not a density),
         # so Parseval's theorem is sum(E_spectrum) == <f^2>, with no dk weighting.
-        # Bin 0 is the DC/k=0 mode (mean^2); exclude it since variance_real above
-        # already has the mean subtracted.
-        spectrum_sum = xp.sum(E_spectrum[1:])
+        # Remove the k=0 (mean^2) power since variance_real above already has
+        # the mean subtracted.
+        spectrum_sum = xp.sum(E_spectrum) - _dc_power(data)
         
         # Calculate relative error
         rel_error = abs(asnumpy(spectrum_sum - variance_real) / asnumpy(variance_real))
@@ -253,8 +262,8 @@ class ParsevalVerification:
             E_spectrum = E_spectrum / (ad.Nx1 * ad.Nx2 * ad.Nx3)
             
             # E_spectrum is already total power per bin; sum bins directly
-            # (excluding the DC/k=0 bin, since the real-space side is mean-subtracted).
-            ke_spectrum_total += xp.sum(E_spectrum[1:])
+            # minus the k=0 power, since the real-space side is mean-subtracted.
+            ke_spectrum_total += xp.sum(E_spectrum) - _dc_power({'x': velx, 'y': vely, 'z': velz}[comp])
         
         # The total should be 2 * total_ke_real because E_spectrum gives variance, not energy
         # and kinetic energy = 0.5 * (velx^2 + vely^2 + velz^2)
@@ -420,10 +429,12 @@ class ParsevalVerification:
         E_spectrum_comp = E_spectrum_comp / (ad.Nx1 * ad.Nx2 * ad.Nx3)
         E_spectrum_sol = E_spectrum_sol / (ad.Nx1 * ad.Nx2 * ad.Nx3)
         
-        # E_spectrum_comp/sol are already total power per bin; sum bins directly
-        # (excluding the DC/k=0 bin, which has no meaningful comp/sol split).
-        total_comp = xp.sum(E_spectrum_comp[1:])
-        total_sol = xp.sum(E_spectrum_sol[1:])
+        # E_spectrum_comp/sol are already total power per bin; sum bins directly.
+        # The k=0 (mean) mode has no compressive part and is all in the
+        # solenoidal spectrum; remove it since the real-space side is mean-subtracted.
+        dc_total = _dc_power(velx) + _dc_power(vely) + _dc_power(velz)
+        total_comp = xp.sum(E_spectrum_comp)
+        total_sol = xp.sum(E_spectrum_sol) - dc_total
         total_helmholtz = total_comp + total_sol
         
         # Compare with individual component spectra from get_spectrum
@@ -446,8 +457,8 @@ class ParsevalVerification:
             E_spectrum = E_spectrum / (ad.Nx1 * ad.Nx2 * ad.Nx3)
             
             # E_spectrum is already total power per bin; sum bins directly
-            # (excluding the DC/k=0 bin, since the real-space side is mean-subtracted).
-            total_components += xp.sum(E_spectrum[1:])
+            # minus the k=0 power, since the real-space side is mean-subtracted.
+            total_components += xp.sum(E_spectrum) - _dc_power({'x': velx, 'y': vely, 'z': velz}[comp])
         
         # Calculate relative errors for different consistency checks
         # 1. Helmholtz decomposition: sol + comp should equal sum of components

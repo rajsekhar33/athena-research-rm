@@ -61,8 +61,11 @@ def config_data_functions(self):
         global_mbl = mbl if mbl is not None else 0
         global_mbh = mbh if mbh is not None else len(self.mb_geometry)
         
-        # Handle MPI distribution: only compute for locally-owned blocks
-        if (mbl is not None or mbh is not None) and not self.has_full_data:
+        # Handle MPI distribution: only compute for locally-owned blocks.
+        # A no-range (full-domain) request also means "this rank's blocks",
+        # because that is all raw data holds; building coordinates for every
+        # block would broadcast against rank-local fields.
+        if not self.has_full_data:
             # Compute intersection of requested range with locally-owned range
             actual_mbl = max(global_mbl, self.local_mb_start)
             actual_mbh = min(global_mbh, self.local_mb_end)
@@ -113,7 +116,8 @@ def config_data_functions(self):
         global_mbh = mbh if mbh is not None else len(self.mb_geometry)
         
         # Handle MPI distribution: only compute for locally-owned blocks
-        if (mbl is not None or mbh is not None) and not self.has_full_data:
+        # (a no-range request means this rank's blocks, as for coordinates).
+        if not self.has_full_data:
             # Compute intersection of requested range with locally-owned range
             actual_mbl = max(global_mbl, self.local_mb_start)
             actual_mbh = min(global_mbh, self.local_mb_end)
@@ -222,7 +226,7 @@ def config_data_functions(self):
     
     # Solar-centric coordinates (for galactic simulations)
     self.data_func['x_sol'] = lambda self, mbl=None, mbh=None: \
-        get_data(self, 'x', mbl, mbh) - 8.0 * self.units.kpc_cgs / self.units.lunit
+        get_data(self, 'x', mbl, mbh) - 8.0 * self.units.kpc_cgs / self.units.length_cgs
     
     self.data_func['r_sol'] = lambda self, mbl=None, mbh=None: \
         xp.sqrt(self.data_func['x_sol'](self, mbl, mbh)**2 + \
@@ -298,7 +302,7 @@ def config_data_functions(self):
     self.data_func['vphi'] = lambda self, mbl=None, mbh=None: \
         (get_data(self, 'x', mbl, mbh) * get_data(self, 'vely', mbl, mbh) - \
          get_data(self, 'y', mbl, mbh) * get_data(self, 'velx', mbl, mbh)) / \
-         self.data_func['r'](self, mbl, mbh)
+         self.data_func['R'](self, mbl, mbh)
     
     self.data_func['vrot'] = lambda self, mbl=None, mbh=None: \
         xp.sqrt(self.data_func['vtot2'](self, mbl, mbh) - \
@@ -627,26 +631,24 @@ def config_data_functions(self):
         except Exception:
             _curl_local = None
 
-        # If not MHD or curl unavailable, return zeros of appropriate shape
-        if (not getattr(self, 'is_mhd', False)) or (_curl_local is None):
+        # Hydro runs carry no field, so the current is identically zero.
+        if not getattr(self, 'is_mhd', False):
             shape = get_data(self, 'dens', mbl, mbh).shape
             return xp.zeros(shape), xp.zeros(shape), xp.zeros(shape)
+        if _curl_local is None:
+            raise ImportError("current density needs operations.grad_div_curl, "
+                              "which could not be imported")
 
         # If full-domain and already cached, return cached arrays
         if mbl is None and mbh is None and 'curx' in self.data_raw:
             return xp.asarray(self.data_raw['curx']), xp.asarray(self.data_raw['cury']), xp.asarray(self.data_raw['curz'])
 
-        # Compute curl via grad_div_curl implementation
-        try:
-            curl_comp = _curl_local(self, 'bcc1', 'bcc2', 'bcc3', mbl=mbl, mbh=mbh)
-            curx = self.units.speed_of_light * curl_comp[0]
-            cury = self.units.speed_of_light * curl_comp[1]
-            curz = self.units.speed_of_light * curl_comp[2]
-        except Exception:
-            shape = get_data(self, 'dens', mbl, mbh).shape
-            curx = xp.zeros(shape)
-            cury = xp.zeros(shape)
-            curz = xp.zeros(shape)
+        # Compute curl via grad_div_curl implementation. Failures propagate:
+        # an all-zero current would be indistinguishable from a real result.
+        curl_comp = _curl_local(self, 'bcc1', 'bcc2', 'bcc3', mbl=mbl, mbh=mbh)
+        curx = self.units.speed_of_light * curl_comp[0]
+        cury = self.units.speed_of_light * curl_comp[1]
+        curz = self.units.speed_of_light * curl_comp[2]
 
         # Cache full-domain results to avoid recomputing
         if mbl is None and mbh is None:
@@ -797,13 +799,17 @@ def get_data(self, var, mbl=None, mbh=None, **kwargs):
     # First check raw data (but skip eint if it doesn't exist)
     # Note: Coordinates are now computed on-demand via data_func, not stored in coord
     # Support caching of full-domain raw arrays as well as per-rank local-range caches
+    # Derived-field caches (cache_data_funcs=True) hold default-argument
+    # results only, so any kwargs bypass both lookup and store.
+    cache_derived = getattr(self, 'cache_data_funcs', False) and not kwargs
+    cached_derived = getattr(self, '_cached_derived_vars', ())
     local_cache_key = f"{var}_local"
-    if (is_meshblock_access and (local_cache_key in self.data_raw)
+    if (is_meshblock_access and not kwargs and (local_cache_key in self.data_raw)
             and (global_mbl == self.local_mb_start and global_mbh == self.local_mb_end)):
         # Use cached per-rank local-range array
         return xp.asarray(self.data_raw[local_cache_key])
 
-    if var in self.data_raw.keys():
+    if var in self.data_raw.keys() and not (kwargs and var in cached_derived):
         if is_meshblock_access:
             # Meshblock-specific data - use local indices
             arr = self.data_raw[var][local_mbl:local_mbh]
@@ -822,7 +828,7 @@ def get_data(self, var, mbl=None, mbh=None, **kwargs):
             # If the requested meshblock range equals the locally-stored range
             # we can cache the result under a per-rank key to avoid recomputing
             try:
-                if (getattr(self, 'cache_data_funcs', False)
+                if (cache_derived
                         and (global_mbl == self.local_mb_start)
                         and (global_mbh == self.local_mb_end)):
                     self.data_raw[f"{var}_local"] = xp.asarray(result)
@@ -842,9 +848,12 @@ def get_data(self, var, mbl=None, mbh=None, **kwargs):
                     raise
 
             # Cache full-domain derived variables in data_raw when enabled
-            if getattr(self, 'cache_data_funcs', False):
+            if cache_derived:
                 try:
                     self.data_raw[var] = xp.asarray(result)
+                    if not hasattr(self, '_cached_derived_vars'):
+                        self._cached_derived_vars = set()
+                    self._cached_derived_vars.add(var)
                 except Exception:
                     # If caching fails, ignore and continue returning the result
                     pass
@@ -981,19 +990,29 @@ def get_data(self, var, mbl=None, mbh=None, **kwargs):
             elif var in ['nprs', 'nprs_hot', 'nprs_range']:
                 mb_var = 'pres'
                 
+            # Weights must be a variable name, not a pre-sliced array: the
+            # profile function iterates the full local domain in its own
+            # batches and loads the weights per batch (see nvelx below).
+            # It cannot forward threshold kwargs, and its result is cached
+            # by varsuf, so thresholds are rejected rather than ignored.
             if var in ['nrho_hot', 'nprs_hot']:
-                weight_data = get_data(self, 'Thotbool', mbl, mbh, **kwargs) * get_data(self, 'vol', mbl, mbh)
+                weight_name = 'Thotbool_vol'
                 varsuf = '_vw_hot'
             elif var in ['nrho_range', 'nprs_range']:
-                weight_data = get_data(self, 'Trangebool', mbl, mbh, **kwargs) * get_data(self, 'vol', mbl, mbh)
+                weight_name = 'Trangebool_vol'
                 varsuf = '_vw_range'
             else:
-                weight_data = get_data(self, 'vol', mbl, mbh)
+                weight_name = 'vol'
                 varsuf = ''
+            if kwargs:
+                raise ValueError(
+                    f"{var!r} does not accept {sorted(kwargs)}: the cached "
+                    f"vertical profile is weighted by {weight_name!r} with its "
+                    f"default thresholds")
                 
             bins = self.Nx3
             vert=self.vertical_profile_func(self, varl=[mb_var], bins=bins,
-                                   weights=weight_data, varsuf=varsuf, redo=False)
+                                   weights=weight_name, varsuf=varsuf, redo=False)
             z_prof = xp.asarray(vert[mb_var+varsuf]['z'])
             var_z_prof = xp.asarray(vert[mb_var+varsuf]['profile'])
             var_z_loc = xp.digitize(get_data(self, 'z', mbl, mbh), (z_prof[1:]+z_prof[:-1])*0.5)

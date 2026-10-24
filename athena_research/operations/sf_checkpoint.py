@@ -58,7 +58,21 @@ def pair_work(n,batch,cursor=None):
                     yield a,b,i,j,following
 
 
-def _signature(ad,source,name,variables,weights,npairs,nbins,order,log_bins,batch,minimum,metadata,product_keys):
+CODE_HASH_KEYS=('kernel_source_sha256','engine_sha256')
+
+
+def code_changed_only(saved_signature_json,signature):
+    """True when a saved state differs from the current signature only in code
+    hashes. The sampling tag (SF_SAMPLER_VERSION) changes whenever the
+    sampling numerics change, so such a state can be continued."""
+    saved=json.loads(saved_signature_json)
+    current=json.loads(json.dumps(signature,sort_keys=True))
+    strip=lambda sig:{k:v for k,v in sig.items() if k not in CODE_HASH_KEYS}
+    return saved!=current and strip(saved)==strip(current)
+
+
+def _signature(ad,source,name,variables,weights,npairs,nbins,order,log_bins,batch,minimum,metadata,product_keys,
+               delta_edges=None):
     geom=np.asarray(ad.mb_geometry,dtype=np.float64)
     file_info={}
     if source is not None:
@@ -74,14 +88,17 @@ def _signature(ad,source,name,variables,weights,npairs,nbins,order,log_bins,batc
         header_sha256=hashlib.sha256(json.dumps(ad._header,sort_keys=True,default=str).encode()).hexdigest(),
         kernel_source_sha256=hashlib.sha256(Path(legacy.__file__).read_bytes()).hexdigest(),
         engine_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        sampling='legacy_block_pair_seed_v1')
+        sampling=legacy.SF_SAMPLER_VERSION,
+        delta_edges=None if delta_edges is None else [float(e) for e in np.asarray(delta_edges).ravel()])
 
 
-def _validate_state(state,signature,shape,total):
+def _validate_state(state,signature,shape,total,pdf_shape=None):
     if state.get('signature_json')!=json.dumps(signature,sort_keys=True):
         raise ValueError('SF checkpoint source/settings/backend/algorithm mismatch; refusing resume')
     expected={'sf_sums':shape,'weight_sums':(shape[0],shape[-1]),
               'bin_counts':(shape[0],shape[-1]),'completed_bitmap':((total+7)//8,)}
+    if pdf_shape is not None:
+        expected['delta_pdf']=pdf_shape
     for name,dims in expected.items():
         value=np.asarray(state.get(name))
         if value.shape!=dims or not np.all(np.isfinite(value)):
@@ -90,7 +107,8 @@ def _validate_state(state,signature,shape,total):
         raise ValueError('invalid SF checkpoint status')
     if np.asarray(state['completed_bitmap']).dtype!=np.uint8 or np.asarray(state['cursor']).shape!=(4,):
         raise ValueError('invalid SF bitmap/cursor representation')
-    if np.any(state['bin_counts']<0) or np.any(state['weight_sums']<0) or np.any(state['sf_sums']<0):
+    if (np.any(state['bin_counts']<0) or np.any(state['weight_sums']<0) or np.any(state['sf_sums']<0)
+            or (pdf_shape is not None and np.any(np.asarray(state['delta_pdf'])<0))):
         raise ValueError('negative checkpoint counts/weights')
     if np.any(np.asarray(state['bin_counts'])!=np.floor(state['bin_counts'])):
         raise ValueError('fractional checkpoint pair counts')
@@ -107,13 +125,19 @@ def _validate_state(state,signature,shape,total):
 def checkpointed_sf(ad,name,variables,*,weights,npairs=1e10,nbins=100,max_order=3,
                      log_bins=True,simultaneous_blocks=None,nsamples_block_min=1000,
                      source=None,selection_metadata=None,checkpoint,checkpoint_seconds=60.,
-                     should_stop=lambda:False,stop_after_pairs=None,redo=False,product_keys=None):
+                     should_stop=lambda:False,stop_after_pairs=None,redo=False,product_keys=None,
+                     delta_edges=None):
     """Attach/save name state; return True only after all final SF keys publish.
 
     `checkpoint(ad, label)` must atomically persist the entire original cache
     or raise. A raised callback never advances any durable file. The caller
     must serialize production cache writers. stop_after_pairs is a validation
     interruption, not a scientific sampling limit.
+
+    A saved state from another sampler version is discarded (its sums cannot
+    be continued); one that differs only in code hashes is continued.
+    delta_edges adds the per-bin increment histogram (see get_sf_mb), saved
+    with the other accumulators and published as 'delta_pdf'.
     """
     if getattr(ad,'has_full_data',True) is False:
         raise ValueError('resumable SF currently requires serial/full-data ownership')
@@ -128,10 +152,15 @@ def checkpointed_sf(ad,name,variables,*,weights,npairs=1e10,nbins=100,max_order=
     if len(keys)!=len(variables) or not all(isinstance(k,str) and k and '/' not in k and '\0' not in k for k in keys) or len(set(keys))!=len(keys):
         raise ValueError('one unique nonempty product key per variable required')
     ad.sf=dict(getattr(ad,'sf',{}) or {})
-    if not redo and all(k in ad.sf for k in keys):
+    if not redo and all(legacy.sf_entry_is_current(ad.sf.get(k)) for k in keys):
         return True
     states=dict(getattr(ad,'sf_checkpoints',{}) or {})
     previous=None if redo else states.get(name)
+    if previous is not None and json.loads(previous['signature_json']).get('sampling')!=legacy.SF_SAMPLER_VERSION:
+        # Sums from another sampler cannot be continued by this one.
+        previous=None
+    if delta_edges is not None:
+        delta_edges=legacy._validated_delta_edges(delta_edges)
     n=int(ad.n_mbs);total=n*(n+1)//2;points=int(ad.nx1*ad.nx2*ad.nx3)
     if n<1:
         raise ValueError('SF needs at least one meshblock')
@@ -146,8 +175,12 @@ def checkpointed_sf(ad,name,variables,*,weights,npairs=1e10,nbins=100,max_order=
     if batch<1:
         raise ValueError('invalid batch size')
     signature=_signature(ad,source,name,variables,weights,npairs,nbins,max_order,
-                         log_bins,batch,nsamples_block_min,selection_metadata,keys)
+                         log_bins,batch,nsamples_block_min,selection_metadata,keys,delta_edges)
+    if previous is not None and code_changed_only(previous['signature_json'],signature):
+        print(f'SF {name}: checkpoint written by an earlier revision of the same sampler; continuing',flush=True)
+        previous={**previous,'signature_json':json.dumps(signature,sort_keys=True)}
     shape=(len(weights),len(variables),max_order,nbins)
+    pdf_shape=None if delta_edges is None else (len(weights),len(variables),nbins,len(delta_edges)+1)
     L=np.array([ad.x1max-ad.x1min,ad.x2max-ad.x2min,ad.x3max-ad.x3min],float)
     geom=np.asarray(ad.mb_geometry);first=geom[0]
     cell=(first[1::2]-first[::2])/np.array([ad.nx1,ad.nx2,ad.nx3])
@@ -155,8 +188,7 @@ def checkpointed_sf(ad,name,variables,*,weights,npairs=1e10,nbins=100,max_order=
     if not positive.size:
         raise ValueError('invalid SF cell geometry')
     rmin=float(positive.min());rmax=float(np.sqrt(.25*np.sum(L**2)))
-    edges=xp.logspace(xp.log10(rmin),xp.log10(rmax),nbins+1) if log_bins else xp.linspace(0,rmax,nbins+1)
-    radial=xp.sqrt(edges[1:]*edges[:-1]) if log_bins else .5*(edges[1:]+edges[:-1])
+    edges,radial=legacy.radial_bin_edges(rmin,rmax,nbins,log_bins)
     periodic=[('periodic' in str(ad._header['mesh'][f'ix{i}_bc'])) for i in (1,2,3)]
     if previous is None:
         state=dict(signature_json=json.dumps(signature,sort_keys=True),status='partial',
@@ -164,46 +196,66 @@ def checkpointed_sf(ad,name,variables,*,weights,npairs=1e10,nbins=100,max_order=
             bin_counts=np.zeros((len(weights),nbins)),completed_bitmap=np.zeros((total+7)//8,dtype=np.uint8),
             completed_pairs=0,cursor=np.array([0,0,0,0],dtype=np.int64),generation=0,
             elapsed_seconds=0.,r=asnumpy(radial),edges=asnumpy(edges))
+        if pdf_shape is not None:
+            state['delta_pdf']=np.zeros(pdf_shape)
     else:
         state={**previous}
-        _validate_state(state,signature,shape,total)
+        _validate_state(state,signature,shape,total,pdf_shape)
         if not np.array_equal(state['edges'],asnumpy(edges)):
             raise ValueError('SF radial edges differ from checkpoint')
     # Copies isolate active GPU/CPU accumulators from the last checkpoint.
     sums=xp.array(state['sf_sums'],copy=True);counts=xp.array(state['bin_counts'],copy=True)
     weight_sums=xp.array(state['weight_sums'],copy=True)
+    delta_pdf=None if pdf_shape is None else xp.array(state['delta_pdf'],copy=True)
     bitmap=np.array(state['completed_bitmap'],dtype=np.uint8,copy=True)
     centers=.5*(geom[:,::2]+geom[:,1::2]);samples=min(int(np.sqrt(npairs)/n),points)
     cache={};resident=None;processed_this_call=0;started=last_save=time.monotonic()
     prior_elapsed=float(state['elapsed_seconds'])
 
+    # Live progress stays in locals; `state` is only ever the last snapshot
+    # handed to ad.sf_checkpoints, so an exception mid-loop leaves a
+    # self-consistent state behind for an in-process retry.
+    completed_pairs=int(state['completed_pairs']);cursor=np.array(state['cursor'],dtype=np.int64,copy=True)
+
     def save(complete=False):
-        nonlocal last_save
+        nonlocal last_save,state
         if cupy_enabled:
             xp.cuda.Stream.null.synchronize()
-        if source is not None and _signature(ad,source,name,variables,weights,npairs,nbins,
-                max_order,log_bins,batch,nsamples_block_min,selection_metadata,keys)!=signature:
-            raise ValueError('source/config changed during SF; refusing checkpoint')
-        state.update(sf_sums=np.array(asnumpy(sums),copy=True),
+        if source is not None:
+            # Code files may be edited while a long run is in flight; only the
+            # data, settings and sampler must stay fixed.
+            current=_signature(ad,source,name,variables,weights,npairs,nbins,max_order,log_bins,
+                               batch,nsamples_block_min,selection_metadata,keys,delta_edges)
+            if any(current[k]!=signature[k] for k in current if k not in CODE_HASH_KEYS):
+                raise ValueError('source/config changed during SF; refusing checkpoint')
+        snapshot=dict(state)
+        snapshot.update(completed_pairs=completed_pairs,cursor=cursor.copy(),
+            sf_sums=np.array(asnumpy(sums),copy=True),
             weight_sums=np.array(asnumpy(weight_sums),copy=True),bin_counts=np.array(asnumpy(counts),copy=True),
             completed_bitmap=bitmap.copy(),generation=int(state['generation'])+1,
             elapsed_seconds=prior_elapsed+time.monotonic()-started,status='complete' if complete else 'partial')
-        _validate_state(state,signature,shape,total)
-        states[name]=state;ad.sf_checkpoints=states
+        if delta_pdf is not None:
+            snapshot['delta_pdf']=np.array(asnumpy(delta_pdf),copy=True)
+        _validate_state(snapshot,signature,shape,total,pdf_shape)
+        state=snapshot;states[name]=state;ad.sf_checkpoints=states
         if complete:
             for i,key in enumerate(keys):
-                if redo or key not in ad.sf:
+                if redo or not legacy.sf_entry_is_current(ad.sf.get(key)):
                     ad.sf[key]=dict(r=np.array(state['r'],copy=True),
                         sf=np.asarray(state['sf_sums'][:,i]).squeeze().copy(),
                         weight_sum_bin=np.asarray(state['weight_sums']).squeeze().copy(),
-                        num_bin_points=np.asarray(state['bin_counts'],dtype=np.int64).squeeze().copy())
+                        num_bin_points=np.asarray(state['bin_counts'],dtype=np.int64).squeeze().copy(),
+                        sampler=legacy.SF_SAMPLER_VERSION)
+                    if delta_pdf is not None:
+                        ad.sf[key]['delta_pdf']=np.asarray(state['delta_pdf'][:,i]).squeeze().copy()
+                        ad.sf[key]['delta_edges']=asnumpy(delta_edges).copy()
         checkpoint(ad,f'SF {name} '+('complete' if complete else 'partial'))
         last_save=time.monotonic()
         print(f'SF {name}: durable pairs {state["completed_pairs"]}/{total}; '
               f'accepted={float(state["bin_counts"].sum()):.0f}; generation={state["generation"]}',flush=True)
 
     try:
-        for a,b,i,j,following in pair_work(n,batch,state['cursor']):
+        for a,b,i,j,following in pair_work(n,batch,cursor):
             if should_stop() or (stop_after_pairs is not None and processed_this_call>=stop_after_pairs):
                 save();return False
             ordinal=pair_ordinal(i,j,n);byte,bit=divmod(ordinal,8)
@@ -226,13 +278,14 @@ def checkpointed_sf(ad,name,variables,*,weights,npairs=1e10,nbins=100,max_order=
                 save();return False
             legacy._process_block_pair(ad,i,j,cache,centers,weights,variables,
                 sums,counts,weight_sums,rmax,rmin,*L,edges,nbins,max_order,samples,points,
-                nsamples_block_min,*periodic,sparse_data=False,use_mpi=False)
+                nsamples_block_min,*periodic,sparse_data=False,use_mpi=False,
+                delta_edges=delta_edges,delta_pdf=delta_pdf)
             bitmap[byte]|=np.uint8(1<<bit)
-            state['completed_pairs']=int(state['completed_pairs'])+1
-            state['cursor']=np.asarray(following,dtype=np.int64);processed_this_call+=1
-            if state['completed_pairs']<total and time.monotonic()-last_save>=checkpoint_seconds:
+            completed_pairs+=1
+            cursor=np.asarray(following,dtype=np.int64);processed_this_call+=1
+            if completed_pairs<total and time.monotonic()-last_save>=checkpoint_seconds:
                 save()
-        if int(state['completed_pairs'])!=total:
+        if completed_pairs!=total:
             raise ValueError('SF traversal ended without complete pair coverage')
         save(complete=True);return True
     finally:

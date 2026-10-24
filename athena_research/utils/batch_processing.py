@@ -91,10 +91,12 @@ def process_data_in_batches(mb_data, var_names, n_mbs, blocks_per_batch, process
             results = batch_results
         else:
             for key, value in batch_results.items():
-                if isinstance(value, np.ndarray) or (cupy_enabled and isinstance(value, xp.ndarray)):
+                is_array = isinstance(value, np.ndarray) or (cupy_enabled and isinstance(value, xp.ndarray))
+                if is_array and value.ndim > 0:
                     results[key] = xp.concatenate([results[key], value])
-                elif isinstance(value, (int, float)):
-                    results[key] += value
+                elif is_array or isinstance(value, (int, float, complex, np.number)):
+                    # Scalars of any kind (incl. NumPy and 0-d arrays) accumulate.
+                    results[key] = results[key] + value
                 else:
                     results[key].extend(value)
     

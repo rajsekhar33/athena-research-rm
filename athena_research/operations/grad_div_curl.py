@@ -1,6 +1,7 @@
 """
 Gradient, divergence, and curl data operations for Athenak simulation data.
 """
+import numpy as np
 from ..core.base import xp, asnumpy, cupy_enabled
 from ..core.utils import axis_index
 from ..utils.batch_processing import determine_blocks_per_batch
@@ -120,7 +121,7 @@ def gradient(ad, f, axis=None, edge_order=1, auto_select=True, handle_boundaries
                             handle_boundaries=handle_boundaries)
     else:
         # Original whole-domain method
-        return _gradient_original(ad, f, axis, edge_order, **kwargs)
+        return _gradient_original(ad, f, axis, edge_order, handle_boundaries=handle_boundaries, **kwargs)
 
 def divergence(ad, fx, fy, fz, auto_select=True, edge_order=1, handle_boundaries=True, simultaneous_blocks=None, **kwargs):
     """
@@ -218,15 +219,15 @@ def divergence(ad, fx, fy, fz, auto_select=True, edge_order=1, handle_boundaries
     
     if use_mb_method:
         # Memory-efficient meshblock method
+        # In MPI mode, use this rank's global meshblock range
+        if hasattr(ad, 'has_full_data') and not ad.has_full_data:
+            mb_start = ad.local_mb_start  # Global index of first block this rank owns
+            mb_end = ad.local_mb_end      # Global index one past last block this rank owns
+        else:
+            mb_start = 0
+            mb_end = ad.n_mbs
         if use_vector_method:
             # Use the optimized vector field divergence implementation
-            # In MPI mode, use this rank's global meshblock range
-            if hasattr(ad, 'has_full_data') and not ad.has_full_data:
-                mb_start = ad.local_mb_start  # Global index of first block this rank owns
-                mb_end = ad.local_mb_end      # Global index one past last block this rank owns
-            else:
-                mb_start = 0
-                mb_end = ad.n_mbs
             return _divergence_mb(ad, vector_prefix, mb_start, mb_end, 
                               edge_order=edge_order, handle_boundaries=handle_boundaries)
         else:
@@ -326,245 +327,174 @@ def curl(ad, fx, fy, fz, auto_select=True, edge_order=1, handle_boundaries=True,
         # Original whole-domain method
         return _curl_original(ad, fx, fy, fz, **kwargs)
 
-def _gradient_original(ad, f, axis=None, edge_order=1, handle_boundaries=True, **kwargs):
+_AXIS_SPACING = {'x': 'dx_mb', 'y': 'dy_mb', 'z': 'dz_mb'}
+_AXIS_GEOMETRY = {'x': (0, 'nx1'), 'y': (2, 'nx2'), 'z': (4, 'nx3')}
+
+
+def _global_cell_width(ad, ax):
+    """Cell width of every global meshblock along ``ax``, indexed by global
+    block id. Taken from mb_geometry, which every rank holds in full, rather
+    than ad.data('dx_mb'), whose no-range result is rank-local under MPI."""
+    col, n_attr = _AXIS_GEOMETRY[ax]
+    geom = np.asarray(ad.mb_geometry, dtype=np.float64)
+    return (geom[:, col + 1] - geom[:, col]) / float(getattr(ad, n_attr))
+
+
+def _first_global_block(ad, mbl=None):
     """
-    Original gradient implementation working on the whole domain at once.
-    
+    Global meshblock index of the first block in ``ad.data(var, mbl, mbh)``.
+
+    Under MPI the returned array is the intersection of the requested range
+    with this rank's blocks, and an unbounded request returns only the local
+    blocks, so local block ``b`` is global block ``offset + b``.
+    """
+    distributed = hasattr(ad, 'has_full_data') and not ad.has_full_data
+    if mbl is None:
+        return ad.local_mb_start if distributed else 0
+    return max(mbl, ad.local_mb_start) if distributed else mbl
+
+
+def _owns_block(ad, mb):
+    if hasattr(ad, 'owns_meshblock'):
+        return ad.owns_meshblock(mb)
+    return getattr(ad, 'has_full_data', True)
+
+
+def _face_neighbour(ad, f, g0, gidx, direction, var, data_kwargs):
+    """
+    Data of the same-level neighbour of global block ``gidx`` across a face,
+    or None when there is none usable. Neighbours at a different refinement
+    level have a different cell size and are not one cell away, so the caller
+    keeps the one-sided in-block stencil there.
+    """
+    neighbours = find_neighbour_blocks(ad, gidx, direction)
+    if not neighbours:
+        return None
+    nbr = neighbours[0]
+    if ad.mb_logical[nbr][3] != ad.mb_logical[gidx][3]:
+        return None
+    if g0 <= nbr < g0 + f.shape[0]:
+        return f[nbr - g0]
+    if var is None or not _owns_block(ad, nbr):
+        return None
+    nbr_data = ad.data(var, nbr, nbr + 1, **data_kwargs)
+    return nbr_data[0] if len(nbr_data) > 0 else None
+
+
+def _block_gradient(ad, f, g0, axis, spacing, edge_order=1, handle_boundaries=True,
+                    var=None, data_kwargs=None):
+    """
+    Per-block derivative of ``f`` (shape (n_blocks, nz, ny, nx)) along ``axis``.
+
+    ``f[b]`` is global meshblock ``g0 + b`` and ``spacing`` is the global
+    per-block cell width along ``axis``. Block faces use a centred difference
+    with the same-level neighbour when it is in ``f`` or, given ``var``,
+    loadable on this rank; otherwise the one-sided in-block stencil is kept.
+    A block that is one cell thick along ``axis`` (2D data) has no in-block
+    stencil: its derivative is the centred difference across both
+    neighbours, or zero without them.
+    """
+    data_kwargs = data_kwargs or {}
+    arr_axis = 2 - 'xyz'.index(axis)
+    n_ax = f.shape[1 + arr_axis]
+
+    def face(idx):
+        return tuple(idx if a == arr_axis else slice(None) for a in range(3))
+
+    result = xp.zeros_like(f)
+    for b in range(f.shape[0]):
+        gidx = g0 + b
+        block = f[b]
+        h = float(spacing[gidx])
+        if n_ax >= 2:
+            grad = xp.gradient(block, h, axis=arr_axis, edge_order=min(edge_order, n_ax - 1))
+        else:
+            grad = xp.zeros_like(block)
+
+        if handle_boundaries:
+            plus = _face_neighbour(ad, f, g0, gidx, axis + '+', var, data_kwargs)
+            minus = _face_neighbour(ad, f, g0, gidx, axis + '-', var, data_kwargs)
+            if n_ax >= 2:
+                if plus is not None:
+                    grad[face(-1)] = (plus[face(0)] - block[face(-2)]) / (2 * h)
+                if minus is not None:
+                    grad[face(0)] = (block[face(1)] - minus[face(-1)]) / (2 * h)
+            elif plus is not None and minus is not None:
+                grad[face(0)] = (plus[face(0)] - minus[face(-1)]) / (2 * h)
+
+        result[b] = grad
+    return result
+
+
+def _gradient_original(ad, f, axis=None, edge_order=1, handle_boundaries=True,
+                       mbl=None, mbh=None, var_name=None, **kwargs):
+    """
+    Original gradient implementation working on the whole domain (or the
+    meshblock range ``mbl:mbh``) at once.
+
     Parameters
     ----------
     ad : AthenaData
         The Athena data object containing simulation data
     f : array-like or str
-        Field to compute the gradient of
+        Field to compute the gradient of. An array must be what
+        ``ad.data(var, mbl, mbh)`` returns for the same ``mbl``/``mbh``.
     axis : str or None, optional
         Direction for the gradient ('x', 'y', 'z'). If None, returns all components.
     edge_order : int, optional
         Order of accuracy for edge points. Default is 1.
     handle_boundaries : bool, optional
         Whether to handle boundaries between mesh blocks. Default is True.
+    mbl, mbh : int, optional
+        Global meshblock range of ``f``. None means the full (rank-local) domain.
+    var_name : str, optional
+        Variable name of an array ``f``; lets block faces at the edge of the
+        range use neighbour data outside it.
     **kwargs : dict, optional
-        Additional arguments passed to ad.data
-        
+        Additional arguments passed to ad.data. ``dtype='uniform'`` uses the
+        first block's cell size for every block.
+
     Returns
     -------
     array-like or list of array-like
         Gradient of the field
     """
-    # Convert variable name to data array if needed
+    uniform = kwargs.pop('dtype', None) == 'uniform'
     if isinstance(f, str):
-        f = ad.data(f, **kwargs)
-    
-    # Convert axis string to numeric index if provided
-    if axis is not None:
-        if axis == 'x':
-            axis_idx = 0
-        elif axis == 'y':
-            axis_idx = 1
-        elif axis == 'z':
-            axis_idx = 2
-        else:
-            raise ValueError(f"Invalid axis: {axis}. Must be 'x', 'y', 'z', or None.")
-    else:
-        axis_idx = None
-    
-    # Get the mesh block cell spacing
-    # Note: We keep the order consistent with Athena++ ordering (x,y,z)
-    dx_mb = ad.data('dx_mb')
-    dy_mb = ad.data('dy_mb')
-    dz_mb = ad.data('dz_mb')
-    
-    # Check if uniform grid is requested (rarely used, but included for completeness)
-    if kwargs.get('dtype') == 'uniform':
-        # For uniform grid, use the same spacing for all blocks
-        # Assuming cell_length returns [dx, dy, dz]
-        dx = [dx_mb[0], dy_mb[0], dz_mb[0]]
-        
-        if axis_idx is None:
-            # Calculate gradient in all directions at once
-            return xp.asarray(xp.gradient(f, dx[2], dx[1], dx[0], edge_order=edge_order))
-        else:
-            # Calculate gradient in specified direction only
-            # Map from axis index to appropriate spacing
-            if axis_idx == 0:  # x direction
-                spacing = dx[0]
-            elif axis_idx == 1:  # y direction
-                spacing = dx[1]
-            else:  # z direction
-                spacing = dx[2]
-            return xp.gradient(f, spacing, axis=axis_idx, edge_order=edge_order)
-    
-    # For non-uniform grid (the usual case), handle each mesh block separately
-    if axis_idx is None:
-        # Calculate gradients in all directions
-        # Initialize arrays for gradient components
-        grad_x = xp.zeros_like(f)
-        grad_y = xp.zeros_like(f)
-        grad_z = xp.zeros_like(f)
-        
-        # Process each mesh block
-        for i in range(ad.n_mbs):
-            if i < f.shape[0]:  # Make sure block index is valid
-                # Get spacing for this block
-                block_dx = dx_mb[i]
-                block_dy = dy_mb[i]
-                block_dz = dz_mb[i]
-                block_data = f[i]
-                
-                # Calculate gradient components for this block
-                # Note: xp.gradient returns [grad_z, grad_y, grad_x] due to axis order
-                grad_components = xp.gradient(block_data, block_dz, block_dy, block_dx, edge_order=edge_order)
-                grad_z[i] = grad_components[0]
-                grad_y[i] = grad_components[1]
-                grad_x[i] = grad_components[2]
-        
-        # Handle block boundaries if requested
-        if handle_boundaries:
-            for i in range(ad.n_mbs):
-                if i >= f.shape[0]:  # Skip if block index is invalid
-                    continue
-                
-                # X boundaries
-                x_plus_neighbors = find_neighbour_blocks(ad, i, 'x+')
-                x_minus_neighbors = find_neighbour_blocks(ad, i, 'x-')
-                
-                # Right boundary (x+)
-                if x_plus_neighbors:
-                    neighbor_idx = x_plus_neighbors[0]  # Use first neighbor
-                    if neighbor_idx < f.shape[0]:  # Ensure valid index
-                        grad_x[i, :, :, -1] = (f[neighbor_idx, :, :, 0] - f[i, :, :, -2]) / (2 * dx_mb[i])
-                
-                # Left boundary (x-)
-                if x_minus_neighbors:
-                    neighbor_idx = x_minus_neighbors[0]  # Use first neighbor
-                    if neighbor_idx < f.shape[0]:  # Ensure valid index
-                        grad_x[i, :, :, 0] = (f[i, :, :, 1] - f[neighbor_idx, :, :, -1]) / (2 * dx_mb[i])
-                
-                # Y boundaries
-                y_plus_neighbors = find_neighbour_blocks(ad, i, 'y+')
-                y_minus_neighbors = find_neighbour_blocks(ad, i, 'y-')
-                
-                # Top boundary (y+)
-                if y_plus_neighbors:
-                    neighbor_idx = y_plus_neighbors[0]  # Use first neighbor
-                    if neighbor_idx < f.shape[0]:  # Ensure valid index
-                        grad_y[i, :, -1, :] = (f[neighbor_idx, :, 0, :] - f[i, :, -2, :]) / (2 * dy_mb[i])
-                
-                # Bottom boundary (y-)
-                if y_minus_neighbors:
-                    neighbor_idx = y_minus_neighbors[0]  # Use first neighbor
-                    if neighbor_idx < f.shape[0]:  # Ensure valid index
-                        grad_y[i, :, 0, :] = (f[i, :, 1, :] - f[neighbor_idx, :, -1, :]) / (2 * dy_mb[i])
-                
-                # Z boundaries
-                z_plus_neighbors = find_neighbour_blocks(ad, i, 'z+')
-                z_minus_neighbors = find_neighbour_blocks(ad, i, 'z-')
-                
-                # Front boundary (z+)
-                if z_plus_neighbors:
-                    neighbor_idx = z_plus_neighbors[0]  # Use first neighbor
-                    if neighbor_idx < f.shape[0]:  # Ensure valid index
-                        grad_z[i, -1, :, :] = (f[neighbor_idx, 0, :, :] - f[i, -2, :, :]) / (2 * dz_mb[i])
-                
-                # Back boundary (z-)
-                if z_minus_neighbors:
-                    neighbor_idx = z_minus_neighbors[0]  # Use first neighbor
-                    if neighbor_idx < f.shape[0]:  # Ensure valid index
-                        grad_z[i, 0, :, :] = (f[i, 1, :, :] - f[neighbor_idx, -1, :, :]) / (2 * dz_mb[i])
-        
-        # Return the gradient components
-        return [grad_x, grad_y, grad_z]
-    else:
-        # Calculate gradient in specified direction only
-        result = xp.zeros_like(f)
-        
-        # Process each mesh block
-        for i in range(ad.n_mbs):
-            if i < f.shape[0]:  # Skip if block index is invalid
-                # Get block data and appropriate spacing
-                block_data = f[i]
-                
-                if axis_idx == 0:  # x direction
-                    spacing = dx_mb[i]
-                    result[i] = xp.gradient(block_data, spacing, axis=2, edge_order=edge_order)
-                    
-                    # Handle block boundaries if requested
-                    if handle_boundaries:
-                        # Right boundary (x+)
-                        x_plus_neighbors = find_neighbour_blocks(ad, i, 'x+')
-                        if x_plus_neighbors:
-                            neighbor_idx = x_plus_neighbors[0]  # Use first neighbor
-                            if neighbor_idx < f.shape[0]:  # Ensure valid index
-                                result[i, :, :, -1] = (f[neighbor_idx, :, :, 0] - f[i, :, :, -2]) / (2 * spacing)
-                        
-                        # Left boundary (x-)
-                        x_minus_neighbors = find_neighbour_blocks(ad, i, 'x-')
-                        if x_minus_neighbors:
-                            neighbor_idx = x_minus_neighbors[0]  # Use first neighbor
-                            if neighbor_idx < f.shape[0]:  # Ensure valid index
-                                result[i, :, :, 0] = (f[i, :, :, 1] - f[neighbor_idx, :, :, -1]) / (2 * spacing)
-                
-                elif axis_idx == 1:  # y direction
-                    spacing = dy_mb[i]
-                    result[i] = xp.gradient(block_data, spacing, axis=1, edge_order=edge_order)
-                    
-                    # Handle block boundaries if requested
-                    if handle_boundaries:
-                        # Top boundary (y+)
-                        y_plus_neighbors = find_neighbour_blocks(ad, i, 'y+')
-                        if y_plus_neighbors:
-                            neighbor_idx = y_plus_neighbors[0]  # Use first neighbor
-                            if neighbor_idx < f.shape[0]:  # Ensure valid index
-                                result[i, :, -1, :] = (f[neighbor_idx, :, 0, :] - f[i, :, -2, :]) / (2 * spacing)
-                        
-                        # Bottom boundary (y-)
-                        y_minus_neighbors = find_neighbour_blocks(ad, i, 'y-')
-                        if y_minus_neighbors:
-                            neighbor_idx = y_minus_neighbors[0]  # Use first neighbor
-                            if neighbor_idx < f.shape[0]:  # Ensure valid index
-                                result[i, :, 0, :] = (f[i, :, 1, :] - f[neighbor_idx, :, -1, :]) / (2 * spacing)
-                
-                else:  # z direction (axis_idx == 2)
-                    spacing = dz_mb[i]
-                    result[i] = xp.gradient(block_data, spacing, axis=0, edge_order=edge_order)
-                    
-                    # Handle block boundaries if requested
-                    if handle_boundaries:
-                        # Front boundary (z+)
-                        z_plus_neighbors = find_neighbour_blocks(ad, i, 'z+')
-                        if z_plus_neighbors:
-                            neighbor_idx = z_plus_neighbors[0]  # Use first neighbor
-                            if neighbor_idx < f.shape[0]:  # Ensure valid index
-                                result[i, -1, :, :] = (f[neighbor_idx, 0, :, :] - f[i, -2, :, :]) / (2 * spacing)
-                        
-                        # Back boundary (z-)
-                        z_minus_neighbors = find_neighbour_blocks(ad, i, 'z-')
-                        if z_minus_neighbors:
-                            neighbor_idx = z_minus_neighbors[0]  # Use first neighbor
-                            if neighbor_idx < f.shape[0]:  # Ensure valid index
-                                result[i, 0, :, :] = (f[i, 1, :, :] - f[neighbor_idx, -1, :, :]) / (2 * spacing)
-        
-        return result
+        var_name = f
+        f = ad.data(f, mbl, mbh, **kwargs)
+    f = xp.asarray(f)
 
-def _divergence_original(ad, fx, fy, fz, **kwargs):
+    if axis is not None and axis not in _AXIS_SPACING:
+        raise ValueError(f"Invalid axis: {axis}. Must be 'x', 'y', 'z', or None.")
+
+    g0 = _first_global_block(ad, mbl)
+
+    def component(ax):
+        spacing = _global_cell_width(ad, ax)
+        if uniform:
+            spacing = spacing[:1].repeat(len(spacing))
+        return _block_gradient(ad, f, g0, ax, spacing, edge_order, handle_boundaries,
+                               var=var_name, data_kwargs=kwargs)
+
+    if axis is None:
+        return [component('x'), component('y'), component('z')]
+    return component(axis)
+
+def _divergence_original(ad, fx, fy, fz, mbl=None, mbh=None, **kwargs):
     """Original divergence implementation working on the whole domain at once."""
-    # Convert variable names to data arrays if needed
-    if isinstance(fx, str):
-        fx = ad.data(fx, **kwargs)
-    if isinstance(fy, str):
-        fy = ad.data(fy, **kwargs)
-    if isinstance(fz, str):
-        fz = ad.data(fz, **kwargs)
-        
-    return _gradient_original(ad, fx, 'x', **kwargs) + _gradient_original(ad, fy, 'y', **kwargs) + _gradient_original(ad, fz, 'z', **kwargs)
+    return (_gradient_original(ad, fx, 'x', mbl=mbl, mbh=mbh, **dict(kwargs))
+            + _gradient_original(ad, fy, 'y', mbl=mbl, mbh=mbh, **dict(kwargs))
+            + _gradient_original(ad, fz, 'z', mbl=mbl, mbh=mbh, **dict(kwargs)))
 
 def _gradient_mb(ad, var, mbl, mbh, axis=None, edge_order=1, handle_boundaries=True):
     """
     Internal function: Calculate gradients of a field variable across mesh blocks.
-    
+
     Uses xp.gradient for efficiency with optional handling of block boundaries.
     Supports MPI-distributed data by determining block ownership and handling
     boundaries accordingly.
-    
+
     Parameters
     ----------
     var : str
@@ -578,7 +508,9 @@ def _gradient_mb(ad, var, mbl, mbh, axis=None, edge_order=1, handle_boundaries=T
     handle_boundaries : bool, optional
         If True (default), use neighbor blocks to calculate gradients at block boundaries.
         In MPI mode, only handles boundaries with neighbors on the same rank.
-    
+        Faces whose neighbour is at a different refinement level keep the
+        one-sided in-block difference.
+
     Returns
     -------
     ndarray or list of ndarray
@@ -591,140 +523,15 @@ def _gradient_mb(ad, var, mbl, mbh, axis=None, edge_order=1, handle_boundaries=T
         grad_y = _gradient_mb(ad, var, mbl, mbh, 'y', edge_order, handle_boundaries)
         grad_z = _gradient_mb(ad, var, mbl, mbh, 'z', edge_order, handle_boundaries)
         return [grad_x, grad_y, grad_z]
-    
-    # Check if we're in MPI mode
-    is_mpi_distributed = hasattr(ad, 'has_full_data') and not ad.has_full_data
-    
-    # Get data for the variable
-    data = ad.data(var, mbl, mbh)
-    
-    # Determine which axis we're working with
-    if axis == 'x':
-        dir_idx = 2
-        dx = ad.data('dx_mb')
-    elif axis == 'y':
-        dir_idx = 1
-        dx = ad.data('dy_mb')
-    else:  # axis == 'z'
-        dir_idx = 0
-        dx = ad.data('dz_mb')
-    
-    # Initialize result array
-    result = xp.zeros_like(data)
-    
-    # Process each block
-    for block_offset in range(mbh - mbl):
-        block_idx = mbl + block_offset
-        block_data = data[block_offset]
-        
-        # Convert global block index to local index for dx/dy/dz array access
-        # dx/dy/dz arrays are indexed by local meshblock indices
-        local_idx = block_offset
-        
-        # Calculate gradient for this block using xp.gradient
-        if axis == 'x':
-            grad = xp.gradient(block_data, dx[local_idx], axis=2, edge_order=edge_order)
-        elif axis == 'y':
-            grad = xp.gradient(block_data, dx[local_idx], axis=1, edge_order=edge_order)
-        else:  # axis == 'z'
-            grad = xp.gradient(block_data, dx[local_idx], axis=0, edge_order=edge_order)
-        
-        # Handle boundary points if requested
-        if handle_boundaries:
-            if axis == 'x':
-                # Right boundary (x+)
-                plus_neighbors = find_neighbour_blocks(ad, block_idx, 'x+')
-                if plus_neighbors:
-                    # Use first neighbor if multiple exist at different refinement levels
-                    neighbor_idx = plus_neighbors[0]
-                    # Check if this neighbor is within our processing range
-                    if mbl <= neighbor_idx < mbh:
-                        neighbor_offset = neighbor_idx - mbl
-                        neighbor_data = data[neighbor_offset]
-                        # Use central difference with neighbor's first point
-                        grad[:, :, -1] = (neighbor_data[:, :, 0] - block_data[:, :, -2]) / (2 * dx[local_idx])
-                    elif ad.owns_meshblock(neighbor_idx):
-                        # Need to fetch data for neighbor outside our range but owned by this rank
-                        neighbor_data = ad.data(var, neighbor_idx, neighbor_idx+1)
-                        if len(neighbor_data) > 0:
-                            grad[:, :, -1] = (neighbor_data[0][:, :, 0] - block_data[:, :, -2]) / (2 * dx[local_idx])
-                
-                # Left boundary (x-)
-                minus_neighbors = find_neighbour_blocks(ad, block_idx, 'x-')
-                if minus_neighbors:
-                    # Use first neighbor if multiple exist at different refinement levels
-                    neighbor_idx = minus_neighbors[0]
-                    # Check if this neighbor is within our processing range
-                    if mbl <= neighbor_idx < mbh:
-                        neighbor_offset = neighbor_idx - mbl
-                        neighbor_data = data[neighbor_offset]
-                        # Use central difference with neighbor's last point
-                        grad[:, :, 0] = (block_data[:, :, 1] - neighbor_data[:, :, -1]) / (2 * dx[local_idx])
-                    elif ad.owns_meshblock(neighbor_idx):
-                        # Need to fetch data for neighbor outside our range but owned by this rank
-                        neighbor_data = ad.data(var, neighbor_idx, neighbor_idx+1)
-                        if len(neighbor_data) > 0:
-                            grad[:, :, 0] = (block_data[:, :, 1] - neighbor_data[0][:, :, -1]) / (2 * dx[local_idx])
-            
-            elif axis == 'y':
-                # Top boundary (y+)
-                plus_neighbors = find_neighbour_blocks(ad, block_idx, 'y+')
-                if plus_neighbors:
-                    neighbor_idx = plus_neighbors[0]
-                    if mbl <= neighbor_idx < mbh:
-                        neighbor_offset = neighbor_idx - mbl
-                        neighbor_data = data[neighbor_offset]
-                        grad[:, -1, :] = (neighbor_data[:, 0, :] - block_data[:, -2, :]) / (2 * dx[local_idx])
-                    elif ad.owns_meshblock(neighbor_idx):
-                        neighbor_data = ad.data(var, neighbor_idx, neighbor_idx+1)
-                        if len(neighbor_data) > 0:
-                            grad[:, -1, :] = (neighbor_data[0][:, 0, :] - block_data[:, -2, :]) / (2 * dx[local_idx])
-                
-                # Bottom boundary (y-)
-                minus_neighbors = find_neighbour_blocks(ad, block_idx, 'y-')
-                if minus_neighbors:
-                    neighbor_idx = minus_neighbors[0]
-                    if mbl <= neighbor_idx < mbh:
-                        neighbor_offset = neighbor_idx - mbl
-                        neighbor_data = data[neighbor_offset]
-                        grad[:, 0, :] = (block_data[:, 1, :] - neighbor_data[:, -1, :]) / (2 * dx[local_idx])
-                    elif ad.owns_meshblock(neighbor_idx):
-                        neighbor_data = ad.data(var, neighbor_idx, neighbor_idx+1)
-                        if len(neighbor_data) > 0:
-                            grad[:, 0, :] = (block_data[:, 1, :] - neighbor_data[0][:, -1, :]) / (2 * dx[local_idx])
-            
-            else:  # axis == 'z'
-                # Front boundary (z+)
-                plus_neighbors = find_neighbour_blocks(ad, block_idx, 'z+')
-                if plus_neighbors:
-                    neighbor_idx = plus_neighbors[0]
-                    if mbl <= neighbor_idx < mbh:
-                        neighbor_offset = neighbor_idx - mbl
-                        neighbor_data = data[neighbor_offset]
-                        grad[-1, :, :] = (neighbor_data[0, :, :] - block_data[-2, :, :]) / (2 * dx[local_idx])
-                    elif ad.owns_meshblock(neighbor_idx):
-                        neighbor_data = ad.data(var, neighbor_idx, neighbor_idx+1)
-                        if len(neighbor_data) > 0:
-                            grad[-1, :, :] = (neighbor_data[0][0, :, :] - block_data[-2, :, :]) / (2 * dx[local_idx])
-                
-                # Back boundary (z-)
-                minus_neighbors = find_neighbour_blocks(ad, block_idx, 'z-')
-                if minus_neighbors:
-                    neighbor_idx = minus_neighbors[0]
-                    if mbl <= neighbor_idx < mbh:
-                        neighbor_offset = neighbor_idx - mbl
-                        neighbor_data = data[neighbor_offset]
-                        grad[0, :, :] = (block_data[1, :, :] - neighbor_data[-1, :, :]) / (2 * dx[local_idx])
-                    elif ad.owns_meshblock(neighbor_idx):
-                        neighbor_data = ad.data(var, neighbor_idx, neighbor_idx+1)
-                        if len(neighbor_data) > 0:
-                            grad[0, :, :] = (block_data[1, :, :] - neighbor_data[0][-1, :, :]) / (2 * dx[local_idx])
-        
-        # Store gradient for this block
-        result[block_offset] = grad
-    
-    return result
-    
+    if axis not in _AXIS_SPACING:
+        raise ValueError(f"Invalid axis: {axis}. Must be 'x', 'y', 'z', or None.")
+
+    data = xp.asarray(ad.data(var, mbl, mbh))
+    # The unbounded cell-width request is global (indexed by global block id).
+    spacing = _global_cell_width(ad, axis)
+    return _block_gradient(ad, data, _first_global_block(ad, mbl), axis, spacing,
+                           edge_order, handle_boundaries, var=var)
+
 def _divergence_mb(ad, var, mbl, mbh, edge_order=1, handle_boundaries=True):
     """
     Internal function: Calculate divergence of a vector field across mesh blocks.
@@ -744,25 +551,32 @@ def _divergence_mb(ad, var, mbl, mbh, edge_order=1, handle_boundaries=True):
     # Sum the components to get divergence
     return grad_x + grad_y + grad_z
 
-def _curl_original(ad, fx, fy, fz, **kwargs):
+def _curl_original(ad, fx, fy, fz, mbl=None, mbh=None, **kwargs):
     """Original curl implementation working on the whole domain at once."""
-    # Convert variable names to data arrays if needed
+    data_kwargs = {k: v for k, v in kwargs.items() if k != 'dtype'}
+    names = {}
+    # Load each component once; keep its name so faces at the edge of an
+    # mbl:mbh batch can still use neighbour blocks outside the batch.
     if isinstance(fx, str):
-        fx = ad.data(fx, **kwargs)
+        names['x'], fx = fx, ad.data(fx, mbl, mbh, **data_kwargs)
     if isinstance(fy, str):
-        fy = ad.data(fy, **kwargs)
+        names['y'], fy = fy, ad.data(fy, mbl, mbh, **data_kwargs)
     if isinstance(fz, str):
-        fz = ad.data(fz, **kwargs)
-    
+        names['z'], fz = fz, ad.data(fz, mbl, mbh, **data_kwargs)
+
+    def grad(f, comp, axis):
+        return _gradient_original(ad, f, axis, mbl=mbl, mbh=mbh,
+                                  var_name=names.get(comp), **dict(kwargs))
+
     # Calculate derivatives
-    dfz_dy = _gradient_original(ad, fz, 'y', **kwargs)
-    dfy_dz = _gradient_original(ad, fy, 'z', **kwargs)
+    dfz_dy = grad(fz, 'z', 'y')
+    dfy_dz = grad(fy, 'y', 'z')
     
-    dfx_dz = _gradient_original(ad, fx, 'z', **kwargs)
-    dfz_dx = _gradient_original(ad, fz, 'x', **kwargs)
+    dfx_dz = grad(fx, 'x', 'z')
+    dfz_dx = grad(fz, 'z', 'x')
     
-    dfy_dx = _gradient_original(ad, fy, 'x', **kwargs)
-    dfx_dy = _gradient_original(ad, fx, 'y', **kwargs)
+    dfy_dx = grad(fy, 'y', 'x')
+    dfx_dy = grad(fx, 'x', 'y')
     
     # Calculate curl components
     curl_x = dfz_dy - dfy_dz

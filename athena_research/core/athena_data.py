@@ -8,7 +8,8 @@ import json
 import h5py
 import pickle
 
-from .io_utils import read_binary, load_dict_from_hdf5, save_dict_to_hdf5
+from .io_utils import (read_binary, load_dict_from_hdf5, save_dict_to_hdf5,
+                       atomic_write, hdf5_value_supported)
 from .units import Units
 from . import utils
 from . import particle_io
@@ -17,18 +18,38 @@ class AthenaData:
     """
     Class for handling and analyzing Athena++ simulation data.
     """
-    def __init__(self, num=0, version='1.0', cache=False):
+    # Keys of a loaded dict that never overwrite the loading object's state.
+    # MPI/meshblock-distribution bookkeeping (mpi_rank, mpi_size,
+    # has_full_data, local_mb_start, local_mb_end) reflects the state of
+    # whichever process wrote the dict, not anything meaningful for the
+    # object doing the loading now. set_mpi_distribution()'s docstring says
+    # to call it BEFORE loading data for exactly this reason -- restoring
+    # these from a saved dict would silently override that and scope every
+    # subsequent ad.data() call (and any raw-file load right after this one)
+    # to a stale partial meshblock range. mb_data is per-block raw data that
+    # is copied into data_raw and must not stay referenced.
+    _LOAD_EXCEPT_KEYS = ('header', 'data', 'binary', 'coord', 'data_raw',
+                         'mb_data', 'mpi_rank', 'mpi_size', 'has_full_data',
+                         'local_mb_start', 'local_mb_end')
+    # Identity of the file an h5data/pickle cache was written from; the
+    # loaded object describes the file it was loaded from instead.
+    _FILE_IDENTITY_KEYS = ('filename', 'num', 'path', '_num_explicit')
+
+    def __init__(self, num=None, version='1.0', cache=False):
         """
         Initialize an AthenaData object.
         
         Parameters
         ----------
         num : int, optional
-            File number
+            File number. Normally parsed from the filename by config();
+            an explicit value is kept only for filenames that carry no
+            numeric part.
         version : str, optional
             Data format version
         """
-        self.num = num
+        self._num_explicit = num is not None
+        self.num = 0 if num is None else num
         self.version = version
         self._header = {}
         self.binary = {}
@@ -109,7 +130,10 @@ class AthenaData:
             self.load_pickle(filename, **kwargs)
         else:
             raise ValueError(f"Unknown file type: {filename.split('.')[-1]}")
-            
+
+        # The identity (path, snapshot number) describes the file just read,
+        # not the one a cache was made from; set it even when config() is skipped.
+        self._set_file_identity(strict=False)
         if (config):
             self.config()
         
@@ -167,6 +191,21 @@ class AthenaData:
         for k, v in self.__dict__.items():
             if (k not in except_keys + default_except_keys and not callable(v)):
                 dic[k] = v
+
+        # Runtime objects (Units, file handles, ...) are not attributes the
+        # file can represent; the unit system is stored by its parameters
+        # and rebuilt on load. Nested product dicts are saved strictly.
+        if is_hdf5:
+            units = dic.pop('units', None)
+            if isinstance(units, Units):
+                dic['_units_params'] = {
+                    'length_cgs': float(units.length_cgs),
+                    'mass_cgs': float(units.mass_cgs),
+                    'time_cgs': float(units.time_cgs),
+                    'mu': float(units.mu), 'x_h': float(units.x_h),
+                    'gamma': float(units.gamma)}
+            dic = {k: v for k, v in dic.items()
+                   if v is not None and hdf5_value_supported(v)}
         
         # Verify raw meshblock data is not in the dictionary for h5data files.
         if is_h5data:
@@ -195,7 +234,16 @@ class AthenaData:
         -------
         None
         """
-        self._load_from_binary(read_binary(filename))
+        if self.has_full_data:
+            binary = read_binary(filename)
+        else:
+            # Distributed load: only this rank's meshblocks are unpacked.
+            def _local_range(n_mbs):
+                self.n_mbs = n_mbs
+                self._finalize_mpi_distribution()
+                return self.local_mb_start, self.local_mb_end
+            binary = read_binary(filename, mb_range=_local_range)
+        self._load_from_binary(binary)
         
     def load_athdf(self, filename):
         """
@@ -280,7 +328,13 @@ class AthenaData:
         -------
         None
         """
-        self._load_from_dic(pickle.load(open(filename, 'rb')), **kwargs)
+        with open(filename, 'rb') as fp:
+            dic = pickle.load(fp)
+        kwargs.setdefault('except_keys', list(self._LOAD_EXCEPT_KEYS)
+                          + list(self._FILE_IDENTITY_KEYS))
+        self._load_from_dic(dic, **kwargs)
+        self.filename = filename
+        self._restore_units()
         
     def load_hdf5(self, filename, **kwargs):
         """
@@ -300,10 +354,33 @@ class AthenaData:
         exclude_hdf5_keys = kwargs.pop('exclude_hdf5_keys', None)
         if exclude_hdf5_keys is None and (filename.endswith('.h5data') or '.h5data.' in filename):
             exclude_hdf5_keys = ['mb_data', 'data_raw']
+        kwargs.setdefault('except_keys', list(self._LOAD_EXCEPT_KEYS)
+                          + list(self._FILE_IDENTITY_KEYS))
         self._load_from_dic(
             load_dict_from_hdf5(filename, exclude_keys=exclude_hdf5_keys),
             **kwargs,
         )
+        self.filename = filename
+        self._restore_units()
+
+    def _restore_units(self):
+        """Rebuild ``self.units`` after loading a post-processed cache.
+
+        Caches store the unit parameters under ``_units_params``; older
+        caches have none, so the unit system is rebuilt from the saved
+        simulation header the same way the original load built it.
+        """
+        params = self.__dict__.pop('_units_params', None)
+        if isinstance(params, dict) and params:
+            self.units = Units(lunit=float(params['length_cgs']),
+                               munit=float(params['mass_cgs']),
+                               tunit=float(params['time_cgs']),
+                               mu=float(params['mu']),
+                               x_h=float(params.get('x_h', 0.715)))
+            self.units.gamma = float(params.get('gamma', getattr(self, 'gamma', 5.0/3.0)))
+        elif self.units is None and isinstance(self._header, dict) and 'mesh' in self._header:
+            self.units = self._units_from_header()
+            self.units.gamma = getattr(self, 'gamma', self.units.gamma)
         
     def save_hdf5(self, dic, filename):
         """
@@ -337,7 +414,10 @@ class AthenaData:
         -------
         None
         """
-        pickle.dump(dic, open(filename, 'wb'))
+        def _write(path):
+            with open(path, 'wb') as fp:
+                pickle.dump(dic, fp)
+        atomic_write(filename, _write)
         
     def _load_from_dic(self, dic, except_keys=None):
         """
@@ -355,18 +435,7 @@ class AthenaData:
         None
         """
         if except_keys is None:
-            # MPI/meshblock-distribution bookkeeping (mpi_rank, mpi_size,
-            # has_full_data, local_mb_start, local_mb_end) reflects the state
-            # of whichever process wrote this dict, not anything meaningful
-            # for the object doing the loading now. set_mpi_distribution()'s
-            # docstring says to call it BEFORE loading data for exactly this
-            # reason -- restoring these from a saved dict would silently
-            # override that and scope every subsequent ad.data() call (and
-            # any raw-file load right after this one) to a stale partial
-            # meshblock range.
-            except_keys = ['header', 'data', 'binary', 'coord', 'data_raw',
-                           'mpi_rank', 'mpi_size', 'has_full_data',
-                           'local_mb_start', 'local_mb_end']
+            except_keys = list(self._LOAD_EXCEPT_KEYS)
 
         for k, v in dic.items():
             if (k not in except_keys):
@@ -388,7 +457,10 @@ class AthenaData:
         -------
         None
         """
-        self.binary = binary
+        # Keep the metadata but not the per-block field data: data_raw below
+        # holds a (rank-local) copy, and a second reference to every block
+        # would keep the full domain alive on each rank.
+        self.binary = {k: v for k, v in binary.items() if k != 'mb_data'}
         self._load_from_dic(self.binary)
         
         # Set mesh metadata
@@ -409,12 +481,36 @@ class AthenaData:
             mb_start = self.local_mb_start
             mb_end = self.local_mb_end
         
-        # Load data for assigned meshblocks only
-        for var in self.binary['var_names']:
-            self.data_raw[var] = np.asarray(binary['mb_data'][var][mb_start:mb_end])
-            
         self._config_header(self.binary['header'])
         self._config_attrs_from_header()
+
+        # Load data for assigned meshblocks only. mb_data may itself hold
+        # only a subrange of blocks starting at mb_data_start.
+        data_start = int(binary.get('mb_data_start', 0))
+        n_held = len(binary['mb_data'][self.binary['var_names'][0]]) \
+            if self.binary['var_names'] else 0
+        if mb_start < data_start or mb_end > data_start + n_held:
+            raise ValueError(
+                f"meshblocks [{mb_start}, {mb_end}) requested but the file data "
+                f"holds [{data_start}, {data_start + n_held})")
+        block_shape = (self.nx3, self.nx2, self.nx1)
+        for var in self.binary['var_names']:
+            blocks = binary['mb_data'][var][mb_start - data_start:mb_end - data_start]
+            if len(blocks) == 0:
+                self.data_raw[var] = np.zeros((0,) + block_shape)
+                continue
+            arr = np.asarray(blocks)
+            if arr.shape[1:] != block_shape:
+                # Coordinates, cell widths and volumes are built from the
+                # <meshblock> nx and the block geometry, so ghost-zone or
+                # sliced outputs would silently get wrong coordinates.
+                raise ValueError(
+                    f"{getattr(self, 'filename', 'binary data')}: variable "
+                    f"{var!r} has per-meshblock shape {arr.shape[1:]} but "
+                    f"<meshblock> nx3,nx2,nx1 = {block_shape}. Ghost-zone and "
+                    f"sliced outputs are not supported; load a full-volume "
+                    f"output without ghost zones.")
+            self.data_raw[var] = arr
         
     def _load_from_athdf(self, filename):
         """
@@ -644,18 +740,7 @@ class AthenaData:
             except Exception:
                 self.filename = str(self.filename)
 
-        self.path = str(Path(self.filename).parent)
-        # Most snapshots are <problem>.<num>.<ext>, so split('.')[-2] works.
-        # Athena 4.2 per-variable VTKs add a suffix (<problem>.<num>.<suffix>.<ext>)
-        # so we fall back to scanning right-to-left for the first all-digit part.
-        try:
-            self.num = int(self.filename.split('.')[-2])
-        except ValueError:
-            self.num = 0
-            for part in reversed(Path(self.filename).name.split('.')):
-                if part.isdigit():
-                    self.num = int(part)
-                    break
+        self._set_file_identity(strict=True)
         self.is_mhd = 'mhd' in self._header.keys()
         # set up vertical/radial profile functions
         try:
@@ -669,6 +754,27 @@ class AthenaData:
         except ImportError:
             self.register_radial_profile_func(None)
         
+    def _set_file_identity(self, strict):
+        """Set path and snapshot number from self.filename.
+
+        Most snapshots are <problem>.<num>.<ext>; Athena 4.2 per-variable VTKs
+        add a suffix (<problem>.<num>.<suffix>.<ext>) and cache copies may add
+        one after the extension, so the name is scanned right-to-left
+        (extension excluded) for the first all-digit part. With strict, a name
+        without one raises unless num was given explicitly.
+        """
+        self.path = str(Path(self.filename).parent)
+        parts = Path(self.filename).name.split('.')[:-1]
+        num = next((int(p) for p in reversed(parts) if p.isdigit()), None)
+        if num is not None:
+            if not getattr(self, '_num_explicit', False):
+                self.num = num
+        elif strict and not getattr(self, '_num_explicit', False):
+            raise ValueError(
+                f"cannot determine the snapshot number from {self.filename!r}: "
+                f"no all-digit '.'-separated part. Rename the file to "
+                f"<name>.<number>.<ext> or pass AthenaData(num=...).")
+
     def _config_header(self, header):
         """
         Configure header information.
@@ -743,21 +849,7 @@ class AthenaData:
         self.x3min = json.loads(self.header('mesh', 'x3min'))
         self.x3max = json.loads(self.header('mesh', 'x3max'))
         
-        # Initialize units from header information
-        try:
-            length_cgs = json.loads(self.header('units', 'length_cgs'))
-            mass_cgs = json.loads(self.header('units', 'mass_cgs'))
-            time_cgs = json.loads(self.header('units', 'time_cgs'))
-            mu = json.loads(self.header('units', 'mu'))
-            self.units = Units(lunit=length_cgs, munit=mass_cgs, tunit=time_cgs, mu=mu)
-        except:
-            # Use default unit values if not found in header
-            length_cgs = 1.0
-            mass_cgs = 1.0
-            time_cgs = 1.0
-            mu = 0.618  # Default mean molecular weight
-            self.units = Units(lunit=length_cgs, munit=mass_cgs, tunit=time_cgs, mu=mu)
-            print("Warning: Using default unit values as they were not found in the header")
+        self.units = self._units_from_header()
             
         # Get gamma with error handling
         try:
@@ -785,6 +877,31 @@ class AthenaData:
         # Update units gamma value to match simulation
         self.units.gamma = self.gamma
         
+    def _units_from_header(self):
+        """Build the unit system from the header's <units> block.
+
+        Without a <units> block the simulation ran in code units and the
+        defaults below apply. A <units> block that is present but missing a
+        key or holding a non-numeric value raises, because silently falling
+        back to code units would rescale every cgs quantity.
+        """
+        block = self._header.get('units') if isinstance(self._header, dict) else None
+        if not block:
+            print("Warning: Using default unit values as they were not found in the header")
+            return Units(lunit=1.0, munit=1.0, tunit=1.0, mu=0.618)
+        values = {}
+        for key in ('length_cgs', 'mass_cgs', 'time_cgs', 'mu'):
+            if key not in block:
+                raise ValueError(f"<units> block in the header has no {key!r}; "
+                                 f"found keys {sorted(block)}")
+            try:
+                values[key] = float(str(block[key]).strip())
+            except ValueError as exc:
+                raise ValueError(f"<units>/{key} = {block[key]!r} is not a "
+                                 f"number") from exc
+        return Units(lunit=values['length_cgs'], munit=values['mass_cgs'],
+                     tunit=values['time_cgs'], mu=values['mu'])
+
     def set_coord(self):
         """
         Set up coordinate information for each meshblock.
@@ -980,7 +1097,9 @@ class AthenaData:
         # Check rendering cache first for commonly used 3D visualization variables
         viz_vars = ['temp', 'dens', 'pgas', 'velx', 'vely', 'velz', 'bcc1', 'bcc2', 'bcc3']
         
-        if var in viz_vars:
+        # The cache holds full-domain, default-argument results only; a
+        # meshblock range or extra arguments bypass it.
+        if var in viz_vars and not kwargs:
             cache_key = f"data_{var}"
             cached_data = self.get_cached_or_compute(
                 var, 
@@ -1015,57 +1134,18 @@ class AthenaData:
 
     def get_coord(self):
         """
-        Retrieve coordinate data, with caching.
-        
+        Retrieve full-domain cell-centre coordinate meshes, with caching.
+
         Returns
         -------
         tuple
-            (x_mesh, y_mesh, z_mesh) coordinate arrays
+            (x_mesh, y_mesh, z_mesh), each of shape (Nx3, Nx2, Nx1) on the
+            level-0 uniform grid, matching ``get_refined_data`` layout.
         """
         cache_key = "coord_meshes"
-        
-        # Check cache first
-        if cache_key in self.rendering:
-            print("  ✓ Using cached coordinate meshes")
-            return self.rendering[cache_key]
-            
-        # Compute coordinate meshes if not cached
-        print("  Computing coordinate meshes...")
-        try:
-            # Use existing coordinate data to create meshes
-            if not self.coord:
-                self.set_coord()
-                
-            # Create full domain meshes by concatenating meshblock data
-            x_coords = []
-            y_coords = []
-            z_coords = []
-            
-            for mb in range(self.n_mbs):
-                x_coords.append(self.coord['x'][mb])
-                y_coords.append(self.coord['y'][mb])
-                z_coords.append(self.coord['z'][mb])
-            
-            # Only the first meshblock's coordinates are used here; this
-            # does not assemble a true multi-meshblock domain mesh.
-            x_mesh = x_coords[0]
-            y_mesh = y_coords[0] 
-            z_mesh = z_coords[0]
-            
-            coord_result = (x_mesh, y_mesh, z_mesh)
-            
-            # Cache the result
-            self.rendering[cache_key] = coord_result
-            print("  ✓ Computed and cached coordinate meshes")
-            
-            return coord_result
-            
-        except Exception as e:
-            print(f"  ⚠ Could not compute coordinate meshes: {e}")
-            # Return basic meshes as fallback
-            return np.mgrid[self.x1min:self.x1max:complex(self.Nx1), 
-                          self.x2min:self.x2max:complex(self.Nx2),
-                          self.x3min:self.x3max:complex(self.Nx3)]
+        if cache_key not in self.rendering:
+            self.rendering[cache_key] = utils.xyz_uniform(self)
+        return self.rendering[cache_key]
     
     def data(self, var, mbl=None, mbh=None, **kwargs):
         """

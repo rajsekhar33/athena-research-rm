@@ -71,6 +71,39 @@ _MC_MODULE = None
 # that build edge vectors v1-v3 / w1-w3 are multiplied by (dx, dy, dz) so the
 # resulting area is already in physical (code) units.
 _ADD_TRIANGLE_PHYS = r"""
+// Interior vertex of tiling entry 12 (the mean of the iso crossings on the
+// cube edges); same rule as interior_vertex() in marching_cubes.hpp, kept
+// here so this string compiles against any copy of that header.  Pass 0 is
+// the strict sign change; when every crossing edge touches the iso level
+// exactly (three or more corners on the level) it finds no edge and the mean
+// would be 0/0, so pass 1 uses process_cube's own classification (v < 0 is
+// inside), whose interpolation stays finite on those edges.
+__device__ inline bool mc_interior_edge_crosses(double a, double b, int pass) {
+  return (pass == 0) ? (a*b < 0) : ((a < 0) != (b < 0));
+}
+
+__device__ inline
+void mc_interior_vertex(Cube cube, double &x, double &y, double &z) {
+  int nv = 0;
+  for (int pass = 0; pass < 2 && nv == 0; pass++) {
+    x = 0.0; y = 0.0; z = 0.0;
+    if (mc_interior_edge_crosses(cube.v1, cube.v0, pass)) {x += 1./(1-cube.v1/cube.v0); nv++;}
+    if (mc_interior_edge_crosses(cube.v2, cube.v1, pass)) {x += 1.0; y += 1./(1-cube.v2/cube.v1); nv++;}
+    if (mc_interior_edge_crosses(cube.v2, cube.v3, pass)) {x += 1./(1-cube.v2/cube.v3); y += 1.0; nv++;}
+    if (mc_interior_edge_crosses(cube.v3, cube.v0, pass)) {y += 1./(1-cube.v3/cube.v0); nv++;}
+    if (mc_interior_edge_crosses(cube.v5, cube.v4, pass)) {x += 1./(1-cube.v5/cube.v4); z += 1.0; nv++;}
+    if (mc_interior_edge_crosses(cube.v6, cube.v5, pass)) {x += 1.0; y += 1./(1-cube.v6/cube.v5); z += 1.0; nv++;}
+    if (mc_interior_edge_crosses(cube.v6, cube.v7, pass)) {x += 1./(1-cube.v6/cube.v7); y += 1.0; z += 1.0; nv++;}
+    if (mc_interior_edge_crosses(cube.v7, cube.v4, pass)) {y += 1./(1-cube.v7/cube.v4); z += 1.0; nv++;}
+    if (mc_interior_edge_crosses(cube.v4, cube.v0, pass)) {z += 1./(1-cube.v4/cube.v0); nv++;}
+    if (mc_interior_edge_crosses(cube.v5, cube.v1, pass)) {x += 1.0; z += 1./(1-cube.v5/cube.v1); nv++;}
+    if (mc_interior_edge_crosses(cube.v6, cube.v2, pass)) {x += 1.0; y += 1.0; z += 1./(1-cube.v6/cube.v2); nv++;}
+    if (mc_interior_edge_crosses(cube.v7, cube.v3, pass)) {y += 1.0; z += 1./(1-cube.v7/cube.v3); nv++;}
+  }
+  if (nv == 0) { x = 0.5; y = 0.5; z = 0.5; return; }
+  x /= nv; y /= nv; z /= nv;
+}
+
 // Physically-scaled marching-cubes triangle area (dx/dy/dz are the physical
 // extents of the current cube in x/y/z).
 __device__ inline
@@ -78,8 +111,6 @@ double add_triangle_phys(const char *trig, char n, Cube cube,
                          double dx, double dy, double dz) {
   double xt[3],yt[3],zt[3];
   double area = 0.0;
-  double xv, yv, zv;
-  int nv;
 
   for( int t = 0 ; t < 3*n ; t++ ){
     switch( trig[t] ) {
@@ -144,22 +175,7 @@ double add_triangle_phys(const char *trig, char n, Cube cube,
         zt[ t % 3 ] = 1./(1-cube.v7/cube.v3);
         break;
       case 12:
-        xv=0.0; yv=0.0; zv=0.0; nv=0;
-        if (cube.v1*cube.v0<0){xv+=1./(1-cube.v1/cube.v0);yv+=0.0;zv+=0.0;nv++;}
-        if (cube.v2*cube.v1<0){xv+=1.0;yv+=1./(1-cube.v2/cube.v1);zv+=0.0;nv++;}
-        if (cube.v2*cube.v3<0){xv+=1./(1-cube.v2/cube.v3);yv+=1.0;zv+=0.0;nv++;}
-        if (cube.v3*cube.v0<0){xv+=0.0;yv+=1./(1-cube.v3/cube.v0);zv+=0.0;nv++;}
-        if (cube.v5*cube.v4<0){xv+=1./(1-cube.v5/cube.v4);yv+=0.0;zv+=1.0;nv++;}
-        if (cube.v6*cube.v5<0){xv+=1.0;yv+=1./(1-cube.v6/cube.v5);zv+=1.0;nv++;}
-        if (cube.v6*cube.v7<0){xv+=1./(1-cube.v6/cube.v7);yv+=1.0;zv+=1.0;nv++;}
-        if (cube.v7*cube.v4<0){xv+=0.0;yv+=1./(1-cube.v7/cube.v4);zv+=1.0;nv++;}
-        if (cube.v4*cube.v0<0){xv+=0.0;yv+=0.0;zv+=1./(1-cube.v4/cube.v0);nv++;}
-        if (cube.v5*cube.v1<0){xv+=1.0;yv+=0.0;zv+=1./(1-cube.v5/cube.v1);nv++;}
-        if (cube.v6*cube.v2<0){xv+=1.0;yv+=1.0;zv+=1./(1-cube.v6/cube.v2);nv++;}
-        if (cube.v7*cube.v3<0){xv+=0.0;yv+=1.0;zv+=1./(1-cube.v7/cube.v3);nv++;}
-        xt[ t % 3 ] = xv/nv;
-        yt[ t % 3 ] = yv/nv;
-        zt[ t % 3 ] = zv/nv;
+        mc_interior_vertex(cube, xt[ t % 3 ], yt[ t % 3 ], zt[ t % 3 ]);
         break;
       default:
         break;
@@ -216,7 +232,8 @@ extern "C" __global__ void mc_area_kernel(
     int Ks = K + s;
     if (Ks >= Nz) Ks = Nz - 1;
 
-    #define D(kk,jj,ii) (data[(kk)*Ny*Nx + (jj)*Nx + (ii)] - iso)
+    // 64-bit offsets: a full-width slab at N=2048 exceeds 2^31 cells.
+    #define D(kk,jj,ii) (data[((long long)(kk)*Ny + (jj))*(long long)Nx + (ii)] - iso)
 
     Cube cube(
         D(K,  J,  I  ), D(K,  J,  I+s),
@@ -267,7 +284,7 @@ extern "C" __global__ void mc_area_kernel_mb(
     int Nx_pad = nx1 + s_ghost;
     int Ny_pad = nx2 + s_ghost;
 
-    #define D_MB(kk,jj,ii) (data[(kk)*Ny_pad*Nx_pad + (jj)*Nx_pad + (ii)] - iso)
+    #define D_MB(kk,jj,ii) (data[((long long)(kk)*Ny_pad + (jj))*(long long)Nx_pad + (ii)] - iso)
 
     Cube cube(
         D_MB(K,   J,   I  ), D_MB(K,   J,   I+s),
@@ -446,17 +463,17 @@ def _get_kernel_mb():
 
 # ── Core computation helpers ──────────────────────────────────────────────────
 
-def _aug_array(log_slab: np.ndarray) -> np.ndarray:
+def _aug_array(log_slab: np.ndarray, periodic_xy=(True, True)) -> np.ndarray:
     """
-    Add one periodic ghost column in x1 (axis=-1) and x2 (axis=-2).
+    Add one ghost column in x1 (axis=-1) and x2 (axis=-2): the wrapped first
+    column on a periodic axis, the repeated last column otherwise.
     Output shape: (Nz, Ny+1, Nx+1).
     """
     Nz, Ny, Nx = log_slab.shape
     aug = np.empty((Nz, Ny + 1, Nx + 1), dtype=np.float64)
     aug[:, :-1, :-1] = log_slab
-    aug[:, :-1, -1]  = log_slab[:, :,  0]   # x1 periodic
-    aug[:, -1,  :-1] = log_slab[:,  0, :]   # x2 periodic
-    aug[:, -1,  -1]  = log_slab[:,  0,  0]  # corner
+    aug[:, :-1, -1]  = log_slab[:, :, 0 if periodic_xy[0] else -1]
+    aug[:, -1, :]    = aug[:, 0 if periodic_xy[1] else -2, :]
     return aug
 
 
@@ -535,26 +552,108 @@ def _fetch_log_temp_mb(ad, idx: int) -> np.ndarray:
     return np.log10(_fetch_temp_mb(ad, idx))
 
 
-def find_interface_z_levels(ad, T_ref, n_buffer=1):
+def _select_interface_levels(profile, level_min, level_max, target, n_buffer,
+                             periodic_z, label='T_ref'):
     """
-    Return the x3min values of meshblock z-levels that bracket the T=T_ref
-    isosurface, plus n_buffer extra levels on each side.
+    Choose the contiguous run of meshblock z-levels [lo, hi] for a slab.
+
+    The level whose mean ``profile`` is closest to ``target`` plus n_buffer
+    levels on each side is always kept. A level that owns cubes crossing the
+    isosurface is added as well: cubes owned by level iz take their upper
+    corners from level iz+1, so iz is needed whenever the value range of
+    levels iz and iz+1 together brackets ``target``. A mean profile alone
+    misses a corrugated or multiply-connected interface whose meshblocks lie
+    outside that window, and those cubes would be silently dropped.
+
+    Returns (lo, hi, crossing, needed) with ``needed`` the per-level flag.
     """
+    n_levels = len(profile)
+    crossing = int(np.argmin(np.abs(np.asarray(profile) - target)))
+    lo = max(0, crossing - n_buffer)
+    hi = min(n_levels - 1, crossing + n_buffer)
+
+    needed = np.zeros(n_levels, dtype=bool)
+    for iz in range(n_levels):
+        above = iz + 1
+        if above >= n_levels:
+            above = 0 if periodic_z else iz
+        vmin = min(level_min[iz], level_min[above])
+        vmax = max(level_max[iz], level_max[above])
+        needed[iz] = bool(vmin <= target <= vmax and vmin < vmax)
+
+    if np.any(needed):
+        idx = np.flatnonzero(needed)
+        new_lo = min(lo, int(idx[0]))
+        new_hi = max(hi, int(idx[-1]))
+        if (new_lo, new_hi) != (lo, hi):
+            warnings.warn(
+                f'The {label} isosurface crosses meshblock z-levels outside '
+                f'the interface window {lo}..{hi} (crossing level {crossing} '
+                f'+- n_buffer={n_buffer}); selecting levels {new_lo}..{new_hi} '
+                f'of {n_levels} so that no crossing meshblock is skipped.',
+                stacklevel=3,
+            )
+        lo, hi = new_lo, new_hi
+    return lo, hi, crossing, needed
+
+
+def _interface_z_level_selection(ad, T_ref, n_buffer=1):
+    """Return (z3_unique, lo, hi, crossing, needed) for T=T_ref."""
     mb_geo = ad.mb_geometry
 
     z3_unique  = np.sort(np.unique(mb_geo[:, 4]))
     log_T_by_z = np.empty(len(z3_unique))
+    log_T_min  = np.empty(len(z3_unique))
+    log_T_max  = np.empty(len(z3_unique))
     for iz, z3min in enumerate(z3_unique):
         idx_list = np.where(mb_geo[:, 4] == z3min)[0]
-        log_T_by_z[iz] = np.mean([
-            np.log10(float(_fetch_temp_mb(ad, int(m)).mean()))
-            for m in idx_list
-        ])
+        means, mins, maxs = [], [], []
+        for m in idx_list:
+            temp = _fetch_temp_mb(ad, int(m))
+            means.append(np.log10(float(temp.mean())))
+            # log10 of the extreme in the data dtype equals the extreme of
+            # the per-cell log10 that the marching-cubes kernels compare.
+            mins.append(float(np.log10(np.nanmin(temp))))
+            maxs.append(float(np.log10(np.nanmax(temp))))
+        log_T_by_z[iz] = np.mean(means)
+        log_T_min[iz] = min(mins)
+        log_T_max[iz] = max(maxs)
 
-    iz_cross = int(np.argmin(np.abs(log_T_by_z - np.log10(T_ref))))
-    iz_low   = max(0, iz_cross - n_buffer)
-    iz_high  = min(len(z3_unique) - 1, iz_cross + n_buffer)
-    return z3_unique[iz_low : iz_high + 1], iz_cross
+    periodic_z = _get_periodic_flags(ad)[2]
+    lo, hi, iz_cross, needed = _select_interface_levels(
+        log_T_by_z, log_T_min, log_T_max, float(np.log10(T_ref)),
+        n_buffer, periodic_z, label=f'T={T_ref:.4g}')
+    return z3_unique, lo, hi, iz_cross, needed
+
+
+def find_interface_z_levels(ad, T_ref, n_buffer=1):
+    """
+    Return the x3min values of the contiguous meshblock z-levels that contain
+    every cube crossing the T=T_ref isosurface, and the index of the level
+    whose mean log10(T) is closest to log10(T_ref).
+
+    The selection always includes that crossing level +- n_buffer levels and
+    is widened (with a warning) to every level whose meshblocks, or the
+    blocks directly above them, bracket T_ref.
+    """
+    z3_unique, lo, hi, iz_cross, _ = _interface_z_level_selection(
+        ad, T_ref, n_buffer=n_buffer)
+    return z3_unique[lo : hi + 1], iz_cross
+
+
+def _slab_z_levels(ad, T_ref, n_buffer=1):
+    """
+    Interface z-levels for the stacked-slab method.
+
+    The slab has no ghost layer above its top level, so when that level owns
+    crossing cubes the next level up is appended to supply their upper
+    corners (the meshblock method gets them from its +z padding instead).
+    """
+    z3_unique, lo, hi, iz_cross, needed = _interface_z_level_selection(
+        ad, T_ref, n_buffer=n_buffer)
+    if needed[hi] and hi + 1 < len(z3_unique):
+        hi += 1
+    return z3_unique[lo : hi + 1], iz_cross
 
 
 def _build_slab(ad, T_ref, z_selected):
@@ -600,14 +699,14 @@ def _find_mc_neighbors(ad):
     """
     Build +x, +y, +z neighbor lookup for every meshblock.
 
-    Uses find_neighbour_blocks which correctly handles periodic BCs (x1/x2)
-    and outflow BCs (x3) via the mb_logical array.
+    Uses find_neighbour_blocks, which reads the periodicity of every axis
+    from the header via the mb_logical array.
 
     Returns
     -------
     list of (ix_plus, iy_plus, iz_plus) per meshblock.
-        ix_plus / iy_plus : int  (always valid; x1/x2 are periodic)
-        iz_plus           : int or None  (None when at the +z domain boundary)
+        Each entry is a meshblock index, or None when the block sits at the
+        + boundary of a non-periodic axis.
     """
     neighbors = []
     for m in range(ad.n_mbs):
@@ -615,12 +714,57 @@ def _find_mc_neighbors(ad):
         y_plus = find_neighbour_blocks(ad, m, 'y+')
         z_plus = find_neighbour_blocks(ad, m, 'z+')
 
-        ix = x_plus[0] if x_plus else m   # x1 is periodic → always has neighbor
-        iy = y_plus[0] if y_plus else m   # x2 is periodic → always has neighbor
-        iz = z_plus[0] if z_plus else None # None at +z domain boundary (outflow)
+        ix = x_plus[0] if x_plus else None
+        iy = y_plus[0] if y_plus else None
+        iz = z_plus[0] if z_plus else None
 
         neighbors.append((ix, iy, iz))
     return neighbors
+
+
+# Ghost octants of a padded block as (dz, dy, dx) offsets, core excluded.
+_GHOST_OCTANTS = tuple(o for o in np.ndindex(2, 2, 2) if o != (0, 0, 0))
+
+
+def _octant_source(neighbors, m, octant):
+    """
+    Meshblock supplying ghost octant (dz, dy, dx) of block m, walking the
+    neighbor chain in z, y, x order; None if the chain leaves the domain.
+    """
+    dz, dy, dx = octant
+    b = m
+    for axis, step in ((2, dz), (1, dy), (0, dx)):
+        if step:
+            b = neighbors[b][axis]
+            if b is None:
+                return None
+    return b
+
+
+def _octant_slices(octant, s_ghost, nx3, nx2, nx1):
+    """(destination, source) slices of a ghost octant in a padded block."""
+    dst, src = [], []
+    for step, n in zip(octant, (nx3, nx2, nx1)):
+        dst.append(slice(n, None) if step else slice(0, n))
+        src.append(slice(0, s_ghost) if step else slice(0, n))
+    return tuple(dst), tuple(src)
+
+
+def _replicate_missing_ghosts(pad, missing, nx3, nx2, nx1):
+    """
+    Fill the + ghost layer of every non-periodic boundary axis by repeating
+    the last real layer (constant extrapolation, as outflow ghost cells do).
+    ``missing`` is (x, y, z) booleans; axes are processed x, y, z so every
+    octant whose neighbor chain left the domain ends up overwritten from a
+    layer that is already valid.
+    """
+    if missing[0]:
+        pad[..., nx1:] = pad[..., nx1 - 1:nx1]
+    if missing[1]:
+        pad[..., nx2:, :] = pad[..., nx2 - 1:nx2, :]
+    if missing[2]:
+        pad[..., nx3:, :, :] = pad[..., nx3 - 1:nx3, :, :]
+    return pad
 
 
 def _build_padded_block(ad, m, neighbors, s_ghost, nx3, nx2, nx1):
@@ -632,18 +776,17 @@ def _build_padded_block(ad, m, neighbors, s_ghost, nx3, nx2, nx1):
     meshblock data so the MC kernel can access all 8 corners of every cube
     whose lower-left-back corner lies within [0, nx3) × [0, nx2) × [0, nx1).
 
-    Fetches only the (up to 4) individual meshblocks actually needed --
-    self, +x, +y, +xy, and (if not at the +z domain boundary) +z, +xz, +yz,
-    +xyz -- via `_fetch_log_temp_mb`, never a precomputed whole-domain array
-    (see MESHBLOCK_DATA_ACCESS.md). A small per-call cache avoids re-fetching
-    the same meshblock twice within one padded block.
+    Fetches only the (up to 8) individual meshblocks actually needed --
+    self, +x, +y, +xy, +z, +xz, +yz, +xyz -- via `_fetch_log_temp_mb`, never
+    a precomputed whole-domain array (see MESHBLOCK_DATA_ACCESS.md). A small
+    per-call cache avoids re-fetching the same meshblock twice within one
+    padded block.
 
     Boundary conditions
     -------------------
-    x1 (+x) : periodic — neighbour always exists.
-    x2 (+y) : periodic — neighbour always exists.
-    x3 (+z) : outflow  — if no neighbour (at domain top), the last z-layer is
-                         replicated into the ghost region (constant extrapolation).
+    Periodic axes always have a neighbour. At the + boundary of a
+    non-periodic axis the last real layer is replicated into the ghost
+    region (constant extrapolation, like outflow ghost cells).
     """
     cache = {}
 
@@ -652,37 +795,18 @@ def _build_padded_block(ad, m, neighbors, s_ghost, nx3, nx2, nx1):
             cache[idx] = _fetch_log_temp_mb(ad, idx)
         return cache[idx]
 
-    ix_plus, iy_plus, iz_plus = neighbors[m]
-
     pad = np.empty((nx3 + s_ghost, nx2 + s_ghost, nx1 + s_ghost), dtype=np.float64)
-
-    # ── core block ────────────────────────────────────────────────────────────
     pad[:nx3, :nx2, :nx1] = _get(m)
 
-    # ── +x ghost: first s_ghost x-columns of x+ neighbour ───────────────────
-    pad[:nx3, :nx2, nx1:] = _get(ix_plus)[:nx3, :nx2, :s_ghost]
+    for octant in _GHOST_OCTANTS:
+        b = _octant_source(neighbors, m, octant)
+        if b is None:
+            continue
+        dst, src = _octant_slices(octant, s_ghost, nx3, nx2, nx1)
+        pad[dst] = _get(b)[src]
 
-    # ── +y ghost and +xy corner ───────────────────────────────────────────────
-    pad[:nx3, nx2:, :nx1] = _get(iy_plus)[:nx3, :s_ghost, :nx1]
-    ixy = neighbors[iy_plus][0]              # +x of the +y neighbour
-    pad[:nx3, nx2:, nx1:] = _get(ixy)[:nx3, :s_ghost, :s_ghost]
-
-    # ── +z ghost and its three corners ───────────────────────────────────────
-    if iz_plus is not None:
-        pad[nx3:, :nx2, :nx1] = _get(iz_plus)[:s_ghost, :nx2, :nx1]
-        iz_x  = neighbors[iz_plus][0]        # +x of the +z neighbour
-        iz_y  = neighbors[iz_plus][1]        # +y of the +z neighbour
-        iz_xy = neighbors[iz_y][0]           # +x of (+y of +z) = (+x,+y,+z) neighbour
-        pad[nx3:, :nx2, nx1:] = _get(iz_x )[:s_ghost, :nx2, :s_ghost]
-        pad[nx3:, nx2:, :nx1] = _get(iz_y )[:s_ghost, :s_ghost, :nx1]
-        pad[nx3:, nx2:, nx1:] = _get(iz_xy)[:s_ghost, :s_ghost, :s_ghost]
-    else:
-        # Outflow BC at +z domain boundary: replicate last real z-layer
-        pad[nx3:, :nx2, :nx1] = pad[nx3 - 1:nx3, :nx2, :nx1]
-        pad[nx3:, :nx2, nx1:] = pad[nx3 - 1:nx3, :nx2, nx1:]
-        pad[nx3:, nx2:, :]    = pad[nx3 - 1:nx3, nx2:, :]
-
-    return pad
+    missing = tuple(n is None for n in neighbors[m])
+    return _replicate_missing_ghosts(pad, missing, nx3, nx2, nx1)
 
 
 def _calc_area_gpu_mb(padded_gpu, iso, nx3, nx2, nx1, s_ghost, s, dz, dy, dx):
@@ -757,11 +881,11 @@ def calc_area_one_step(ad, T_ref, step_size=1, n_mb_buffer=1, use_gpu=True):
     -------
     float  Physical surface area.
     """
-    z_sel, iz_cross = find_interface_z_levels(ad, T_ref, n_buffer=n_mb_buffer)
+    z_sel, iz_cross = _slab_z_levels(ad, T_ref, n_buffer=n_mb_buffer)
     _, log_slab, iso = _build_slab(ad, T_ref, z_sel)
     Nz_slab = log_slab.shape[0]
 
-    aug = _aug_array(log_slab)
+    aug = _aug_array(log_slab, _get_periodic_flags(ad)[:2])
 
     if use_gpu and cupy_enabled and _get_kernel() is not None:
         return _calc_area_gpu(aug, iso, ad, step_size)
@@ -793,7 +917,7 @@ def calc_areas_all_steps(ad, T_ref, step_sizes=None, n_mb_buffer=1, use_gpu=True
     if step_sizes is None:
         step_sizes = STEP_SIZES
 
-    z_sel, iz_cross = find_interface_z_levels(ad, T_ref, n_buffer=n_mb_buffer)
+    z_sel, iz_cross = _slab_z_levels(ad, T_ref, n_buffer=n_mb_buffer)
     _, log_slab, iso = _build_slab(ad, T_ref, z_sel)
     Nz_slab = log_slab.shape[0]
 
@@ -801,7 +925,7 @@ def calc_areas_all_steps(ad, T_ref, step_sizes=None, n_mb_buffer=1, use_gpu=True
         print(f'  Slab: {Nz_slab}/{ad.Nx3} z-cells '
               f'({100.*Nz_slab/ad.Nx3:.1f}%,  interface idx={iz_cross})')
 
-    aug = _aug_array(log_slab)
+    aug = _aug_array(log_slab, _get_periodic_flags(ad)[:2])
 
     use_kernel = use_gpu and cupy_enabled and _get_kernel() is not None
     if verbose:
@@ -1322,7 +1446,7 @@ def calc_area_smoothed_indicator_mc(ad, T_ref, step_sizes=None, phase='cold',
                 f'range=[{vmin:.6g}, {vmax:.6g}]'
             )
 
-        aug = _aug_array(smoothed)
+        aug = _aug_array(smoothed, _get_periodic_flags(ad)[:2])
         area = _calc_area_skimage(aug, 0.5, ad, 1)
         out_areas.append(area)
 
@@ -1555,12 +1679,20 @@ def calc_area_smoothed_indicator_mc_meshblocks(
 
 def _build_coarse_sampled_grid_offset(ad, T_ref, step_size,
                                       offset_k=0, offset_j=0, offset_i=0,
-                                      verbose=True):
+                                      verbose=True, return_indices=False):
     """
     Build a coarse log10(T) grid using BCs from ad._header.
 
     Periodic directions are closed with offset + N.
     Non-periodic directions are closed at N - 1.
+
+    The final interval along an axis is shorter than step_size whenever the
+    step does not tile it (N not a multiple of the step on a periodic axis,
+    a step larger than N, or the N - 1 closure of a non-periodic axis), so
+    the returned uniform ``spacing`` is only exact for the other intervals.
+    With ``return_indices=True`` the global cell index of every sample along
+    (x3, x2, x1) is returned as well; marching-cubes vertices must be mapped
+    through those indices to get physical positions.
 
     For your usual setup:
         x1 periodic
@@ -1595,14 +1727,6 @@ def _build_coarse_sampled_grid_offset(ad, T_ref, step_size,
             if idx[-1] != n - 1:
                 idx.append(n - 1)
 
-            # Warn if the last cell is not the same physical size as the others.
-            if verbose and ((n - 1 - offset) % s != 0):
-                print(
-                    f'  WARNING: nonuniform final coarse interval along {axis_name}: '
-                    f'N={n}, offset={offset}, step={s}. '
-                    'skimage spacing assumes uniform intervals.'
-                )
-
         return idx
 
     z_idx = make_indices(ad.Nx3, ok, periodic_z, 'x3')
@@ -1636,7 +1760,23 @@ def _build_coarse_sampled_grid_offset(ad, T_ref, step_size,
             f'iso={iso:.6g}'
         )
 
+    if return_indices:
+        return coarse, spacing, (z_idx, y_idx, x_idx)
     return coarse, spacing
+
+
+def _coarse_vertices_to_physical(verts, indices, cell_spacing):
+    """
+    Map marching-cubes vertices in coarse-sample index space to physical
+    (x3, x2, x1) positions. Vertices lie on cube edges, so a piecewise-linear
+    map through the sampled global cell indices is exact even where the
+    final interval is shorter than the others.
+    """
+    out = np.empty_like(np.asarray(verts, dtype=np.float64))
+    for axis, (idx, d) in enumerate(zip(indices, cell_spacing)):
+        idx = np.asarray(idx, dtype=np.float64)
+        out[:, axis] = np.interp(verts[:, axis], np.arange(len(idx)), idx) * d
+    return out
 
 
 def calc_area_global_coarse_sampled_offsets(ad, T_ref, step_sizes=None,
@@ -1682,6 +1822,11 @@ def calc_area_global_coarse_sampled_offsets(ad, T_ref, step_sizes=None,
     iso = float(np.log10(T_ref))
 
     periodic_x, periodic_y, periodic_z = _get_periodic_flags(ad)
+    cell_spacing = (
+        (ad.x3max - ad.x3min) / ad.Nx3,
+        (ad.x2max - ad.x2min) / ad.Nx2,
+        (ad.x1max - ad.x1min) / ad.Nx1,
+    )
 
     out_steps = []
     out_areas = []
@@ -1718,7 +1863,7 @@ def calc_area_global_coarse_sampled_offsets(ad, T_ref, step_sizes=None,
         for ok in k_offsets:
             for oj in j_offsets:
                 for oi in i_offsets:
-                    coarse, spacing = _build_coarse_sampled_grid_offset(
+                    coarse, spacing, indices = _build_coarse_sampled_grid_offset(
                         ad,
                         T_ref,
                         s,
@@ -1726,6 +1871,7 @@ def calc_area_global_coarse_sampled_offsets(ad, T_ref, step_sizes=None,
                         offset_j=oj,
                         offset_i=oi,
                         verbose=verbose,
+                        return_indices=True,
                     )
 
                     cmin = float(np.nanmin(coarse))
@@ -1747,9 +1893,10 @@ def calc_area_global_coarse_sampled_offsets(ad, T_ref, step_sizes=None,
                         verts, faces, _, _ = skimage.measure.marching_cubes(
                             coarse,
                             level=iso,
-                            spacing=spacing,
                             allow_degenerate=False,
                         )
+                        verts = _coarse_vertices_to_physical(
+                            verts, indices, cell_spacing)
 
                         area = float(skimage.measure.mesh_surface_area(verts, faces))
 
@@ -1838,6 +1985,17 @@ def _area_cache_metadata_matches(area_mc, requested_metadata):
             if str(area_mc.get(key, '')).lower() != str(requested_metadata[key]).lower():
                 return False
 
+    # Caches written without the slab buffer stay readable; a recorded
+    # buffer must match the requested one.
+    if 'n_mb_buffer' in requested_metadata:
+        cached_buffer = area_mc.get('n_mb_buffer')
+        if cached_buffer is not None:
+            try:
+                if int(np.asarray(cached_buffer).ravel()[0]) != int(requested_metadata['n_mb_buffer']):
+                    return False
+            except Exception:
+                return False
+
     return True
 
 def set_area(ad, T_ref, h5_path: str, step_sizes=None, redo=False,
@@ -1877,6 +2035,8 @@ def set_area(ad, T_ref, h5_path: str, step_sizes=None, redo=False,
         'method_version': AREA_METHOD_VERSION[area_method],
         'T_ref': float(T_ref),
     }
+    if area_method == AREA_METHOD_MARCHING_CUBES:
+        requested_metadata['n_mb_buffer'] = int(n_mb_buffer)
     if area_method == AREA_METHOD_SMOOTHED_INDICATOR_MC:
         requested_metadata.update({
             'phase': str(phase).lower(),
@@ -2165,8 +2325,6 @@ void add_triangle_align(const char *trig, char n, Cube cube,
                         double* __restrict__ area_out,
                         double* __restrict__ align_out) {
   double xt[3],yt[3],zt[3];
-  double xv, yv, zv;
-  int nv;
 
   for( int t = 0 ; t < 3*n ; t++ ){
     switch( trig[t] ) {
@@ -2183,20 +2341,7 @@ void add_triangle_align(const char *trig, char n, Cube cube,
       case 10: xt[t%3]=1.; yt[t%3]=1.; zt[t%3]=1./(1-cube.v6/cube.v2); break;
       case 11: xt[t%3]=0.; yt[t%3]=1.; zt[t%3]=1./(1-cube.v7/cube.v3); break;
       case 12:
-        xv=0.;yv=0.;zv=0.;nv=0;
-        if(cube.v1*cube.v0<0){xv+=1./(1-cube.v1/cube.v0);yv+=0.;zv+=0.;nv++;}
-        if(cube.v2*cube.v1<0){xv+=1.;yv+=1./(1-cube.v2/cube.v1);zv+=0.;nv++;}
-        if(cube.v2*cube.v3<0){xv+=1./(1-cube.v2/cube.v3);yv+=1.;zv+=0.;nv++;}
-        if(cube.v3*cube.v0<0){xv+=0.;yv+=1./(1-cube.v3/cube.v0);zv+=0.;nv++;}
-        if(cube.v5*cube.v4<0){xv+=1./(1-cube.v5/cube.v4);yv+=0.;zv+=1.;nv++;}
-        if(cube.v6*cube.v5<0){xv+=1.;yv+=1./(1-cube.v6/cube.v5);zv+=1.;nv++;}
-        if(cube.v6*cube.v7<0){xv+=1./(1-cube.v6/cube.v7);yv+=1.;zv+=1.;nv++;}
-        if(cube.v7*cube.v4<0){xv+=0.;yv+=1./(1-cube.v7/cube.v4);zv+=1.;nv++;}
-        if(cube.v4*cube.v0<0){xv+=0.;yv+=0.;zv+=1./(1-cube.v4/cube.v0);nv++;}
-        if(cube.v5*cube.v1<0){xv+=1.;yv+=0.;zv+=1./(1-cube.v5/cube.v1);nv++;}
-        if(cube.v6*cube.v2<0){xv+=1.;yv+=1.;zv+=1./(1-cube.v6/cube.v2);nv++;}
-        if(cube.v7*cube.v3<0){xv+=0.;yv+=1.;zv+=1./(1-cube.v7/cube.v3);nv++;}
-        xt[t%3]=xv/nv;yt[t%3]=yv/nv;zt[t%3]=zv/nv;
+        mc_interior_vertex(cube, xt[t%3], yt[t%3], zt[t%3]);
         break;
       default: break;
     }
@@ -2290,19 +2435,21 @@ extern "C" __global__ void mc_align_kernel_mb_batch(
     int s_ghost, int s, double iso,
     double dz_cell, double dy_cell, double dx_cell
 ) {
-    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    // 64-bit thread and block offsets: n_blocks * cubes_per_block and
+    // mb * block_size can exceed 2^31 for large batches of large meshblocks.
+    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     int ni = nx1 / s, nj = nx2 / s, nk = nx3 / s;
-    int cubes_per_block = ni * nj * nk;
-    if (tid >= n_blocks * cubes_per_block) return;
+    long long cubes_per_block = (long long)ni * nj * nk;
+    if (tid >= (long long)n_blocks * cubes_per_block) return;
 
-    int mb = tid / cubes_per_block;
-    int local = tid - mb * cubes_per_block;
+    long long mb = tid / cubes_per_block;
+    int local = (int)(tid - mb * cubes_per_block);
     int i = local % ni;
     int j = (local / ni) % nj;
     int k = local / (ni * nj);
     int I = i*s, J = j*s, K = k*s;
     int Nx_pad = nx1 + s_ghost, Ny_pad = nx2 + s_ghost;
-    int block_size = (nx3 + s_ghost) * Ny_pad * Nx_pad;
+    long long block_size = (long long)(nx3 + s_ghost) * Ny_pad * Nx_pad;
     const double* d = data + mb * block_size;
     const double* bxp = bx + mb * block_size;
     const double* byp = by + mb * block_size;
@@ -2476,31 +2623,24 @@ def _build_alignment_padded_batch(field_runs, centers, neighbors, s_ghost, field
     out = xp.empty((ncenters, nx3 + s_ghost, nx2 + s_ghost, nx1 + s_ghost),
                    dtype=xp.float64)
 
-    center = _alignment_gather_blocks(field_runs, centers, field)
-    x_plus = _alignment_gather_blocks(field_runs, [neighbors[m][0] for m in centers], field)
-    y_plus = _alignment_gather_blocks(field_runs, [neighbors[m][1] for m in centers], field)
-    xy_plus = _alignment_gather_blocks(
-        field_runs, [neighbors[neighbors[m][1]][0] for m in centers], field)
-    out[:, :nx3, :nx2, :nx1] = center
-    out[:, :nx3, :nx2, nx1:] = x_plus[:, :, :, :s_ghost]
-    out[:, :nx3, nx2:, :nx1] = y_plus[:, :, :s_ghost, :]
-    out[:, :nx3, nx2:, nx1:] = xy_plus[:, :, :s_ghost, :s_ghost]
+    out[:, :nx3, :nx2, :nx1] = _alignment_gather_blocks(field_runs, centers, field)
+    for octant in _GHOST_OCTANTS:
+        sources = [_octant_source(neighbors, m, octant) for m in centers]
+        rows = [i for i, b in enumerate(sources) if b is not None]
+        if not rows:
+            continue
+        values = _alignment_gather_blocks(
+            field_runs, [sources[i] for i in rows], field)
+        dst, src = _octant_slices(octant, s_ghost, nx3, nx2, nx1)
+        if len(rows) == ncenters:
+            out[(slice(None),) + dst] = values[(slice(None),) + src]
+        else:
+            out[(rows,) + dst] = values[(slice(None),) + src]
 
-    has_z = [i for i, m in enumerate(centers) if neighbors[m][2] is not None]
-    no_z = [i for i, m in enumerate(centers) if neighbors[m][2] is None]
-    if has_z:
-        z_indices = [neighbors[centers[i]][2] for i in has_z]
-        z_plus = _alignment_gather_blocks(field_runs, z_indices, field)
-        zx_plus = _alignment_gather_blocks(field_runs, [neighbors[m][0] for m in z_indices], field)
-        zy_plus = _alignment_gather_blocks(field_runs, [neighbors[m][1] for m in z_indices], field)
-        zxy_plus = _alignment_gather_blocks(
-            field_runs, [neighbors[neighbors[m][1]][0] for m in z_indices], field)
-        out[has_z, nx3:, :nx2, :nx1] = z_plus[:, :s_ghost, :, :]
-        out[has_z, nx3:, :nx2, nx1:] = zx_plus[:, :s_ghost, :, :s_ghost]
-        out[has_z, nx3:, nx2:, :nx1] = zy_plus[:, :s_ghost, :s_ghost, :]
-        out[has_z, nx3:, nx2:, nx1:] = zxy_plus[:, :s_ghost, :s_ghost, :s_ghost]
-    if no_z:
-        out[no_z, nx3:, :, :] = out[no_z, nx3 - 1:nx3, :, :]
+    for i, m in enumerate(centers):
+        missing = tuple(n is None for n in neighbors[m])
+        if any(missing):
+            _replicate_missing_ghosts(out[i], missing, nx3, nx2, nx1)
     return out
 
 
@@ -2508,11 +2648,11 @@ def _alignment_required_blocks(centers, neighbors):
     """Return center blocks and the +direction blocks needed for their padding."""
     required = set()
     for m in centers:
-        x_plus, y_plus, z_plus = neighbors[m]
-        required.update((m, x_plus, y_plus, neighbors[y_plus][0]))
-        if z_plus is not None:
-            required.update((z_plus, neighbors[z_plus][0], neighbors[z_plus][1],
-                             neighbors[neighbors[z_plus][1]][0]))
+        required.add(m)
+        for octant in _GHOST_OCTANTS:
+            b = _octant_source(neighbors, m, octant)
+            if b is not None:
+                required.add(b)
     return sorted(required)
 
 
@@ -2657,23 +2797,35 @@ def _calc_vector_nhat_alignment_cpu_local(ad, iso, centers, neighbors, step_size
 
 def _find_interface_z_levels_for_field(ad, iso_field, iso_value, log_iso_field,
                                        n_buffer=1):
-    """Find the interface slab for an arbitrary scalar through ``ad.data``."""
+    """Find the interface slab for an arbitrary scalar through ``ad.data``.
+
+    Same selection rule as :func:`find_interface_z_levels`.
+    """
     zstarts = np.sort(np.unique(ad.mb_geometry[:, 4]))
     profile = np.empty(len(zstarts), dtype=float)
+    level_min = np.empty(len(zstarts), dtype=float)
+    level_max = np.empty(len(zstarts), dtype=float)
     for iz, zstart in enumerate(zstarts):
         blocks = np.where(ad.mb_geometry[:, 4] == zstart)[0].tolist()
         total = 0.0
         count = 0
+        vmin, vmax = np.inf, -np.inf
         for mbl, mbh in _iter_contiguous_block_runs(blocks):
             values = xp.asarray(ad.data(iso_field, mbl=mbl, mbh=mbh), dtype=xp.float64)
             if log_iso_field:
                 values = xp.log10(values)
             total += float(asnumpy(xp.sum(values)))
             count += int(values.size)
+            vmin = min(vmin, float(asnumpy(xp.nanmin(values))))
+            vmax = max(vmax, float(asnumpy(xp.nanmax(values))))
         profile[iz] = total / count
+        level_min[iz] = vmin
+        level_max[iz] = vmax
     target = float(np.log10(iso_value)) if log_iso_field else float(iso_value)
-    crossing = int(np.argmin(np.abs(profile - target)))
-    return zstarts[max(0, crossing - n_buffer):min(len(zstarts), crossing + n_buffer + 1)], crossing
+    lo, hi, crossing, _ = _select_interface_levels(
+        profile, level_min, level_max, target, n_buffer,
+        _get_periodic_flags(ad)[2], label=f'{iso_field}={iso_value:.4g}')
+    return zstarts[lo:hi + 1], crossing
 
 
 def _calc_vector_nhat_alignment_grouped_mb(ad, iso, z_selected, step_sizes,
@@ -2693,6 +2845,7 @@ def _calc_vector_nhat_alignment_grouped_mb(ad, iso, z_selected, step_sizes,
 
     nblk1, nblk2, nblk3 = ad.Nx1 // nx1, ad.Nx2 // nx2, ad.Nx3 // nx3
     lookup = _build_meshblock_lookup(ad)
+    periodic_x, periodic_y, periodic_z = _get_periodic_flags(ad)
     zstarts = np.sort(np.unique(ad.mb_geometry[:, 4]))
     slab_bz = set(np.where(np.isin(zstarts, z_selected))[0].tolist())
     dz = (ad.x3max - ad.x3min) / ad.Nx3
@@ -2729,7 +2882,9 @@ def _calc_vector_nhat_alignment_grouped_mb(ad, iso, z_selected, step_sizes,
             group_mb.append(group)
             for dk, dj, di in ((0, 0, 0), (0, 0, s), (0, s, s), (0, s, 0),
                                (s, 0, 0), (s, 0, s), (s, s, s), (s, s, 0)):
-                ii, jj, kk = (gi + di) % ad.Nx1, (gj + dj) % ad.Nx2, min(gk + dk, ad.Nx3 - 1)
+                ii = _apply_bc_index(gi + di, ad.Nx1, periodic_x)
+                jj = _apply_bc_index(gj + dj, ad.Nx2, periodic_y)
+                kk = _apply_bc_index(gk + dk, ad.Nx3, periodic_z)
                 bi, li = divmod(ii, nx1)
                 bj, lj = divmod(jj, nx2)
                 bk, lk = divmod(kk, nx3)
@@ -2795,6 +2950,30 @@ def _calc_vector_nhat_alignment_grouped_mb(ad, iso, z_selected, step_sizes,
     return out
 
 
+def _alignment_results_finite(area_list, cos2_list):
+    """
+    True when every area is finite and non-negative and every mean cos^2 is
+    finite, except the documented NaN for a scale with zero area.
+    """
+    area = np.asarray(area_list, dtype=float).ravel()
+    cos2 = np.asarray(cos2_list, dtype=float).ravel()
+    if area.shape != cos2.shape:
+        return False
+    if not np.all(np.isfinite(area)) or np.any(area < 0.0):
+        return False
+    return bool(np.all(np.isfinite(cos2[area > 0.0])))
+
+
+def _check_alignment_results_finite(step_sizes, area_list, cos2_list):
+    """Refuse to cache non-finite alignment results."""
+    if not _alignment_results_finite(area_list, cos2_list):
+        raise RuntimeError(
+            'Alignment produced non-finite values; refusing to cache them: '
+            f'step_sizes={list(step_sizes)}, total_area={list(area_list)}, '
+            f'mean_cos2={list(cos2_list)}'
+        )
+
+
 def calc_vector_nhat_alignment_mb_based(ad, iso_value, iso_field, vector_fields,
                                         n_mb_buffer=1, step_sizes=None,
                                         log_iso_field=False, use_gpu=True,
@@ -2803,7 +2982,8 @@ def calc_vector_nhat_alignment_mb_based(ad, iso_value, iso_field, vector_fields,
     """
     Compute area-weighted <(v̂·n̂)²> for a scalar isosurface and vector field.
 
-    Requires a uniform mesh with periodic x1/x2 and outflow x3 boundaries.
+    Requires a uniform mesh; the periodicity of each axis is read from the
+    header (non-periodic + boundaries replicate the last layer).
     MPI work sharing requires a full-domain input on every rank.
 
     Processes batches of slab meshblocks.  For each batch and step size s:
@@ -2869,7 +3049,9 @@ def calc_vector_nhat_alignment_mb_based(ad, iso_value, iso_field, vector_fields,
                 and list(cached.get('step_sizes', [])) == step_sizes
                 and cached.get('iso_field', iso_field) == iso_field
                 and tuple(cached.get('vector_fields', vector_fields)) == vector_fields
-                and bool(cached.get('log_iso_field', log_iso_field)) == bool(log_iso_field)):
+                and bool(cached.get('log_iso_field', log_iso_field)) == bool(log_iso_field)
+                and _alignment_results_finite(cached.get('total_area', []),
+                                              cached.get('mean_cos2', []))):
             if rank == 0 and verbose:
                 print('  Using cached alignment from ad.align_mc')
             cos2_list = cached['mean_cos2']
@@ -2950,6 +3132,7 @@ def calc_vector_nhat_alignment_mb_based(ad, iso_value, iso_field, vector_fields,
         cos2_list = [float(results_align[s] / results_area[s]) if results_area[s] else np.nan
                      for s in step_sizes]
         area_list = [float(results_area[s]) for s in step_sizes]
+        _check_alignment_results_finite(step_sizes, area_list, cos2_list)
         setattr(ad, cache_attr, {
             'step_sizes': step_sizes, 'mean_cos2': cos2_list, 'total_area': area_list,
             'iso_value': float(iso_value), 'iso_field': iso_field,
@@ -3053,6 +3236,7 @@ def calc_vector_nhat_alignment_mb_based(ad, iso_value, iso_field, vector_fields,
                 f'area={tot_area:.6g}  <(v̂·n̂)²>={mc2:.4f}'
             )
 
+    _check_alignment_results_finite(step_sizes, area_list, cos2_list)
     setattr(ad, cache_attr, {
         'step_sizes':  step_sizes,
         'mean_cos2':   cos2_list,

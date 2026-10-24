@@ -36,6 +36,91 @@ def fft_comp(data, nindex=1):
 
     return xp.abs(ru) ** 2
 
+def _box_lengths(ad):
+    """Box lengths (Lx, Ly, Lz)."""
+    return np.array([ad.x1max - ad.x1min, ad.x2max - ad.x2min, ad.x3max - ad.x3min], dtype=float)
+
+
+def _strat_xyz(ad, skip):
+    """Region kept by strat_flag: the full box minus ``skip`` at both z ends."""
+    return [ad.x1min, ad.x1max, ad.x2min, ad.x2max, ad.x3min + skip, ad.x3max - skip]
+
+
+def _spectral_grid(ad, shape, nbins, log_bin_flag):
+    """
+    Wavenumber axes and bins for an array of shape (nz, ny, nx) on ad's grid.
+
+    k is in cycles per unit length. Each axis length is the extent of the data
+    actually transformed (N_i * dx_i), so a z-cropped array gets its own Lz.
+    kmax = min_i N_i / L_i over axes with more than one cell (a single-cell
+    axis, as in 2D data, only carries k=0 and does not limit the bins), raised
+    to the largest |k| on the grid if that is larger, so that every mode is
+    binned and sum(E_spectrum) == sum(f^2). The raise only happens for
+    strongly anisotropic cells; with equal cell sizes the corner mode
+    sqrt(3)/(2 dx) is below 1/dx.
+
+    Returns
+    -------
+    kx, ky, kz : ndarray
+        Per-axis FFT wavenumbers (numpy).
+    kbins, k_ : ndarray
+        Bin edges and representative bin wavenumbers (numpy).
+    """
+    nz, ny, nx = (int(n) for n in shape)
+    n_xyz = np.array([nx, ny, nz])
+    box = _box_lengths(ad)
+    n_box = np.array([ad.Nx1, ad.Nx2, ad.Nx3])
+    L = np.where(n_xyz == n_box, box, n_xyz * (box / n_box))
+
+    kx = np.fft.fftfreq(nx) * nx / L[0]
+    ky = np.fft.fftfreq(ny) * ny / L[1]
+    kz = np.fft.fftfreq(nz) * nz / L[2]
+
+    active = n_xyz > 1
+    if not active.any():
+        active[:] = True
+    kmag_max = np.sqrt(np.max(np.abs(kx))**2 + np.max(np.abs(ky))**2 + np.max(np.abs(kz))**2)
+    kmax = max(np.min(n_xyz[active] / L[active]), kmag_max)
+    if log_bin_flag:
+        kmin = 0.25 * np.min(1.0 / L[active])
+        kbins = np.logspace(np.log10(kmin), np.log10(kmax), nbins + 1)
+        k_ = np.sqrt(kbins[:-1] * kbins[1:])
+    else:
+        kbins = np.linspace(0.0, kmax, nbins)
+        k_ = 0.5 * (kbins[:-1] + kbins[1:])
+    return kx, ky, kz, kbins, k_
+
+
+def _hamming_window(n):
+    """
+    z Hamming window scaled to unit mean square, so that windowing keeps the
+    mean power (sum of f^2) of a statistically homogeneous field.
+    """
+    w = hamming(n)
+    return w / np.sqrt(np.mean(w ** 2))
+
+
+def _slab_bounds(n, ndiv):
+    """(start, end) of at most ``ndiv`` nearly equal, non-empty slabs covering range(n)."""
+    nslab = max(1, min(int(ndiv), int(n)))
+    edges = [(i * n) // nslab for i in range(nslab + 1)]
+    return [(edges[i], edges[i + 1]) for i in range(nslab)]
+
+
+def _compressive_part(kx, ky, kz, k2, vx, vy, vz):
+    """
+    Longitudinal projection (k.v) k / |k|^2 of a Fourier-space vector field.
+    The k=0 mode has no direction; it gets no compressive part, so the mean
+    field ends up in the solenoidal remainder. The division is guarded
+    exactly rather than with an additive regulariser, which would swamp
+    |k|^2 for boxes in physical (e.g. cgs) length units.
+    """
+    nonzero = k2 > 0
+    inv_k2 = xp.where(nonzero, 1.0 / xp.where(nonzero, k2, 1.0), 0.0)
+    scale = (kx * vx + ky * vy + kz * vz) * inv_k2
+    return scale * kx, scale * ky, scale * kz
+
+
 def get_spectrum(ad, var, strat_flag=False, skip=0.0, nbins=256, log_bin_flag=False, debug=False):
     """
     Compute the energy spectrum from the given variable data using Fourier transforms.
@@ -72,34 +157,17 @@ def get_spectrum(ad, var, strat_flag=False, skip=0.0, nbins=256, log_bin_flag=Fa
         The power spectrum normalized by 4πk².
     """
     if(strat_flag==False):
-        nz, ny, nx = dims = xp.asarray([ad.Nx3,ad.Nx2,ad.Nx1])
-        L = xp.array([(ad.x1max-ad.x1min),(ad.x2max-ad.x2min),(ad.x3max-ad.x3min)])
-    else:
-        # set z direction stuff sizes same as y direction stuff
-        nz, ny, nx = dims = xp.asarray([int(xp.abs(ad.Nx3*(ad.x3max-ad.x3min-skip*2)/(ad.x3max-ad.x3min))),ad.Nx2,ad.Nx1])
-        L = xp.array([(ad.x1max-ad.x1min),(ad.x2max-ad.x2min),(ad.x3max-ad.x3min-skip*2)])
-    kx = xp.fft.fftfreq(nx) * nx / L[0]
-    ky = xp.fft.fftfreq(ny) * ny / L[1]
-    kz = xp.fft.fftfreq(nz) * nz / L[2]
-    kmax = xp.min(dims / L)
-    if(log_bin_flag):
-        kmin = 0.25*xp.min(1.0 / L)
-        kbins=xp.logspace(xp.log10(kmin), xp.log10(kmax), nbins+1)
-        k_ = xp.sqrt(kbins[:-1] * kbins[1:])
-    else:
-        kmin = 0.
-        kbins = xp.linspace(kmin, kmax+kmin, nbins)
-        k_ = 0.5*(kbins[:-1] + kbins[1:])
-    kz3d, ky3d, kx3d = xp.meshgrid(kz, ky, kx, indexing="ij")
-    k = xp.sqrt(kx3d ** 2 + ky3d ** 2 + kz3d ** 2)
-
-    if(strat_flag==False):
         real_data = ad.get_refined_data(var)
     else:
-        real_data = ad.get_refined_data(var, xyz=[ad.x1min,ad.x1max,ad.x2min,ad.x2max,ad.x3min+skip,ad.x3max-skip])
-        n_hamming=real_data.shape[0]
-        hamming_filter=xp.asarray(hamming(n_hamming))/xp.sqrt(xp.sum(hamming(n_hamming))/n_hamming)
+        real_data = ad.get_refined_data(var, xyz=_strat_xyz(ad, skip))
+        hamming_filter = xp.asarray(_hamming_window(real_data.shape[0]))
         real_data = real_data*hamming_filter[:,xp.newaxis,xp.newaxis]
+
+    kx, ky, kz, kbins, k_ = _spectral_grid(ad, real_data.shape, nbins, log_bin_flag)
+    kbins = xp.asarray(kbins)
+    k_ = xp.asarray(k_)
+    kz3d, ky3d, kx3d = xp.meshgrid(xp.asarray(kz), xp.asarray(ky), xp.asarray(kx), indexing="ij")
+    k = xp.sqrt(kx3d ** 2 + ky3d ** 2 + kz3d ** 2)
 
     if debug:
         # DEBUG: Check input data
@@ -192,40 +260,22 @@ def get_spectrum_mb(ad, var, strat_flag=False, skip=0.0, nbins=256,
         xp.get_default_pinned_memory_pool().free_all_blocks()
         
     if(strat_flag==False):
-        nz, ny, nx = dims = np.array([ad.Nx3,ad.Nx2,ad.Nx1])
-        L = np.array([(ad.x1max-ad.x1min),(ad.x2max-ad.x2min),(ad.x3max-ad.x3min)])
-    else:
-        # set z direction stuff sizes same as y direction stuff
-        nz, ny, nx = dims = np.asarray([int(np.abs(ad.Nx3*(ad.x3max-ad.x3min-skip*2)/(ad.x3max-ad.x3min))),ad.Nx2,ad.Nx1])
-        L = np.array([(ad.x1max-ad.x1min),(ad.x2max-ad.x2min),(ad.x3max-ad.x3min-skip*2)])
-    
-    kx = np.fft.fftfreq(nx) * nx / L[0]
-    ky = np.fft.fftfreq(ny) * ny / L[1]
-    kz = np.fft.fftfreq(nz) * nz / L[2]
-    kmax = np.min(dims / L)
-
-    if log_bin_flag:
-        kmin = 0.25 * np.min(1.0 / L)
-        kbins = np.logspace(np.log10(kmin), np.log10(kmax), nbins + 1)
-    else:
-        kmin = 0.0
-        kbins = np.linspace(kmin, kmax + kmin, nbins)
-
-    kz3d, ky3d, kx3d = np.meshgrid(kz, ky, kx, indexing="ij")
-    k = np.sqrt(kx3d ** 2 + ky3d ** 2 + kz3d ** 2)
-    kbins = xp.array(kbins)
-    
-    if(strat_flag==False):
         real_data = ad.get_refined_data_mb(var)
         if(weight_name != 'ones'):
             weight = ad.get_refined_data_mb(var=weight_name)
     else:
-        real_data = ad.get_refined_data_mb(var, xyz=[ad.x1min,ad.x1max,ad.x2min,ad.x2max,ad.x3min+skip,ad.x3max-skip])
-        n_hamming=real_data.shape[0]
-        hamming_filter=np.asarray(hamming(n_hamming))/np.sqrt(np.sum(hamming(n_hamming))/n_hamming)
+        real_data = ad.get_refined_data_mb(var, xyz=_strat_xyz(ad, skip))
+        hamming_filter = _hamming_window(real_data.shape[0])
         real_data = real_data*hamming_filter[:,np.newaxis,np.newaxis]
         if(weight_name != 'ones'):
-            weight = ad.get_refined_data_mb(var=weight_name, xyz=[ad.x1min,ad.x1max,ad.x2min,ad.x2max,ad.x3min+skip,ad.x3max-skip])
+            weight = ad.get_refined_data_mb(var=weight_name, xyz=_strat_xyz(ad, skip))
+
+    nz, ny, nx = real_data.shape
+    kx, ky, kz, kbins, k_ = _spectral_grid(ad, real_data.shape, nbins, log_bin_flag)
+    kz3d, ky3d, kx3d = np.meshgrid(kz, ky, kx, indexing="ij")
+    k = np.sqrt(kx3d ** 2 + ky3d ** 2 + kz3d ** 2)
+    kbins = xp.array(kbins)
+    k_ = xp.asarray(k_)
     
     if debug:
         print(f"[DEBUG get_spectrum_mb] var={var}, shape={real_data.shape}")
@@ -238,20 +288,14 @@ def get_spectrum_mb(ad, var, strat_flag=False, skip=0.0, nbins=256,
             ndiv = int(max( 4, ntot_cells // 512**3))
         else:
             ndiv = 4 # default value
-    ndiv_ = ndiv
-    if(nz % ndiv != 0):
-        ndiv_ = ndiv+1
-    local_nz = nz // ndiv
     
-    spectrum_mb = xp.zeros(nbins-1)
-    spectrum_bins_mb = xp.zeros(nbins-1)
+    spectrum_mb = xp.zeros(len(kbins)-1)
+    spectrum_bins_mb = xp.zeros(len(kbins)-1)
     
     # Step 1: 2D FFTs along x and y for each z-slab
     partial_results = []
     weight_partial_results = []
-    for slab_id in range(ndiv_):
-        start_z = slab_id * local_nz
-        end_z = min(start_z + local_nz, nz)
+    for start_z, end_z in _slab_bounds(nz, ndiv):
         slab = xp.array(real_data[start_z:end_z])
         # Perform 2D FFTs for entire slab at once
         local_fft_2d = xp.fft.fft2(slab, axes=(1,2))
@@ -274,11 +318,7 @@ def get_spectrum_mb(ad, var, strat_flag=False, skip=0.0, nbins=256,
     k_transpose = np.transpose(k, (1, 2, 0)) # ny, nx, nz
 
     # Step 4 : FFT along the z-direction
-    local_ny = ny // ndiv
-
-    for slab_id in range(ndiv_):
-        start_y = slab_id * local_ny
-        end_y = min(start_y + local_ny, ny)  # Ensure we don't exceed ny
+    for start_y, end_y in _slab_bounds(ny, ndiv):
         slab = xp.array(data_transpose[start_y:end_y])
         k_slab = xp.array(k_transpose[start_y:end_y])
         # Perform 1D FFTs for entire slab at once
@@ -294,14 +334,8 @@ def get_spectrum_mb(ad, var, strat_flag=False, skip=0.0, nbins=256,
             Kk = Kk * Kk_weight
         
         # Now calculate the spectrum
-        spectrum = xp.histogram(k_slab,bins=kbins,weights=Kk, density=False)
-        spectrum_bins = xp.histogram(k_slab,bins=kbins, density=False)
-        if log_bin_flag:
-            k_ = xp.sqrt(spectrum[1][1:]*spectrum[1][:-1])
-        else:
-            k_ = (spectrum[1][1:]+spectrum[1][:-1])*0.5
-        spectrum_mb += spectrum[0]
-        spectrum_bins_mb += spectrum_bins[0]
+        spectrum_mb += xp.histogram(k_slab,bins=kbins,weights=Kk, density=False)[0]
+        spectrum_bins_mb += xp.histogram(k_slab,bins=kbins, density=False)[0]
         
     E_spectrum = spectrum_mb
     # Suppress divide-by-zero warning (handled by nan_to_num below)
@@ -364,36 +398,42 @@ def get_spectrum_mb_mpi(ad, var, mpi_manager, strat_flag=False, skip=0.0, nbins=
         Power spectral density
     E_spectrum_norm : array
         Normalized power spectrum
+
+    Notes
+    -----
+    The gather of the 2D-transformed field passes per-rank element counts and
+    displacements to MPI as C ints. They overflow once a count or offset
+    exceeds 2**31 - 1 elements (e.g. N=2048^3 = 8.6e9 complex values), so this
+    path is limited to grids below that size until the gather is chunked or
+    switched to a derived datatype.
     """
     rank = mpi_manager.rank
     size = mpi_manager.size
     comm = mpi_manager.comm
     
-    # Get global domain parameters
-    if strat_flag:
-        nz_global = int(np.abs(ad.Nx3*(ad.x3max-ad.x3min-skip*2)/(ad.x3max-ad.x3min)))
-        ny_global, nx_global = ad.Nx2, ad.Nx1
-        L = np.array([(ad.x1max-ad.x1min), (ad.x2max-ad.x2min), (ad.x3max-ad.x3min-skip*2)])
-    else:
-        nz_global, ny_global, nx_global = ad.Nx3, ad.Nx2, ad.Nx1
-        L = np.array([(ad.x1max-ad.x1min), (ad.x2max-ad.x2min), (ad.x3max-ad.x3min)])
-    
-    dims = np.array([nz_global, ny_global, nx_global])
-    
-    # Setup k-space (same as single-node version)
-    kx = np.fft.fftfreq(nx_global) * nx_global / L[0]
-    ky = np.fft.fftfreq(ny_global) * ny_global / L[1]
-    kz = np.fft.fftfreq(nz_global) * nz_global / L[2]
-    kmax = np.min(dims / L)
-    
-    if log_bin_flag:
-        kmin = 0.25 * np.min(1.0 / L)
-        kbins = np.logspace(np.log10(kmin), np.log10(kmax), nbins + 1)
-        k_ = np.sqrt(kbins[:-1] * kbins[1:])
-    else:
-        kmin = 0.0
-        kbins = np.linspace(kmin, kmax + kmin, nbins)
-        k_ = 0.5 * (kbins[:-1] + kbins[1:])
+    if force_slab_loading:
+        raise RuntimeError("force_slab_loading=True: slab loading is not implemented in get_spectrum_mb_mpi")
+
+    # Every rank loads the full (optionally z-cropped) field and slices its
+    # own z-range, so the global shape is that of the loaded data.
+    try:
+        if strat_flag:
+            full_data = ad.get_refined_data_mb(var, xyz=_strat_xyz(ad, skip))
+            hamming_filter = _hamming_window(full_data.shape[0])
+            full_data = full_data * hamming_filter[:, np.newaxis, np.newaxis]
+        else:
+            full_data = ad.get_refined_data_mb(var, use_mpi_gather=True)
+    except (MemoryError, RuntimeError) as e:
+        # No slab-loading fallback is implemented for when full-domain
+        # loading fails -- fail loudly instead.
+        raise RuntimeError(
+            f"[rank {rank}] Full-domain data loading failed for '{var}' ({e}) and the "
+            "MPI slab-loading fallback in get_spectrum_mb_mpi is not implemented. "
+            "Reduce the domain size per rank or increase available memory."
+        ) from e
+
+    nz_global, ny_global, nx_global = full_data.shape
+    kx, ky, kz, kbins, k_ = _spectral_grid(ad, full_data.shape, nbins, log_bin_flag)
     
     # Divide z-dimension among ranks
     nz_per_rank = nz_global // size
@@ -405,64 +445,10 @@ def get_spectrum_mb_mpi(ad, var, mpi_manager, strat_flag=False, skip=0.0, nbins=
     
     local_nz = z_end_idx - z_start_idx
     
-    # Calculate physical bounds for this rank's z-slice
-    dz = (ad.x3max - ad.x3min) / nz_global
-    z_min_rank = ad.x3min + z_start_idx * dz
-    z_max_rank = ad.x3min + z_end_idx * dz
-    
     if debug:
         print(f"[DEBUG rank {rank}] z_slice=[{z_start_idx}:{z_end_idx}], shape will be ({local_nz}, {ny_global}, {nx_global})")
-        print(f"[DEBUG rank {rank}] physical z=[{z_min_rank:.4f}, {z_max_rank:.4f}]")
     
-    # Strategy: Try loading full data first (much faster if it fits in memory)
-    # Fall back to slab loading if OOM or if forced by user
-    use_slab_loading = force_slab_loading
-    full_data = None
-    
-    if not use_slab_loading:
-        try:
-            if debug and rank == 0:
-                print(f"[DEBUG rank {rank}] Attempting to load full domain data...")
-            
-            # Try loading full domain on all ranks
-            if strat_flag:
-                z_min_with_skip = ad.x3min + skip
-                z_max_with_skip = ad.x3max - skip
-                full_data = ad.get_refined_data_mb(var, xyz=[ad.x1min, ad.x1max, ad.x2min, ad.x2max,
-                                                              z_min_with_skip, z_max_with_skip])
-                n_hamming = full_data.shape[0]
-                hamming_filter = np.asarray(hamming(n_hamming)) / np.sqrt(np.sum(hamming(n_hamming))/n_hamming)
-                full_data = full_data * hamming_filter[:, np.newaxis, np.newaxis]
-            else:
-                # use_mpi_gather=True: each rank needs the FULL domain data for manual slicing
-                # MPI will gather contributions from all ranks to create complete domain
-                full_data = ad.get_refined_data_mb(var, use_mpi_gather=True)  # Load full domain
-            
-            if debug and rank == 0:
-                print(f"[DEBUG rank {rank}] Successfully loaded full data, shape: {full_data.shape}")
-                
-        except (MemoryError, RuntimeError) as e:
-            if debug and rank == 0:
-                print(f"[DEBUG rank {rank}] Full data loading failed ({e}), falling back to slab loading")
-            use_slab_loading = True
-            full_data = None
-    
-    # Process data based on loading strategy
-    if full_data is not None:
-        if debug and rank == 0:
-            print(f"[DEBUG rank {rank}] Using full data path with manual slicing")
-        
-        local_data = full_data[z_start_idx:z_end_idx, :, :]
-        
-    else:
-        # No slab-loading fallback is implemented for when full-domain
-        # loading fails (MemoryError/RuntimeError) -- fail loudly instead.
-        raise RuntimeError(
-            f"[rank {rank}] Full-domain data loading failed for '{var}' and the "
-            "MPI slab-loading fallback in get_spectrum_mb_mpi is not implemented. "
-            "Reduce the domain size per rank or increase available memory."
-        )
-    
+    local_data = full_data[z_start_idx:z_end_idx, :, :]
     
     if debug:
         print(f"[DEBUG rank {rank}] Loaded data shape: {local_data.shape}")
@@ -495,6 +481,7 @@ def get_spectrum_mb_mpi(ad, var, mpi_manager, strat_flag=False, skip=0.0, nbins=
         print(f"[DEBUG rank {rank}] Gathering 2D FFT results from all ranks...")
     
     # Prepare receive buffer - need to know sizes from each rank
+    # Counts/displacements are C ints in MPI: see the 2**31 limit in the docstring.
     recvcounts = comm.allgather(local_nz * ny_global * nx_global)
     
     # Flatten for communication
@@ -667,31 +654,6 @@ def get_spectrum_helmholtz(ad, var='vel', strat_flag=False, skip=0.0, nbins=200,
         The solenoidal spectral density values.
     
     """
-    if(strat_flag==False):
-        nz, ny, nx = dims = xp.array([ad.Nx3,ad.Nx2,ad.Nx1])
-        L = xp.array([(ad.x1max-ad.x1min),(ad.x2max-ad.x2min),(ad.x3max-ad.x3min)])
-    else:
-        # set z direction stuff sizes same as y direction stuff
-        nz, ny, nx = dims = xp.asarray([int(xp.abs(ad.Nx3*(ad.x3max-ad.x3min-skip*2)/(ad.x3max-ad.x3min))),ad.Nx2,ad.Nx1])
-        L = xp.array([(ad.x1max-ad.x1min),(ad.x2max-ad.x2min),(ad.x3max-ad.x3min-skip*2)])
-    
-    kx = xp.fft.fftfreq(nx) * nx / L[0]
-    ky = xp.fft.fftfreq(ny) * ny / L[1]
-    kz = xp.fft.fftfreq(nz) * nz / L[2]
-    kmax = xp.min(dims / L)
-
-    if log_bin_flag:
-        kmin = 0.25 * xp.min(1.0 / L)
-        kbins = xp.logspace(xp.log10(kmin), xp.log10(kmax), nbins + 1)
-        k_ = xp.sqrt(kbins[:-1] * kbins[1:])
-    else:
-        kmin = 0.0
-        kbins = xp.linspace(kmin, kmax + kmin, nbins)
-        k_ = 0.5 * (kbins[:-1] + kbins[1:])
-
-    kz3d, ky3d, kx3d = xp.meshgrid(kz, ky, kx, indexing="ij")
-    k = xp.sqrt(kx3d ** 2 + ky3d ** 2 + kz3d ** 2)
-    kbins = xp.array(kbins)
     varl=[var+'x', var+'y', var+'z']
 
     if(strat_flag==False):
@@ -699,12 +661,19 @@ def get_spectrum_helmholtz(ad, var='vel', strat_flag=False, skip=0.0, nbins=200,
         real_data_y = ad.get_refined_data(varl[1])
         real_data_z = ad.get_refined_data(varl[2])
     else:
-        real_data_x = ad.get_refined_data(varl[0], xyz=[ad.x1min,ad.x1max,ad.x2min,ad.x2max,ad.x3min+skip,ad.x3max-skip])
-        n_hamming=real_data_x.shape[0]
-        hamming_filter=xp.asarray(hamming(n_hamming))/xp.sqrt(xp.sum(hamming(n_hamming))/n_hamming)
+        xyz = _strat_xyz(ad, skip)
+        real_data_x = ad.get_refined_data(varl[0], xyz=xyz)
+        hamming_filter = xp.asarray(_hamming_window(real_data_x.shape[0]))
         real_data_x = real_data_x*hamming_filter[:,xp.newaxis,xp.newaxis]
-        real_data_y = ad.get_refined_data(varl[1], xyz=[ad.x1min,ad.x1max,ad.x2min,ad.x2max,ad.x3min+skip,ad.x3max-skip])*hamming_filter[:,xp.newaxis,xp.newaxis]
-        real_data_z = ad.get_refined_data(varl[2], xyz=[ad.x1min,ad.x1max,ad.x2min,ad.x2max,ad.x3min+skip,ad.x3max-skip])*hamming_filter[:,xp.newaxis,xp.newaxis]
+        real_data_y = ad.get_refined_data(varl[1], xyz=xyz)*hamming_filter[:,xp.newaxis,xp.newaxis]
+        real_data_z = ad.get_refined_data(varl[2], xyz=xyz)*hamming_filter[:,xp.newaxis,xp.newaxis]
+
+    nz, ny, nx = real_data_x.shape
+    kx, ky, kz, kbins, k_ = _spectral_grid(ad, real_data_x.shape, nbins, log_bin_flag)
+    kz3d, ky3d, kx3d = xp.meshgrid(xp.asarray(kz), xp.asarray(ky), xp.asarray(kx), indexing="ij")
+    k = xp.sqrt(kx3d ** 2 + ky3d ** 2 + kz3d ** 2)
+    kbins = xp.array(kbins)
+    k_ = xp.asarray(k_)
     
     data_x_k = xp.fft.fftn(real_data_x)
     data_x_k = data_x_k/xp.sqrt(nx*ny*nz)
@@ -715,11 +684,8 @@ def get_spectrum_helmholtz(ad, var='vel', strat_flag=False, skip=0.0, nbins=200,
     data_z_k = xp.fft.fftn(real_data_z)
     data_z_k = data_z_k/xp.sqrt(nx*ny*nz)
 
-    kdotv = (kx3d*data_x_k + ky3d*data_y_k + kz3d*data_z_k)
-
-    data_x_k_comp = kdotv*kx3d/(k**2+1e-16)
-    data_y_k_comp = kdotv*ky3d/(k**2+1e-16)
-    data_z_k_comp = kdotv*kz3d/(k**2+1e-16)
+    data_x_k_comp, data_y_k_comp, data_z_k_comp = _compressive_part(
+        kx3d, ky3d, kz3d, k**2, data_x_k, data_y_k, data_z_k)
     
     data_x_k_sol = data_x_k - data_x_k_comp
     data_y_k_sol = data_y_k - data_y_k_comp
@@ -776,31 +742,6 @@ def get_spectrum_helmholtz_mb(ad, var, strat_flag=False, skip=0.0, nbins=200,
     E_spectral_density_sol : ndarray
         The energy spectral density of the solenoidal component in each bin (energy per bin count).
     """
-    if(strat_flag==False):
-        nz, ny, nx = dims = np.array([ad.Nx3,ad.Nx2,ad.Nx1])
-        L = np.array([(ad.x1max-ad.x1min),(ad.x2max-ad.x2min),(ad.x3max-ad.x3min)])
-    else:
-        # set z direction stuff sizes same as y direction stuff
-        nz, ny, nx = dims = np.asarray([int(np.abs(ad.Nx3*(ad.x3max-ad.x3min-skip*2)/(ad.x3max-ad.x3min))),ad.Nx2,ad.Nx1])
-        L = np.array([(ad.x1max-ad.x1min),(ad.x2max-ad.x2min),(ad.x3max-ad.x3min-skip*2)])
-    
-    kx = np.fft.fftfreq(nx) * nx / L[0]
-    ky = np.fft.fftfreq(ny) * ny / L[1]
-    kz = np.fft.fftfreq(nz) * nz / L[2]
-    kmax = np.min(dims / L)
-    
-    if log_bin_flag:
-        kmin = 0.25 * np.min(1.0 / L)
-        kbins = np.logspace(np.log10(kmin), np.log10(kmax), nbins + 1)
-        k_ = np.sqrt(kbins[:-1] * kbins[1:])
-    else:
-        kmin = 0.0
-        kbins = np.linspace(kmin, kmax + kmin, nbins)
-        k_ = 0.5 * (kbins[:-1] + kbins[1:])
-
-    kz3d, ky3d, kx3d = np.meshgrid(kz, ky, kx, indexing="ij")
-    k = np.sqrt(kx3d ** 2 + ky3d ** 2 + kz3d ** 2)
-    kbins = xp.array(kbins)
     varl=[var+'x', var+'y', var+'z']
 
     if(strat_flag==False):
@@ -808,36 +749,36 @@ def get_spectrum_helmholtz_mb(ad, var, strat_flag=False, skip=0.0, nbins=200,
         real_data_y = ad.get_refined_data_mb(varl[1])
         real_data_z = ad.get_refined_data_mb(varl[2])
     else:
-        real_data_x = ad.get_refined_data_mb(varl[0], xyz=[ad.x1min,ad.x1max,ad.x2min,ad.x2max,ad.x3min+skip,ad.x3max-skip])
-        n_hamming=real_data_x.shape[0]
-        hamming_filter=np.asarray(hamming(n_hamming))/np.sqrt(np.sum(hamming(n_hamming))/n_hamming)
+        xyz = _strat_xyz(ad, skip)
+        real_data_x = ad.get_refined_data_mb(varl[0], xyz=xyz)
+        hamming_filter = _hamming_window(real_data_x.shape[0])
         real_data_x = real_data_x*hamming_filter[:,np.newaxis,np.newaxis]
-        real_data_y = ad.get_refined_data_mb(varl[1], xyz=[ad.x1min,ad.x1max,ad.x2min,ad.x2max,ad.x3min+skip,ad.x3max-skip])*hamming_filter[:,np.newaxis,np.newaxis]
-        real_data_z = ad.get_refined_data_mb(varl[2], xyz=[ad.x1min,ad.x1max,ad.x2min,ad.x2max,ad.x3min+skip,ad.x3max-skip])*hamming_filter[:,np.newaxis,np.newaxis]
+        real_data_y = ad.get_refined_data_mb(varl[1], xyz=xyz)*hamming_filter[:,np.newaxis,np.newaxis]
+        real_data_z = ad.get_refined_data_mb(varl[2], xyz=xyz)*hamming_filter[:,np.newaxis,np.newaxis]
+
+    nz, ny, nx = real_data_x.shape
+    kx, ky, kz, kbins, k_ = _spectral_grid(ad, real_data_x.shape, nbins, log_bin_flag)
+    kz3d, ky3d, kx3d = np.meshgrid(kz, ky, kx, indexing="ij")
+    k = np.sqrt(kx3d ** 2 + ky3d ** 2 + kz3d ** 2)
+    kbins = xp.array(kbins)
+
     if(ndiv is None):
         ntot_cells = ad.Nx1 * ad.Nx2 * ad.Nx3
         if(ntot_cells > 512**3):
             ndiv = int(max( 4, ntot_cells * 3 // 512**3))
         else:
             ndiv = 4 # default value
-    ndiv_ = ndiv
-    if(nz % ndiv != 0):
-        ndiv_ = ndiv+1
-    local_nz = nz // ndiv
     
-    comp_spectrum_mb = xp.zeros(nbins-1)
-    sol_spectrum_mb = xp.zeros(nbins-1)
-    spectrum_bins_mb = xp.zeros(nbins-1)
+    comp_spectrum_mb = xp.zeros(len(kbins)-1)
+    sol_spectrum_mb = xp.zeros(len(kbins)-1)
+    spectrum_bins_mb = xp.zeros(len(kbins)-1)
     
     # Step 1: 2D FFTs along x and y for each z-slab
     partial_results_x = []
     partial_results_y = []
     partial_results_z = []
 
-    for slab_id in range(ndiv_):
-        start_z = slab_id * local_nz
-        end_z = min(start_z + local_nz, nz)
-        
+    for start_z, end_z in _slab_bounds(nz, ndiv):
         # Extract slabs - keeping original axis order [z, y, x]
         slab_x = xp.array(real_data_x[start_z:end_z, :, :])  # Shape: (slab_z, y, x)
         slab_y = xp.array(real_data_y[start_z:end_z, :, :])
@@ -870,13 +811,8 @@ def get_spectrum_helmholtz_mb(ad, var, strat_flag=False, skip=0.0, nbins=200,
     ky3d_transpose = np.transpose(ky3d, (1, 2, 0))
     kz3d_transpose = np.transpose(kz3d, (1, 2, 0))
 
-    # Step 4: FFT along z-direction with proper boundary handling
-    local_ny = ny // ndiv
-
-    for slab_id in range(ndiv_):
-        start_y = slab_id * local_ny
-        end_y = min(start_y + local_ny, ny)  # Ensure we don't exceed ny
-        
+    # Step 4: FFT along z-direction
+    for start_y, end_y in _slab_bounds(ny, ndiv):
         slab_x = xp.array(data_x_transpose[start_y:end_y, :, :])
         slab_y = xp.array(data_y_transpose[start_y:end_y, :, :])
         slab_z = xp.array(data_z_transpose[start_y:end_y, :, :])
@@ -890,12 +826,9 @@ def get_spectrum_helmholtz_mb(ad, var, strat_flag=False, skip=0.0, nbins=200,
         data_y_k_slab = xp.fft.fft(slab_y, axis=2) / xp.sqrt(nx * ny * nz)
         data_z_k_slab = xp.fft.fft(slab_z, axis=2) / xp.sqrt(nx * ny * nz)
         
-        # All arrays now have the same shape, proceed with Helmholtz decomposition
-        kdotv_slab = (kx3d_slab*data_x_k_slab + ky3d_slab*data_y_k_slab + kz3d_slab*data_z_k_slab)
-        
-        data_x_k_comp_slab = kdotv_slab*kx3d_slab/(k_slab**2+1e-16)  
-        data_y_k_comp_slab = kdotv_slab*ky3d_slab/(k_slab**2+1e-16)
-        data_z_k_comp_slab = kdotv_slab*kz3d_slab/(k_slab**2+1e-16)
+        data_x_k_comp_slab, data_y_k_comp_slab, data_z_k_comp_slab = _compressive_part(
+            kx3d_slab, ky3d_slab, kz3d_slab, k_slab**2,
+            data_x_k_slab, data_y_k_slab, data_z_k_slab)
         
         data_x_k_sol_slab = data_x_k_slab - data_x_k_comp_slab
         data_y_k_sol_slab = data_y_k_slab - data_y_k_comp_slab
@@ -904,13 +837,9 @@ def get_spectrum_helmholtz_mb(ad, var, strat_flag=False, skip=0.0, nbins=200,
         Kk_comp_slab = xp.abs(data_x_k_comp_slab)**2 + xp.abs(data_y_k_comp_slab)**2 + xp.abs(data_z_k_comp_slab)**2
         Kk_sol_slab  = xp.abs(data_x_k_sol_slab)**2  + xp.abs(data_y_k_sol_slab)**2  + xp.abs(data_z_k_sol_slab) **2
         
-        spectrum_comp = xp.histogram(k_slab,bins=kbins,weights=Kk_comp_slab,density=False)[0]
-        spectrum_sol = xp.histogram(k_slab,bins=kbins,weights=Kk_sol_slab,density=False)[0]
-        spectrum_bins = xp.histogram(k_slab,bins=kbins,density=False)[0]
-        
-        comp_spectrum_mb += spectrum_comp
-        sol_spectrum_mb += spectrum_sol
-        spectrum_bins_mb += spectrum_bins
+        comp_spectrum_mb += xp.histogram(k_slab,bins=kbins,weights=Kk_comp_slab,density=False)[0]
+        sol_spectrum_mb += xp.histogram(k_slab,bins=kbins,weights=Kk_sol_slab,density=False)[0]
+        spectrum_bins_mb += xp.histogram(k_slab,bins=kbins,density=False)[0]
         
     E_spectrum_comp = comp_spectrum_mb
     E_spectrum_sol = sol_spectrum_mb
@@ -969,37 +898,38 @@ def get_spectrum_helmholtz_mb_mpi(ad, var, mpi_manager, strat_flag=False, skip=0
         Compressive spectral density
     E_spectral_density_sol : array
         Solenoidal spectral density
+
+    Notes
+    -----
+    The gather of the 2D-transformed field passes per-rank element counts and
+    displacements to MPI as C ints. They overflow once a count or offset
+    exceeds 2**31 - 1 elements (e.g. N=2048^3 = 8.6e9 complex values), so this
+    path is limited to grids below that size until the gather is chunked or
+    switched to a derived datatype.
     """
     rank = mpi_manager.rank
     size = mpi_manager.size
     comm = mpi_manager.comm
     
-    # Get global domain parameters
-    if strat_flag:
-        nz_global = int(np.abs(ad.Nx3*(ad.x3max-ad.x3min-skip*2)/(ad.x3max-ad.x3min)))
-        ny_global, nx_global = ad.Nx2, ad.Nx1
-        L = np.array([(ad.x1max-ad.x1min), (ad.x2max-ad.x2min), (ad.x3max-ad.x3min-skip*2)])
-    else:
-        nz_global, ny_global, nx_global = ad.Nx3, ad.Nx2, ad.Nx1
-        L = np.array([(ad.x1max-ad.x1min), (ad.x2max-ad.x2min), (ad.x3max-ad.x3min)])
-    
-    dims = np.array([nz_global, ny_global, nx_global])
     varl = [var+'x', var+'y', var+'z']
-    
-    # Setup k-space
-    kx = np.fft.fftfreq(nx_global) * nx_global / L[0]
-    ky = np.fft.fftfreq(ny_global) * ny_global / L[1]
-    kz = np.fft.fftfreq(nz_global) * nz_global / L[2]
-    kmax = np.min(dims / L)
-    
-    if log_bin_flag:
-        kmin = 0.25 * np.min(1.0 / L)
-        kbins = np.logspace(np.log10(kmin), np.log10(kmax), nbins + 1)
-        k_ = np.sqrt(kbins[:-1] * kbins[1:])
+
+    # Load full data with MPI gather (faster than slab loading)
+    if strat_flag:
+        xyz = _strat_xyz(ad, skip)
+        full_data_x = ad.get_refined_data_mb(varl[0], xyz=xyz)
+        hamming_filter = _hamming_window(full_data_x.shape[0])
+        full_data_x = full_data_x * hamming_filter[:, np.newaxis, np.newaxis]
+        full_data_y = ad.get_refined_data_mb(varl[1], xyz=xyz)
+        full_data_y = full_data_y * hamming_filter[:, np.newaxis, np.newaxis]
+        full_data_z = ad.get_refined_data_mb(varl[2], xyz=xyz)
+        full_data_z = full_data_z * hamming_filter[:, np.newaxis, np.newaxis]
     else:
-        kmin = 0.0
-        kbins = np.linspace(kmin, kmax + kmin, nbins)
-        k_ = 0.5 * (kbins[:-1] + kbins[1:])
+        full_data_x = ad.get_refined_data_mb(varl[0], use_mpi_gather=True)
+        full_data_y = ad.get_refined_data_mb(varl[1], use_mpi_gather=True)
+        full_data_z = ad.get_refined_data_mb(varl[2], use_mpi_gather=True)
+
+    nz_global, ny_global, nx_global = full_data_x.shape
+    kx, ky, kz, kbins, k_ = _spectral_grid(ad, full_data_x.shape, nbins, log_bin_flag)
     
     # Create k-space grids
     kz3d, ky3d, kx3d = np.meshgrid(kz, ky, kx, indexing="ij")
@@ -1017,26 +947,6 @@ def get_spectrum_helmholtz_mb_mpi(ad, var, mpi_manager, strat_flag=False, skip=0
     
     if debug:
         print(f"[DEBUG rank {rank}] z_slice=[{z_start_idx}:{z_end_idx}], shape=({local_nz},{ny_global},{nx_global})")
-    
-    # Load full data with MPI gather (faster than slab loading)
-    if strat_flag:
-        z_min_skip = ad.x3min + skip
-        z_max_skip = ad.x3max - skip
-        full_data_x = ad.get_refined_data_mb(varl[0], xyz=[ad.x1min, ad.x1max, ad.x2min, ad.x2max,
-                                                           z_min_skip, z_max_skip])
-        n_hamming = full_data_x.shape[0]
-        hamming_filter = np.asarray(hamming(n_hamming)) / np.sqrt(np.sum(hamming(n_hamming))/n_hamming)
-        full_data_x = full_data_x * hamming_filter[:, np.newaxis, np.newaxis]
-        full_data_y = ad.get_refined_data_mb(varl[1], xyz=[ad.x1min, ad.x1max, ad.x2min, ad.x2max,
-                                                           z_min_skip, z_max_skip])
-        full_data_y = full_data_y * hamming_filter[:, np.newaxis, np.newaxis]
-        full_data_z = ad.get_refined_data_mb(varl[2], xyz=[ad.x1min, ad.x1max, ad.x2min, ad.x2max,
-                                                           z_min_skip, z_max_skip])
-        full_data_z = full_data_z * hamming_filter[:, np.newaxis, np.newaxis]
-    else:
-        full_data_x = ad.get_refined_data_mb(varl[0], use_mpi_gather=True)
-        full_data_y = ad.get_refined_data_mb(varl[1], use_mpi_gather=True)
-        full_data_z = ad.get_refined_data_mb(varl[2], use_mpi_gather=True)
     
     # Each rank slices its portion
     local_data_x = full_data_x[z_start_idx:z_end_idx, :, :]
@@ -1102,11 +1012,8 @@ def get_spectrum_helmholtz_mb_mpi(ad, var, mpi_manager, strat_flag=False, skip=0
         kz3d_xp = xp.array(kz3d_transpose)
         
         # Helmholtz decomposition
-        kdotv = (kx3d_xp*data_x_k + ky3d_xp*data_y_k + kz3d_xp*data_z_k)
-        
-        data_x_k_comp = kdotv*kx3d_xp/(k_xp**2+1e-16)
-        data_y_k_comp = kdotv*ky3d_xp/(k_xp**2+1e-16)
-        data_z_k_comp = kdotv*kz3d_xp/(k_xp**2+1e-16)
+        data_x_k_comp, data_y_k_comp, data_z_k_comp = _compressive_part(
+            kx3d_xp, ky3d_xp, kz3d_xp, k_xp**2, data_x_k, data_y_k, data_z_k)
         
         data_x_k_sol = data_x_k - data_x_k_comp
         data_y_k_sol = data_y_k - data_y_k_comp
@@ -1139,6 +1046,28 @@ def get_spectrum_helmholtz_mb_mpi(ad, var, mpi_manager, strat_flag=False, skip=0
     
     return k_, kbins, nk, E_spectrum_comp, E_spectrum_sol, E_spectral_density_comp, E_spectral_density_sol
 
+_SPECTRUM_DEFAULTS = {'strat_flag': False, 'skip': 0.0, 'nbins': 256,
+                      'log_bin_flag': False, 'weight_name': 'ones'}
+_HELMHOLTZ_DEFAULTS = {'strat_flag': False, 'skip': 0.0, 'nbins': 200,
+                       'log_bin_flag': False}
+# Arguments that change how a spectrum is computed but not its value.
+_EXECUTION_KWARGS = ('ndiv', 'debug', 'force_slab_loading')
+
+
+def _spectrum_settings(kind, kwargs):
+    """Settings that determine a cached ad.spectra entry, defaults filled in."""
+    settings = dict(_SPECTRUM_DEFAULTS if kind == 'scalar' else _HELMHOLTZ_DEFAULTS)
+    settings.update({k: v for k, v in kwargs.items() if k not in _EXECUTION_KWARGS})
+    settings['kind'] = kind
+    return settings
+
+
+def _has_cached_spectrum(ad, var, settings):
+    """True if ad.spectra[var] was computed with exactly these settings."""
+    entry = ad.spectra.get(var)
+    return isinstance(entry, dict) and entry.get('settings') == settings
+
+
 def set_spectrum(ad, varl, redo=False, auto_select=True, use_mpi=False, verbose=True, **kwargs):
     """
     Calculate and store power spectra for given variables with optional MPI parallelization.
@@ -1163,7 +1092,9 @@ def set_spectrum(ad, varl, redo=False, auto_select=True, use_mpi=False, verbose=
     Returns
     -------
     dict
-        Dictionary of calculated spectra
+        Dictionary of calculated spectra. Each entry records the settings it
+        was computed with under 'settings'; an entry computed with different
+        settings (or by set_spectrum_helmholtz) is recomputed, not reused.
     """
     # Initialize MPI if requested
     mpi_manager = None
@@ -1195,9 +1126,11 @@ def set_spectrum(ad, varl, redo=False, auto_select=True, use_mpi=False, verbose=
         if rank == 0 and verbose:
             print(f"Memory-based selection: Using {'memory-efficient' if use_mb_method else 'standard'} method for spectrum calculation")
     
+    settings = _spectrum_settings('scalar', kwargs)
+
     # Process each variable
     for var in varl:
-        if (redo or var not in ad.spectra):
+        if (redo or not _has_cached_spectrum(ad, var, settings)):
             try:
                 if rank == 0 and verbose:
                     print(f"Calculating spectrum for {var}...")
@@ -1221,12 +1154,17 @@ def set_spectrum(ad, varl, redo=False, auto_select=True, use_mpi=False, verbose=
                     'nk': asnumpy(nk),
                     'spectrum': asnumpy(spectrum),
                     'spect_dens': asnumpy(E_spectral_density),
-                    'spect_norm': asnumpy(E_spectrum_norm)
+                    'spect_norm': asnumpy(E_spectrum_norm),
+                    'settings': dict(settings),
                 }
                 if rank == 0 and verbose:
                     print(f"Spectrum calculation for {var} successful")
             except Exception as e:
                 print(f"Error calculating spectrum for {var}: {e}")
+                if mpi_manager is not None:
+                    # The single-process fallbacks would only see this rank's
+                    # blocks and store a rank-local spectrum.
+                    raise
                 # Try the other method as a fallback
                 try:
                     print(f"Trying alternate method for {var}...")
@@ -1242,7 +1180,8 @@ def set_spectrum(ad, varl, redo=False, auto_select=True, use_mpi=False, verbose=
                         'nk': asnumpy(nk),
                         'spectrum': asnumpy(spectrum),
                         'spect_dens': asnumpy(E_spectral_density),
-                        'spect_norm': asnumpy(E_spectrum_norm)
+                        'spect_norm': asnumpy(E_spectrum_norm),
+                        'settings': dict(settings),
                     }
                     print(f"Alternate method for {var} successful")
                 except Exception as e2:
@@ -1283,7 +1222,8 @@ def set_spectrum_helmholtz(ad, var, redo=False, auto_select=True, use_mpi=False,
     Returns
     -------
     dict
-        Updated spectra dictionary
+        Updated spectra dictionary. The entry is keyed by ``var`` and records
+        its settings under 'settings' (see set_spectrum).
     """
     # Initialize MPI if requested
     mpi_manager = None
@@ -1312,7 +1252,9 @@ def set_spectrum_helmholtz(ad, var, redo=False, auto_select=True, use_mpi=False,
     if rank == 0 and verbose:
         print(f"Memory-based selection: Using {'memory-efficient' if use_mb_method else 'standard'} method for Helmholtz spectrum calculation")
     
-    if (redo or var not in ad.spectra.keys()):
+    settings = _spectrum_settings('helmholtz', kwargs)
+
+    if (redo or not _has_cached_spectrum(ad, var, settings)):
         try:
             if rank == 0 and verbose:
                 print(f"Calculating Helmholtz spectrum for {var}...")
@@ -1337,12 +1279,17 @@ def set_spectrum_helmholtz(ad, var, redo=False, auto_select=True, use_mpi=False,
                 'spectrum_sol': asnumpy(spectrum_sol),
                 'spectrum_comp': asnumpy(spectrum_comp),
                 'spect_dens_sol': asnumpy(E_spectral_density_sol),
-                'spect_dens_comp': asnumpy(E_spectral_density_comp)
+                'spect_dens_comp': asnumpy(E_spectral_density_comp),
+                'settings': dict(settings),
             }
             if rank == 0 and verbose:
                 print(f"Helmholtz spectrum calculation for {var} successful")
         except Exception as e:
             print(f"Error calculating Helmholtz spectrum for {var}: {e}")
+            if mpi_manager is not None:
+                # The single-process fallbacks would only see this rank's
+                # blocks and store a rank-local spectrum.
+                raise
             # Try the other method as a fallback
             try:
                 if rank == 0:
@@ -1360,7 +1307,8 @@ def set_spectrum_helmholtz(ad, var, redo=False, auto_select=True, use_mpi=False,
                     'spectrum_sol': asnumpy(spectrum_sol),
                     'spectrum_comp': asnumpy(spectrum_comp),
                     'spect_dens_sol': asnumpy(E_spectral_density_sol),
-                    'spect_dens_comp': asnumpy(E_spectral_density_comp)
+                    'spect_dens_comp': asnumpy(E_spectral_density_comp),
+                    'settings': dict(settings),
                 }
                 print(f"Alternate method for {var} Helmholtz spectrum successful")
             except Exception as e2:

@@ -7,6 +7,7 @@ and other weighted projections along any specified Cartesian axis.
 
 import numpy as np
 from scipy.ndimage import gaussian_filter
+from ..core.base import xp
 from ..operations.histograms import set_dist2d
 from scipy.signal import windows
 
@@ -35,8 +36,9 @@ def create_weighted_projection(ad, variable, weight_type, axis='x', smooth_sigma
     window_type : str
         Type of window function to apply ('hamming', 'hanning', 'blackman', 'kaiser')
     redo : bool
-        If False and no filters are requested, try to recover existing projection 
-        from ad.dist2d before computing. If True, always recompute.
+        If False, try to recover an existing projection (computed with the
+        same window settings) from ad.dist2d before computing. Smoothing is
+        applied after recovery. If True, always recompute.
     debug : bool
         If True, print debug information about projection recovery and computation.
         Default is False.
@@ -70,6 +72,7 @@ def create_weighted_projection(ad, variable, weight_type, axis='x', smooth_sigma
     temp_proj = create_weighted_projection(ad, 'temp', 'mass', axis='x', smooth_sigma=1.0)
     """
     # Determine the coordinate variables based on projection axis
+    extent = {'x': (ad.x1min, ad.x1max), 'y': (ad.x2min, ad.x2max), 'z': (ad.x3min, ad.x3max)}
     if axis == 'x':
         coords = ['y', 'z']
         Nx, Ny = ad.Nx2, ad.Nx3
@@ -84,16 +87,22 @@ def create_weighted_projection(ad, variable, weight_type, axis='x', smooth_sigma
         axis_size = ad.Nx3
     else:
         raise ValueError(f"Invalid projection axis: {axis}. Must be 'x', 'y', or 'z'.")
+    # Numerator and denominator must share one pixel grid. Taking it from the
+    # domain extent (not the data support, which depends on where var*weight
+    # is nonzero) keeps them identical and aligns pixels with root-level cells.
+    pixel_range = [extent[coords[0]], extent[coords[1]]]
+
+    # The window changes the stored histograms, so it is part of the cache
+    # key; smoothing is applied afterwards and is not.
+    window_tag = f"_win{window_type}" if apply_window else ""
+    weighted_key = f"{coords[0]}_{coords[1]}_{variable}_{weight_type}{window_tag}_weighted"
+    norm_key = f"{coords[0]}_{coords[1]}_{variable}_{weight_type}{window_tag}_norm"
     
-    # Check if we can recover existing projection when redo=False and no filters
-    if not redo and smooth_sigma is None and not apply_window:
+    # Check if we can recover existing projection when redo=False
+    if not redo:
         # Initialize dist2d storage if it doesn't exist
         if not hasattr(ad, 'dist2d'):
             ad.dist2d = {}
-        
-        # Check if projections already exist with variable and weight type info
-        weighted_key = f"{coords[0]}_{coords[1]}_{variable}_{weight_type}_weighted"
-        norm_key = f"{coords[0]}_{coords[1]}_{variable}_{weight_type}_norm"
         
         # Debug: print what keys exist and what we're looking for
         if debug:
@@ -111,7 +120,9 @@ def create_weighted_projection(ad, variable, weight_type, axis='x', smooth_sigma
             mask = norm_data > 0
             result = np.zeros_like(weighted_data)
             result[mask] = weighted_data[mask] / norm_data[mask]
-            
+
+            if smooth_sigma is not None and smooth_sigma > 0:
+                result = gaussian_filter(result, sigma=smooth_sigma)
             return result
         else:
             if debug:
@@ -133,46 +144,35 @@ def create_weighted_projection(ad, variable, weight_type, axis='x', smooth_sigma
         
         # Normalize window
         window = window / np.sqrt(np.sum(window) / axis_size)
-        window_data = window
+        window_data = xp.asarray(window)
+
+    def windowed(self, arr, mbl, mbh):
+        # Data arrive per meshblock, so the window is looked up from each
+        # cell's global coordinate along the projection axis, not broadcast
+        # against the local array shape.
+        if window_data is None:
+            return arr
+        lo, hi = extent[axis]
+        idx = xp.floor((self.data(axis, mbl, mbh) - lo) / (hi - lo) * axis_size).astype(xp.int64)
+        idx = xp.clip(idx, 0, axis_size - 1)
+        return arr * window_data[idx]
     
     # Create the weighted variable function
-    weighted_var_name = f"{variable}_{weight_type}_{axis}proj"
+    weighted_var_name = f"{variable}_{weight_type}{window_tag}_{axis}proj"
     
     # Define the weighted variable function
     def weighted_var(self, mbl=None, mbh=None):
         var_data = self.data(variable, mbl, mbh)
         weight_data = self.data(weight_type, mbl, mbh)
-        result = var_data * weight_data
-        
-        # Apply window function if provided
-        if window_data is not None:
-            if axis == 'x':
-                result = result * window_data[np.newaxis, np.newaxis, :]
-            elif axis == 'y':
-                result = result * window_data[np.newaxis, :, np.newaxis]
-            elif axis == 'z':
-                result = result * window_data[:, np.newaxis, np.newaxis]
-        
-        return result
+        return windowed(self, var_data * weight_data, mbl, mbh)
     
     # Define the weight function with window if needed
     def weight_func(self, mbl=None, mbh=None):
-        weight_data = self.data(weight_type, mbl, mbh)
-        
-        # Apply window function if provided
-        if window_data is not None:
-            if axis == 'x':
-                weight_data = weight_data * window_data[np.newaxis, np.newaxis, :]
-            elif axis == 'y':
-                weight_data = weight_data * window_data[np.newaxis, :, np.newaxis]
-            elif axis == 'z':
-                weight_data = weight_data * window_data[:, np.newaxis, np.newaxis]
-        
-        return weight_data
+        return windowed(self, self.data(weight_type, mbl, mbh), mbl, mbh)
     
     # Add the custom functions to ad
     ad.add_data_func(weighted_var_name, weighted_var)
-    weight_func_name = f"{weight_type}_{axis}_window"
+    weight_func_name = f"{weight_type}{window_tag}_{axis}_window"
     if apply_window:
         ad.add_data_func(weight_func_name, weight_func)
     
@@ -194,7 +194,8 @@ def create_weighted_projection(ad, variable, weight_type, axis='x', smooth_sigma
         scales=['lin', 'lin'],
         redo=redo,
         weightnorm=False,
-        varsuf=f"_{variable}_{weight_type}_weighted",
+        pdf_range=pixel_range,
+        varsuf=f"_{variable}_{weight_type}{window_tag}_weighted",
         use_mpi=use_mpi,
         debug=debug
     )
@@ -209,15 +210,13 @@ def create_weighted_projection(ad, variable, weight_type, axis='x', smooth_sigma
         scales=['lin', 'lin'],
         redo=redo,
         weightnorm=False,
-        varsuf=f"_{variable}_{weight_type}_norm",
+        pdf_range=pixel_range,
+        varsuf=f"_{variable}_{weight_type}{window_tag}_norm",
         use_mpi=use_mpi,
         debug=debug
     )
     
     # Get the weighted data and normalization
-    weighted_key = f"{coords[0]}_{coords[1]}_{variable}_{weight_type}_weighted"
-    norm_key = f"{coords[0]}_{coords[1]}_{variable}_{weight_type}_norm"
-    
     if debug:
         print(f"[DEBUG] Looking for keys: weighted_key='{weighted_key}', norm_key='{norm_key}'")
         print(f"[DEBUG] Available keys in ad.dist2d: {list(ad.dist2d.keys())}")

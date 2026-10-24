@@ -268,14 +268,83 @@ bool test_interior(signed char s, Cube cube, signed char _case,
   return s<0;
 }
 
+// Edge test for the interior vertex of tiling entry 12.  Pass 0 is the strict
+// sign change of the reference implementation; pass 1 is the classification
+// process_cube uses (v < 0 is inside), which also counts an edge whose
+// non-negative endpoint lies exactly on the iso level.
+KOKKOS_INLINE_FUNCTION
+bool interior_edge_crosses(Real a, Real b, int pass) {
+  return (pass == 0) ? (a*b < 0) : ((a < 0) != (b < 0));
+}
+
+// Interior vertex of tiling entry 12: the mean of the iso crossings on the
+// cube edges.  If every crossing edge touches the iso level exactly (three
+// or more corners on the level), the strict test finds no edge and the mean
+// would be 0/0, so the classification-consistent test is used instead.  Its
+// interpolation 1/(1-b/a) stays finite because exactly one endpoint of each
+// counted edge is negative.
+KOKKOS_INLINE_FUNCTION
+void interior_vertex(Cube cube, Real &x, Real &y, Real &z) {
+  int nv = 0;
+  for (int pass = 0; pass < 2 && nv == 0; pass++) {
+    x = 0.0;
+    y = 0.0;
+    z = 0.0;
+    if (interior_edge_crosses(cube.v1, cube.v0, pass)) {
+      x += 1./(1-cube.v1/cube.v0); nv++;
+    }
+    if (interior_edge_crosses(cube.v2, cube.v1, pass)) {
+      x += 1.0; y += 1./(1-cube.v2/cube.v1); nv++;
+    }
+    if (interior_edge_crosses(cube.v2, cube.v3, pass)) {
+      x += 1./(1-cube.v2/cube.v3); y += 1.0; nv++;
+    }
+    if (interior_edge_crosses(cube.v3, cube.v0, pass)) {
+      y += 1./(1-cube.v3/cube.v0); nv++;
+    }
+    if (interior_edge_crosses(cube.v5, cube.v4, pass)) {
+      x += 1./(1-cube.v5/cube.v4); z += 1.0; nv++;
+    }
+    if (interior_edge_crosses(cube.v6, cube.v5, pass)) {
+      x += 1.0; y += 1./(1-cube.v6/cube.v5); z += 1.0; nv++;
+    }
+    if (interior_edge_crosses(cube.v6, cube.v7, pass)) {
+      x += 1./(1-cube.v6/cube.v7); y += 1.0; z += 1.0; nv++;
+    }
+    if (interior_edge_crosses(cube.v7, cube.v4, pass)) {
+      y += 1./(1-cube.v7/cube.v4); z += 1.0; nv++;
+    }
+    if (interior_edge_crosses(cube.v4, cube.v0, pass)) {
+      z += 1./(1-cube.v4/cube.v0); nv++;
+    }
+    if (interior_edge_crosses(cube.v5, cube.v1, pass)) {
+      x += 1.0; z += 1./(1-cube.v5/cube.v1); nv++;
+    }
+    if (interior_edge_crosses(cube.v6, cube.v2, pass)) {
+      x += 1.0; y += 1.0; z += 1./(1-cube.v6/cube.v2); nv++;
+    }
+    if (interior_edge_crosses(cube.v7, cube.v3, pass)) {
+      y += 1.0; z += 1./(1-cube.v7/cube.v3); nv++;
+    }
+  }
+  if (nv == 0) {
+    x = 0.5;
+    y = 0.5;
+    z = 0.5;
+    return;
+  }
+  // average the positions of edge vertices
+  x /= nv;
+  y /= nv;
+  z /= nv;
+}
+
 KOKKOS_INLINE_FUNCTION
 Real add_triangle(const char *trig, char n, Cube cube) {
   // get triangle vertices
   Real xt[3],yt[3],zt[3];
   // initialize the area
   Real area = 0.0;
-  Real xv, yv, zv;
-  int nv;
 
   for( int t = 0; t < 3*n; t++ ) {
     switch ( trig[t] ) {
@@ -340,139 +409,7 @@ Real add_triangle(const char *trig, char n, Cube cube) {
         zt[ t % 3 ] = 1./(1-cube.v7/cube.v3);
         break;
       case 12:
-        xv=0.0;
-        yv=0.0;
-        zv=0.0;
-        nv = 0;
-        for(int iv=0; iv<12; iv++) {
-          switch (iv) {
-            case  0:
-              if (cube.v1*cube.v0 < 0) {
-                xv += 1./(1-cube.v1/cube.v0);
-                yv += 0.0;
-                zv += 0.0;
-                nv++;
-                break;
-              } else {
-                break;
-              }
-            case  1:
-              if (cube.v2*cube.v1 < 0) {
-                xv += 1.0;
-                yv += 1./(1-cube.v2/cube.v1);
-                zv += 0.0;
-                nv++;
-                break;
-              } else {
-                break;
-              }
-            case  2:
-              if (cube.v2*cube.v3 < 0) {
-                xv += 1./(1-cube.v2/cube.v3);
-                yv += 1.0;
-                zv += 0.0;
-                nv++;
-                break;
-              } else {
-                break;
-              }
-            case  3:
-              if (cube.v3*cube.v0 < 0) {
-                xv += 0.0;
-                yv += 1./(1-cube.v3/cube.v0);
-                zv += 0.0;
-                nv++;
-                break;
-              } else {
-                break;
-              }
-            case  4:
-              if (cube.v5*cube.v4 < 0) {
-                xv += 1./(1-cube.v5/cube.v4);
-                yv += 0.0;
-                zv += 1.0;
-                nv++;
-                break;
-              } else {
-                break;
-              }
-              break;
-            case  5:
-              if (cube.v6*cube.v5 < 0) {
-                xv += 1.0;
-                yv += 1./(1-cube.v6/cube.v5);
-                zv += 1.0;
-                nv++;
-                break;
-              } else {
-                break;
-              }
-            case  6:
-              if (cube.v6*cube.v7 < 0) {
-                xv += 1./(1-cube.v6/cube.v7);
-                yv += 1.0;
-                zv += 1.0;
-                nv++;
-                break;
-              } else {
-                break;
-              }
-            case  7:
-              if (cube.v7*cube.v4 < 0) {
-                xv += 0.0;
-                yv += 1./(1-cube.v7/cube.v4);
-                zv += 1.0;
-                nv++;
-                break;
-              } else {
-                break;
-              }
-            case  8:
-              if (cube.v4*cube.v0 < 0) {
-                xv += 0.0;
-                yv += 0.0;
-                zv += 1./(1-cube.v4/cube.v0);
-                nv++;
-                break;
-              } else {
-                break;
-              }
-            case  9:
-              if (cube.v5*cube.v1 < 0) {
-                xv += 1.0;
-                yv += 0.0;
-                zv += 1./(1-cube.v5/cube.v1);
-                nv++;
-                break;
-              } else {
-                break;
-              }
-            case 10:
-              if (cube.v6*cube.v2 < 0) {
-                xv += 1.0;
-                yv += 1.0;
-                zv += 1./(1-cube.v6/cube.v2);
-                nv++;
-                break;
-              } else {
-                break;
-              }
-            case 11:
-              if (cube.v7*cube.v3 < 0) {
-                xv += 0.0;
-                yv += 1.0;
-                zv += 1./(1-cube.v7/cube.v3);
-                nv++;
-                break;
-              } else {
-                break;
-              }
-          }
-        }
-        // average the positions of edge vertices
-        xt[ t % 3 ] = xv/nv;
-        yt[ t % 3 ] = yv/nv;
-        zt[ t % 3 ] = zv/nv;
+        interior_vertex(cube, xt[ t % 3 ], yt[ t % 3 ], zt[ t % 3 ]);
         break;
       default :
         break;

@@ -6,6 +6,7 @@ computation. For CPU mode, Numba JIT compilation provides significant speedup
 (10-100x) over pure NumPy. Install numba for best CPU performance:
     pip install numba
 """
+import json
 import numpy as np
 from ..core.base import xp, asnumpy, cupy_enabled
 from ..core.utils import build_owner_tiled_mpi_pairs, get_mpi_block_owner, maybe_trim_gpu_memory_pool
@@ -151,6 +152,23 @@ __device__ unsigned int hash32(unsigned int x) {
     return x;
 }
 
+// Point indices of draw idx of one block pair. A 64-bit counter hash keeps
+// draws independent of each other and of other block pairs (base_seed is
+// unique per pair), with no repetition below 2^64 draws.
+__device__ unsigned long long splitmix64(unsigned long long x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+__device__ void draw_pair(unsigned long long base_seed, long long idx,
+                          int n_points1, int n_points2, int* i1, int* i2) {
+    unsigned long long h = splitmix64(base_seed ^ splitmix64((unsigned long long)idx));
+    *i1 = (int)((h & 0xffffffffull) % (unsigned long long)n_points1);
+    *i2 = (int)((h >> 32) % (unsigned long long)n_points2);
+}
+
 // Binary search function for finding bin
 __device__ int binary_search_bin(const double* rbins, const double r, const int nbins) {
     int left = 0;
@@ -182,19 +200,13 @@ void structure_function_kernel(const double* data1, const double* data2,
                             const double Lx, const double Ly, const double Lz,
                             const int nbins, const int max_order,
                             const bool periodic_x, const bool periodic_y, const bool periodic_z,
-                            const unsigned int base_seed)
+                            const unsigned long long base_seed)
 {
     long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     
     if (idx < n_pairs) {
-        // Initialize simple random number generator with deterministic seed
-        // Combine base_seed with thread index for reproducible but varied sampling
-        unsigned int seed = base_seed + idx * 1664525;
-        
-        // Randomly select points
-        unsigned int h = hash32(seed ^ 0x9e3779b9u);
-        int i1 = hash32(h) % n_points1;
-        int i2 = hash32(h ^ 0x68e31da4u) % n_points2;
+        int i1, i2;
+        draw_pair(base_seed, idx, n_points1, n_points2, &i1, &i2);
         
         // Skip if same point in same block
         if ((data1 == data2 && i1 == i2) || weight1[i1] == 0 || weight2[i2] == 0) return;
@@ -352,6 +364,35 @@ __device__ unsigned int hash32(unsigned int x) {
     return x;
 }
 
+// Point indices of draw idx of one block pair. A 64-bit counter hash keeps
+// draws independent of each other and of other block pairs (base_seed is
+// unique per pair), with no repetition below 2^64 draws.
+__device__ unsigned long long splitmix64(unsigned long long x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+__device__ void draw_pair(unsigned long long base_seed, long long idx,
+                          int n_points1, int n_points2, int* i1, int* i2) {
+    unsigned long long h = splitmix64(base_seed ^ splitmix64((unsigned long long)idx));
+    *i1 = (int)((h & 0xffffffffull) % (unsigned long long)n_points1);
+    *i2 = (int)((h >> 32) % (unsigned long long)n_points2);
+}
+
+// Increment-histogram column: number of edges <= v (0 = underflow,
+// n_edges = overflow), matching numpy.searchsorted(edges, v, 'right').
+__device__ int delta_column(const double* edges, const int n_edges, const double v) {
+    if (v != v) return n_edges;
+    int lo = 0, hi = n_edges;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (edges[mid] <= v) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
 // Binary search function for finding bin
 __device__ int binary_search_bin(const double* rbins, const double r, const int nbins) {
     int left = 0;
@@ -383,19 +424,14 @@ void structure_function_varlist_kernel(const double* data1, const double* data2,
                             const double Lx, const double Ly, const double Lz,
                             const int nbins, const int max_order,
                             const bool periodic_x, const bool periodic_y, const bool periodic_z,
-                            const unsigned int base_seed)
+                            const unsigned long long base_seed,
+                            double* delta_pdf, const double* delta_edges, const int n_delta_edges)
 {
     long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     
     if (idx < n_pairs) {
-        // Initialize simple random number generator with deterministic seed
-        // Combine base_seed with thread index for reproducible but varied sampling
-        unsigned int seed = base_seed + idx * 1664525;
-        
-        // Randomly select points
-        unsigned int h = hash32(seed ^ 0x9e3779b9u);
-        int i1 = hash32(h) % n_points1;
-        int i2 = hash32(h ^ 0x68e31da4u) % n_points2;
+        int i1, i2;
+        draw_pair(base_seed, idx, n_points1, n_points2, &i1, &i2);
         
         // Skip if same point in same block
         if ((data1 == data2 && i1 == i2) || weight1[i1] == 0 || weight2[i2] == 0) return;
@@ -437,6 +473,11 @@ void structure_function_varlist_kernel(const double* data1, const double* data2,
                 for(int p = 0; p < max_order; p++) {
                     atomicAdd(&sf[sf_bin_offset + p * nbins + bin_idx], sf_value[p]);
                 }
+                if (n_delta_edges > 0) {
+                    int ncol = n_delta_edges + 1;
+                    atomicAdd(&delta_pdf[(ivar * nbins + bin_idx) * ncol
+                                         + delta_column(delta_edges, n_delta_edges, diff)], 1.0);
+                }
             }
         }
     }
@@ -449,6 +490,18 @@ void structure_function_varlist_kernel(const double* data1, const double* data2,
 #define __CUDA_NO_HALF_CONVERSIONS__
 #define __CUDA_NO_HALF_OPERATORS__
 #define __CUDA_NO_HALF2_OPERATORS__
+
+// Increment-histogram column: number of edges <= v (0 = underflow,
+// n_edges = overflow), matching numpy.searchsorted(edges, v, 'right').
+__device__ int delta_column(const double* edges, const int n_edges, const double v) {
+    if (v != v) return n_edges;
+    int lo = 0, hi = n_edges;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (edges[mid] <= v) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
 
 // Binary search function for finding bin
 __device__ int binary_search_bin(const double* rbins, const double r, const int nbins) {
@@ -480,7 +533,8 @@ void structure_function_varlist_kernel_exhaustive(const double* data1, const dou
                             const int n_points1, const int n_points2,
                             const double Lx, const double Ly, const double Lz,
                             const int nbins, const int max_order,
-                            const bool periodic_x, const bool periodic_y, const bool periodic_z)
+                            const bool periodic_x, const bool periodic_y, const bool periodic_z,
+                            double* delta_pdf, const double* delta_edges, const int n_delta_edges)
 {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     
@@ -545,6 +599,11 @@ void structure_function_varlist_kernel_exhaustive(const double* data1, const dou
             for(int p = 0; p < max_order; p++) {
                 atomicAdd(&sf[sf_bin_offset + p * nbins + bin_idx], sf_value[p]);
             }
+            if (n_delta_edges > 0) {
+                int ncol = n_delta_edges + 1;
+                atomicAdd(&delta_pdf[(ivar * nbins + bin_idx) * ncol
+                                     + delta_column(delta_edges, n_delta_edges, diff)], 1.0);
+            }
         }
     }
 }
@@ -572,6 +631,35 @@ __device__ unsigned int simple_rand(unsigned int* seed) {
 __device__ unsigned int hash32(unsigned int x) {
     x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
     return x;
+}
+
+// Point indices of draw idx of one block pair. A 64-bit counter hash keeps
+// draws independent of each other and of other block pairs (base_seed is
+// unique per pair), with no repetition below 2^64 draws.
+__device__ unsigned long long splitmix64(unsigned long long x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+__device__ void draw_pair(unsigned long long base_seed, long long idx,
+                          int n_points1, int n_points2, int* i1, int* i2) {
+    unsigned long long h = splitmix64(base_seed ^ splitmix64((unsigned long long)idx));
+    *i1 = (int)((h & 0xffffffffull) % (unsigned long long)n_points1);
+    *i2 = (int)((h >> 32) % (unsigned long long)n_points2);
+}
+
+// Increment-histogram column: number of edges <= v (0 = underflow,
+// n_edges = overflow), matching numpy.searchsorted(edges, v, 'right').
+__device__ int delta_column(const double* edges, const int n_edges, const double v) {
+    if (v != v) return n_edges;
+    int lo = 0, hi = n_edges;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (edges[mid] <= v) lo = mid + 1; else hi = mid;
+    }
+    return lo;
 }
 
 // Binary search function for finding bin
@@ -608,19 +696,15 @@ void structure_function_helmholtz_kernel(
                              const double Lx, const double Ly, const double Lz,
                              const int nbins, const int max_order,
                              const bool periodic_x, const bool periodic_y, const bool periodic_z,
-                             const unsigned int base_seed)
+                             const unsigned long long base_seed,
+                             double* pdf_comp, const double* comp_edges, const int n_comp_edges,
+                             double* pdf_sol, const double* sol_edges, const int n_sol_edges)
 {
     long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     
     if (idx < n_pairs) {
-        // Initialize simple random number generator with deterministic seed
-        // Combine base_seed with thread index for reproducible but varied sampling
-        unsigned int seed = base_seed + idx * 1664525;
-        
-        // Randomly select points
-        unsigned int h = hash32(seed ^ 0x9e3779b9u);
-        int i1 = hash32(h) % n_points1;
-        int i2 = hash32(h ^ 0x68e31da4u) % n_points2;
+        int i1, i2;
+        draw_pair(base_seed, idx, n_points1, n_points2, &i1, &i2);
         
         // Skip if same point in same block
         if ((data1_x == data2_x && i1 == i2) || weight1[i1] == 0 || weight2[i2] == 0) return;
@@ -662,8 +746,11 @@ void structure_function_helmholtz_kernel(
         double diff_z = weight2[i2]*data2_z[i2] - weight1[i1]*data1_z[i1];
         double diff  = sqrt(diff_x*diff_x + diff_y*diff_y + diff_z*diff_z);
         double diff_dot_r = dist_x*diff_x + dist_y*diff_y + dist_z*diff_z;
-        double diff_comp = diff_dot_r/(r+1e-10);
-        double diff_sol = sqrt(diff*diff - diff_comp*diff_comp);
+        if (r <= 0.0) return;  // coincident points carry no direction
+        double diff_comp = diff_dot_r/r;
+        // Rounding can make diff^2 - comp^2 slightly negative for increments
+        // parallel to the separation; clamp instead of returning NaN.
+        double diff_sol = sqrt(fmax(0.0, diff*diff - diff_comp*diff_comp));
         double sf_value_comp[10];
         double sf_value_sol[10];
         for(int p = 0; p < max_order; p++) {
@@ -685,6 +772,14 @@ void structure_function_helmholtz_kernel(
                 atomicAdd(&sf_comp[p * nbins + bin_idx], sf_value_comp[p]);
                 atomicAdd(&sf_sol [p * nbins + bin_idx], sf_value_sol[p]);
             }
+            // Signed longitudinal increment (orientation invariant: swapping the
+            // two points flips both dv and r) and transverse magnitude.
+            if (n_comp_edges > 0)
+                atomicAdd(&pdf_comp[bin_idx * (n_comp_edges + 1)
+                                    + delta_column(comp_edges, n_comp_edges, diff_comp)], 1.0);
+            if (n_sol_edges > 0)
+                atomicAdd(&pdf_sol[bin_idx * (n_sol_edges + 1)
+                                   + delta_column(sol_edges, n_sol_edges, diff_sol)], 1.0);
         }
     }
 }
@@ -696,6 +791,18 @@ void structure_function_helmholtz_kernel(
 #define __CUDA_NO_HALF_CONVERSIONS__
 #define __CUDA_NO_HALF_OPERATORS__
 #define __CUDA_NO_HALF2_OPERATORS__
+
+// Increment-histogram column: number of edges <= v (0 = underflow,
+// n_edges = overflow), matching numpy.searchsorted(edges, v, 'right').
+__device__ int delta_column(const double* edges, const int n_edges, const double v) {
+    if (v != v) return n_edges;
+    int lo = 0, hi = n_edges;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (edges[mid] <= v) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
 
 // Binary search function for finding bin
 __device__ int binary_search_bin(const double* rbins, const double r, const int nbins) {
@@ -730,7 +837,9 @@ void structure_function_helmholtz_kernel_exhaustive(
                              const int n_points1, const int n_points2,
                              const double Lx, const double Ly, const double Lz,
                              const int nbins, const int max_order,
-                             const bool periodic_x, const bool periodic_y, const bool periodic_z)
+                             const bool periodic_x, const bool periodic_y, const bool periodic_z,
+                             double* pdf_comp, const double* comp_edges, const int n_comp_edges,
+                             double* pdf_sol, const double* sol_edges, const int n_sol_edges)
 {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     
@@ -797,8 +906,11 @@ void structure_function_helmholtz_kernel_exhaustive(
     double diff_z = weight2[i2]*data2_z[i2] - weight1[i1]*data1_z[i1];
     double diff  = sqrt(diff_x*diff_x + diff_y*diff_y + diff_z*diff_z);
     double diff_dot_r = dist_x*diff_x + dist_y*diff_y + dist_z*diff_z;
-    double diff_comp = diff_dot_r/(r+1e-10);
-    double diff_sol = sqrt(diff*diff - diff_comp*diff_comp);
+    if (r <= 0.0) return;  // coincident points carry no direction
+    double diff_comp = diff_dot_r/r;
+    // Rounding can make diff^2 - comp^2 slightly negative for increments
+    // parallel to the separation; clamp instead of returning NaN.
+    double diff_sol = sqrt(fmax(0.0, diff*diff - diff_comp*diff_comp));
     
     double sf_value_comp[10];
     double sf_value_sol[10];
@@ -822,6 +934,14 @@ void structure_function_helmholtz_kernel_exhaustive(
             atomicAdd(&sf_comp[p * nbins + bin_idx], sf_value_comp[p]);
             atomicAdd(&sf_sol [p * nbins + bin_idx], sf_value_sol[p]);
         }
+        // Signed longitudinal increment (orientation invariant: swapping the
+        // two points flips both dv and r) and transverse magnitude.
+        if (n_comp_edges > 0)
+            atomicAdd(&pdf_comp[bin_idx * (n_comp_edges + 1)
+                                + delta_column(comp_edges, n_comp_edges, diff_comp)], 1.0);
+        if (n_sol_edges > 0)
+            atomicAdd(&pdf_sol[bin_idx * (n_sol_edges + 1)
+                               + delta_column(sol_edges, n_sol_edges, diff_sol)], 1.0);
     }
 }
 ''', 'structure_function_helmholtz_kernel_exhaustive')
@@ -848,6 +968,23 @@ __device__ unsigned int simple_rand(unsigned int* seed) {
 __device__ unsigned int hash32(unsigned int x) {
     x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
     return x;
+}
+
+// Point indices of draw idx of one block pair. A 64-bit counter hash keeps
+// draws independent of each other and of other block pairs (base_seed is
+// unique per pair), with no repetition below 2^64 draws.
+__device__ unsigned long long splitmix64(unsigned long long x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+__device__ void draw_pair(unsigned long long base_seed, long long idx,
+                          int n_points1, int n_points2, int* i1, int* i2) {
+    unsigned long long h = splitmix64(base_seed ^ splitmix64((unsigned long long)idx));
+    *i1 = (int)((h & 0xffffffffull) % (unsigned long long)n_points1);
+    *i2 = (int)((h >> 32) % (unsigned long long)n_points2);
 }
 
 __device__ int binary_search_bin(const double* bins, const double val, const int nbins) {
@@ -882,15 +1019,13 @@ void structure_function_aniso_mhd_kernel(
         const int nbins, const int nbins_prll, const int nbins_perp, const int max_order,
         const double cos_theta_prll_min, const double cos_theta_perp_max,
         const bool periodic_x, const bool periodic_y, const bool periodic_z,
-        const unsigned int base_seed)
+        const unsigned long long base_seed)
 {
     long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= n_pairs) return;
 
-    unsigned int seed = base_seed + idx * 1664525u;
-    unsigned int h = hash32(seed ^ 0x9e3779b9u);
-    int i1 = hash32(h) % n_points1;
-    int i2 = hash32(h ^ 0x68e31da4u) % n_points2;
+    int i1, i2;
+    draw_pair(base_seed, idx, n_points1, n_points2, &i1, &i2);
 
     if (weight1[i1] == 0 || weight2[i2] == 0) return;
 
@@ -1173,246 +1308,110 @@ else:
     structure_function_aniso_mhd_kernel = None
     structure_function_aniso_mhd_kernel_exhaustive = None
 
-# Try to import numba for JIT compilation of CPU code
-try:
-    from numba import jit
-    NUMBA_AVAILABLE = True
-except ImportError:
-    NUMBA_AVAILABLE = False
-    # Create a dummy decorator if numba is not available
-    def jit(*args, **kwargs):
-        def decorator(func):
-            return func
-        # If jit is called with arguments, return the decorator
-        # If called without arguments (as a decorator), return the function itself
-        if len(args) == 1 and callable(args[0]) and not kwargs:
-            return args[0]
-        return decorator
+_SPLITMIX = tuple(np.uint64(c) for c in (0x9E3779B97F4A7C15, 0xBF58476D1CE4E5B9, 0x94D049BB133111EB))
 
-@jit(nopython=True)
-def _compute_periodic_distance(x1, y1, z1, x2, y2, z2, Lx, Ly, Lz, periodic_x, periodic_y, periodic_z):
-    """Compute distance between two points with periodic boundaries (Numba JIT)."""
-    dx = x2 - x1
-    dy = y2 - y1
-    dz = z2 - z1
-    
-    if periodic_x and abs(dx) > 0.5 * Lx:
-        dx = dx - np.sign(dx) * Lx
-    if periodic_y and abs(dy) > 0.5 * Ly:
-        dy = dy - np.sign(dy) * Ly
-    if periodic_z and abs(dz) > 0.5 * Lz:
-        dz = dz - np.sign(dz) * Lz
-    
-    return np.sqrt(dx*dx + dy*dy + dz*dz)
 
-@jit(nopython=True)
-def _compute_sf_batch_numba(data1, data2, weight1, weight2, 
-                             x1, y1, z1, x2, y2, z2,
-                             idx1, idx2, rbins, nbins, max_order,
-                             Lx, Ly, Lz, periodic_x, periodic_y, periodic_z,
-                             sf, num_bin_points, weight_sum_bin):
-    """
-    Compute structure function for a batch of point pairs using Numba JIT.
-    
-    This function is compiled with Numba for speed and processes batches of
-    point pairs to accumulate structure function statistics.
-    """
-    n_pairs = len(idx1)
-    
-    for i in range(n_pairs):
-        i1 = idx1[i]
-        i2 = idx2[i]
-        
-        # Skip if weights are zero
-        if weight1[i1] == 0 or weight2[i2] == 0:
-            continue
-        
-        # Calculate distance with periodic boundaries
-        dx = x2[i2] - x1[i1]
-        dy = y2[i2] - y1[i1]
-        dz = z2[i2] - z1[i1]
-        
-        if periodic_x and abs(dx) > 0.5 * Lx:
-            dx = dx - np.sign(dx) * Lx
-        if periodic_y and abs(dy) > 0.5 * Ly:
-            dy = dy - np.sign(dy) * Ly
-        if periodic_z and abs(dz) > 0.5 * Lz:
-            dz = dz - np.sign(dz) * Lz
-        
-        r = np.sqrt(dx*dx + dy*dy + dz*dz)
-        
-        # Calculate structure function value
-        diff = abs(weight2[i2] * data2[i2] - weight1[i1] * data1[i1])
-        
-        # Find bin using binary search
-        bin_idx = np.searchsorted(rbins, r) - 1
-        
-        if 0 <= bin_idx < nbins:
-            num_bin_points[bin_idx] += 1.0
-            weight_sum_bin[bin_idx] += weight1[i1] + weight2[i2]
-            
-            # Compute powers of diff and accumulate
-            diff_power = diff
-            for order in range(max_order):
-                sf[order, bin_idx] += diff_power
-                diff_power *= diff
+def _splitmix64(x):
+    """NumPy twin of the kernels' splitmix64 (uint64 arithmetic wraps)."""
+    with np.errstate(over='ignore'):
+        x = x + _SPLITMIX[0]
+        x = (x ^ (x >> np.uint64(30))) * _SPLITMIX[1]
+        x = (x ^ (x >> np.uint64(27))) * _SPLITMIX[2]
+    return x ^ (x >> np.uint64(31))
 
-def _compute_sf_cpu_vectorized(data1, data2, weight1, weight2, 
-                                x1, y1, z1, x2, y2, z2,
-                                rbins, nbins, max_order, 
-                                Lx, Ly, Lz, periodic_x, periodic_y, periodic_z,
-                                n_samples, batch_size=10000, use_mpi=False, random_seed=None):
+
+def _draw_pair_indices(base_seed, start, count, n_points1, n_points2):
+    """Point indices of draws start..start+count-1, identical to the kernels'
+    draw_pair, so CPU and GPU sample the same pairs."""
+    idx = np.arange(start, start + count, dtype=np.uint64)
+    h = _splitmix64(np.uint64(base_seed) ^ _splitmix64(idx))
+    i1 = (h & np.uint64(0xFFFFFFFF)) % np.uint64(n_points1)
+    i2 = (h >> np.uint64(32)) % np.uint64(n_points2)
+    return i1.astype(np.int64), i2.astype(np.int64)
+
+
+def _delta_bin_index(values, delta_edges):
+    """Increment-histogram column: 0 below the first edge, k for
+    edges[k-1] <= value < edges[k], len(edges) at or above the last edge."""
+    return np.searchsorted(delta_edges, values, side='right')
+
+
+def _compute_sf_cpu_vectorized(data1, data2, no_vars, weight1, weight2,
+                               x1, y1, z1, x2, y2, z2,
+                               rbins, max_order, Lx, Ly, Lz,
+                               periodic_x, periodic_y, periodic_z,
+                               n_samples, base_seed, same_block,
+                               delta_edges=None, batch_size=65536, exhaustive=False):
+    """CPU twin of structure_function_varlist_kernel (and, with exhaustive=True,
+    of structure_function_varlist_kernel_exhaustive: every distinct pair once,
+    n_samples and base_seed unused).
+
+    data1/data2 hold no_vars variables stacked variable-major (as the
+    kernels expect). Draws, the same-point exclusion for same-block pairs,
+    the [lo, hi) radial binning and the increment |w2*d2 - w1*d1| match the
+    GPU kernel, so both backends sample and bin the same pairs.
+
+    Returns sf (no_vars, max_order, nbins), num_bin_points (nbins),
+    weight_sum_bin (nbins) and, when delta_edges is given, the increment
+    histogram (no_vars, nbins, len(delta_edges) + 1) with underflow and
+    overflow columns; otherwise None.
     """
-    CPU fallback for structure function computation using vectorized NumPy operations.
-    
-    This implementation processes point pairs in batches for efficiency, using
-    vectorized NumPy operations where possible and Numba JIT compilation for
-    the inner loop if available (disabled in MPI mode to avoid deadlock).
-    
-    Parameters
-    ----------
-    data1, data2 : ndarray
-        Data values at each point
-    weight1, weight2 : ndarray
-        Weights for each point
-    x1, y1, z1, x2, y2, z2 : ndarray
-        Coordinates of points
-    rbins : ndarray
-        Bin edges for separations
-    nbins : int
-        Number of bins
-    max_order : int
-        Maximum structure function order
-    Lx, Ly, Lz : float
-        Box dimensions for periodic wrapping
-    periodic_x, periodic_y, periodic_z : bool
-        Whether each direction has periodic boundaries
-    n_samples : int
-        Number of point pairs to sample
-    batch_size : int
-        Number of pairs to process in each batch
-    
-    Returns
-    -------
-    sf : ndarray
-        Structure function values (max_order x nbins)
-    num_bin_points : ndarray
-        Number of pairs in each bin
-    weight_sum_bin : ndarray
-        Sum of weights in each bin
-    """
-    n_points1 = len(data1)
-    n_points2 = len(data2)
-    
-    # Early return if either dataset is empty (e.g., idle MPI rank with no meshblocks)
-    if n_points1 == 0 or n_points2 == 0:
-        sf = np.zeros((max_order, nbins))
-        num_bin_points = np.zeros(nbins)
-        weight_sum_bin = np.zeros(nbins)
-        return sf, num_bin_points, weight_sum_bin
-    
-    sf = np.zeros((max_order, nbins))
+    nbins = len(rbins) - 1
+    n_points1 = weight1.size
+    n_points2 = weight2.size
+    sf = np.zeros((no_vars, max_order, nbins))
     num_bin_points = np.zeros(nbins)
     weight_sum_bin = np.zeros(nbins)
-    
-    # Process pairs in batches
-    n_batches = int(np.ceil(n_samples / batch_size))
-    # Use deterministic seed if provided for reproducible results
-    rng = np.random.default_rng(random_seed)
-    
-    for batch_idx in range(n_batches):
-        # Determine batch size for this iteration
-        current_batch_size = min(batch_size, int(n_samples - batch_idx * batch_size))
-        
-        # Generate random indices for this batch
-        idx1 = rng.integers(0, n_points1, size=current_batch_size)
-        idx2 = rng.integers(0, n_points2, size=current_batch_size)
-        
-        # Use Numba JIT version if available AND not in MPI mode
-        # (Numba JIT compilation causes deadlock when all MPI ranks compile simultaneously)
-        use_numba = NUMBA_AVAILABLE and not use_mpi
-        
-        if use_numba:
-            _compute_sf_batch_numba(
-                data1, data2, weight1, weight2,
-                x1, y1, z1, x2, y2, z2,
-                idx1, idx2, rbins, nbins, max_order,
-                float(Lx), float(Ly), float(Lz),
-                periodic_x, periodic_y, periodic_z,
-                sf, num_bin_points, weight_sum_bin
-            )
+    pdf = None if delta_edges is None else np.zeros((no_vars, nbins, len(delta_edges) + 1))
+    if n_points1 == 0 or n_points2 == 0:
+        return sf, num_bin_points, weight_sum_bin, pdf
+    data1 = np.asarray(data1, dtype=np.float64).reshape(no_vars, n_points1)
+    data2 = np.asarray(data2, dtype=np.float64).reshape(no_vars, n_points2)
+    lengths = (float(Lx), float(Ly), float(Lz))
+    periodic = (periodic_x, periodic_y, periodic_z)
+    total = n_points1 * n_points2 if exhaustive else int(n_samples)
+    for start in range(0, total, batch_size):
+        count = min(batch_size, total - start)
+        if exhaustive:
+            flat = np.arange(start, start + count, dtype=np.int64)
+            i1, i2 = flat // n_points2, flat % n_points2
         else:
-            # Pure NumPy fallback (vectorized where possible)
-            # Extract coordinates and data for sampled points
-            x1_batch = x1[idx1]
-            y1_batch = y1[idx1]
-            z1_batch = z1[idx1]
-            x2_batch = x2[idx2]
-            y2_batch = y2[idx2]
-            z2_batch = z2[idx2]
-            data1_batch = data1[idx1]
-            data2_batch = data2[idx2]
-            weight1_batch = weight1[idx1]
-            weight2_batch = weight2[idx2]
-            
-            # Filter out zero-weight pairs
-            valid_mask = (weight1_batch != 0) & (weight2_batch != 0)
-            if not np.any(valid_mask):
-                continue
-            
-            x1_batch = x1_batch[valid_mask]
-            y1_batch = y1_batch[valid_mask]
-            z1_batch = z1_batch[valid_mask]
-            x2_batch = x2_batch[valid_mask]
-            y2_batch = y2_batch[valid_mask]
-            z2_batch = z2_batch[valid_mask]
-            data1_batch = data1_batch[valid_mask]
-            data2_batch = data2_batch[valid_mask]
-            weight1_batch = weight1_batch[valid_mask]
-            weight2_batch = weight2_batch[valid_mask]
-            
-            # Vectorized distance calculation
-            dx = x2_batch - x1_batch
-            dy = y2_batch - y1_batch
-            dz = z2_batch - z1_batch
-            
-            # Apply periodic boundaries
-            if periodic_x:
-                dx = np.where(np.abs(dx) > 0.5 * Lx, dx - np.sign(dx) * Lx, dx)
-            if periodic_y:
-                dy = np.where(np.abs(dy) > 0.5 * Ly, dy - np.sign(dy) * Ly, dy)
-            if periodic_z:
-                dz = np.where(np.abs(dz) > 0.5 * Lz, dz - np.sign(dz) * Lz, dz)
-            
-            r_batch = np.sqrt(dx*dx + dy*dy + dz*dz)
-            
-            # Vectorized structure function calculation
-            diff = np.abs(weight2_batch * data2_batch - weight1_batch * data1_batch)
-            
-            # Find bins for all distances at once
-            bin_indices = np.searchsorted(rbins, r_batch) - 1
-            
-            # Filter valid bins
-            valid_bins = (bin_indices >= 0) & (bin_indices < nbins)
-            bin_indices = bin_indices[valid_bins]
-            diff = diff[valid_bins]
-            weight1_batch = weight1_batch[valid_bins]
-            weight2_batch = weight2_batch[valid_bins]
-            
-            # Accumulate using np.add.at for efficient in-place addition
-            np.add.at(num_bin_points, bin_indices, 1.0)
-            np.add.at(weight_sum_bin, bin_indices, weight1_batch + weight2_batch)
-            
-            # Accumulate structure function for each order
-            diff_power = diff.copy()
-            for order in range(max_order):
-                np.add.at(sf[order], bin_indices, diff_power)
-                diff_power *= diff
-    
-    return sf, num_bin_points, weight_sum_bin
+            i1, i2 = _draw_pair_indices(base_seed, start, count, n_points1, n_points2)
+        keep = (weight1[i1] != 0) & (weight2[i2] != 0)
+        if same_block:
+            keep &= (i1 < i2) if exhaustive else (i1 != i2)
+        i1, i2 = i1[keep], i2[keep]
+        if not i1.size:
+            continue
+        rsq = np.zeros(i1.size)
+        for c1, c2, length, wrap in zip((x1, y1, z1), (x2, y2, z2), lengths, periodic):
+            d = np.abs(c2[i2] - c1[i1])
+            if wrap:
+                d = np.minimum(d, length - d)
+            rsq += d * d
+        bins = np.searchsorted(rbins, np.sqrt(rsq), side='right') - 1
+        good = (bins >= 0) & (bins < nbins)
+        bins, i1, i2 = bins[good], i1[good], i2[good]
+        if not bins.size:
+            continue
+        w1, w2 = weight1[i1], weight2[i2]
+        num_bin_points += np.bincount(bins, minlength=nbins)
+        weight_sum_bin += np.bincount(bins, weights=w1 + w2, minlength=nbins)
+        for ivar in range(no_vars):
+            diff = np.abs(w2 * data2[ivar, i2] - w1 * data1[ivar, i1])
+            power = diff.copy()
+            for p in range(max_order):
+                sf[ivar, p] += np.bincount(bins, weights=power, minlength=nbins)
+                power *= diff
+            if pdf is not None:
+                cols = _delta_bin_index(diff, delta_edges)
+                pdf[ivar] += np.bincount(bins * pdf.shape[2] + cols,
+                                         minlength=nbins * pdf.shape[2]).reshape(nbins, -1)
+    return sf, num_bin_points, weight_sum_bin, pdf
+
 
 def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=100, log_bin_flag=True, 
-           nsamples_block_min=1000, debug=False, weight_support_rescaling=False):
+           nsamples_block_min=1000, debug=False, weight_support_rescaling=False, use_exhaustive=False):
     """
     Calculate structure functions for a given field using GPU acceleration.
     
@@ -1538,12 +1537,7 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
             print(f"Debug: Periodic boundaries - x:{periodic_x}, y:{periodic_y}, z:{periodic_z}")
         
         # Make rbins
-        if log_bin_flag:
-            rbins = xp.logspace(xp.log10(rmin), xp.log10(rmax), nbins+1)
-            r_ = xp.sqrt(rbins[1:]*rbins[:-1])
-        else:
-            rbins = xp.linspace(0, rmax, nbins+1)
-            r_ = 0.5*(rbins[1:]+rbins[:-1])
+        rbins, r_ = radial_bin_edges(rmin, rmax, nbins, log_bin_flag)
         if debug:
             print(f"Debug: Created {nbins} radial bins, log_bin_flag={log_bin_flag}")
         
@@ -1653,12 +1647,19 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
             threadsperblock = 256
             n_pairs = int(asnumpy(n_samples1 * n_samples2_blocks[idx]))  # Convert to host integer
             blockspergrid = (n_pairs + threadsperblock - 1) // threadsperblock
-            # Each block pair holds _distinct_pair_count point pairs but contributes
-            # n_pairs samples (distance dependent): weight its sums so the binned mean
-            # is a uniform average over all pairs rather than favouring nearby blocks.
+            # Each block pair contributes n_pairs samples (distance dependent): weight
+            # its sums so the binned mean is a uniform average over all pairs rather
+            # than favouring nearby blocks.
             if int(b1) == int(b2):
                 data2, weight2, x2, y2, z2 = data1, weight1, x1, y1, z1
-            pair_weight = _distinct_pair_count(n_points_per_block, n_points_per_block, int(b1) == int(b2)) / max(n_pairs, 1)
+            pair_weight = _random_pair_weight(n_points_per_block, n_points_per_block, int(b1) == int(b2), n_pairs)
+            # Enumerate every distinct pair when asked and affordable (same rule
+            # as the meshblock path); otherwise sample.
+            n_all = n_points_per_block * n_points_per_block
+            exhaustive = (use_exhaustive and n_all < 5 * n_pairs
+                          and n_all <= np.iinfo(np.int32).max // 4)
+            if exhaustive:
+                pair_weight = 1.0
 
             if debug and idx < 5:  # Print kernel info for first few iterations
                 if debug:
@@ -1668,9 +1669,7 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
             if not cupy_enabled or structure_function_kernel is None:
                 # Use CPU fallback
                 if debug:
-                    accel_msg = "with Numba JIT" if NUMBA_AVAILABLE else "pure NumPy (slow - install numba for 10-100x speedup)"
-                    if debug:
-                        print(f"Debug: Using CPU fallback for structure function computation ({accel_msg})")
+                    print("Debug: Using CPU fallback for structure function computation")
                 
                 # Convert to NumPy arrays
                 data1_cpu = asnumpy(data1)
@@ -1685,21 +1684,16 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
                 z2_cpu = asnumpy(z2)
                 rbins_cpu = asnumpy(rbins)
                 
-                # Compute structure function on CPU using vectorized implementation
-                # Note: use_mpi=False because get_sf should never be called with MPI enabled
-                # When MPI is needed, set_sf automatically calls get_sf_mb instead
-                # Use deterministic seed matching GPU: idx * 1013904223, wrapped
-                # to uint32 range (matches the GPU kernel's native uint32 wraparound).
-                cpu_seed = int((int(idx) * 1013904223) % (2**32))
-                sf_cpu, num_cpu, weights_cpu = _compute_sf_cpu_vectorized(
-                    data1_cpu, data2_cpu,
+                sf_cpu, num_cpu, weights_cpu, _ = _compute_sf_cpu_vectorized(
+                    data1_cpu, data2_cpu, 1,
                     weight1_cpu, weight2_cpu,
                     x1_cpu, y1_cpu, z1_cpu,
                     x2_cpu, y2_cpu, z2_cpu,
-                    rbins_cpu, nbins, max_order,
+                    rbins_cpu, max_order,
                     float(Lx), float(Ly), float(Lz),
                     periodic_x, periodic_y, periodic_z,
-                    n_pairs, use_mpi=False, random_seed=cpu_seed
+                    n_pairs, _pair_seed(b1, b2), int(b1) == int(b2),
+                    exhaustive=exhaustive
                 )
                 
                 # Accumulate results - flatten sf_cpu to match sf shape
@@ -1710,27 +1704,33 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
                 if debug:
                     print(f"Debug: CPU fallback computation completed for block pair {idx}")
             else:
-                # Launch kernel with deterministic base seed
-                # Use idx (block pair index) as base seed for reproducibility,
-                # wrapped to uint32 range to match the kernel's native arithmetic.
-                base_seed = np.uint32((int(idx) * 1013904223) % (2**32))
+                base_seed = _pair_seed(b1, b2)
                 local_sf = xp.zeros_like(sf)
                 local_num = xp.zeros_like(num_bin_points)
                 local_weight = xp.zeros_like(weight_sum_bin)
-                structure_function_kernel(
-                    (blockspergrid,), (threadsperblock,),
-                    (data1, data2,
-                    weight1, weight2,
-                    x1, y1, z1,
-                    x2, y2, z2,
-                    rbins, 
-                    local_sf, local_num,
-                    local_weight, n_pairs, 
-                    n_points_per_block, n_points_per_block,
-                    float(Lx), float(Ly), float(Lz),
-                    nbins, max_order,
-                    periodic_x, periodic_y, periodic_z,
-                    base_seed))
+                if exhaustive:
+                    structure_function_kernel_exhaustive(
+                        ((n_all + threadsperblock - 1) // threadsperblock,), (threadsperblock,),
+                        (data1, data2, weight1, weight2, x1, y1, z1, x2, y2, z2, rbins,
+                         local_sf, local_num, local_weight,
+                         n_points_per_block, n_points_per_block,
+                         float(Lx), float(Ly), float(Lz), nbins, max_order,
+                         periodic_x, periodic_y, periodic_z))
+                else:
+                    structure_function_kernel(
+                        (blockspergrid,), (threadsperblock,),
+                        (data1, data2,
+                        weight1, weight2,
+                        x1, y1, z1,
+                        x2, y2, z2,
+                        rbins, 
+                        local_sf, local_num,
+                        local_weight, n_pairs, 
+                        n_points_per_block, n_points_per_block,
+                        float(Lx), float(Ly), float(Lz),
+                        nbins, max_order,
+                        periodic_x, periodic_y, periodic_z,
+                        base_seed))
                     
                 # Keep the hot path asynchronous unless debug asks for eager synchronization;
                 # the accumulation below is queued on the same stream as the kernel.
@@ -1764,7 +1764,8 @@ def get_sf(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=10
 
 
 def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=100, log_bin_flag=True, 
-            nsamples_block_min=1000, sparse_data=False, debug=False, simultaneous_blocks=None, mpi_manager=None, weight_support_rescaling=False):
+            nsamples_block_min=1000, sparse_data=False, debug=False, simultaneous_blocks=None, mpi_manager=None, weight_support_rescaling=False,
+            delta_edges=None, use_exhaustive=False):
     """
     Calculate structure functions for multiple variables using GPU acceleration with optimized batch processing.
     
@@ -1801,6 +1802,16 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
     simultaneous_blocks : int, optional
         Number of blocks to process per batch. If None, automatically determined based on 
         available memory. Default=None
+    delta_edges : array-like, optional
+        Strictly increasing edges for a per-separation-bin histogram of the
+        increment |w2*q2 - w1*q1| (the quantity whose powers form the moment
+        sums), e.g. from delta_edges_from_dist. Column 0 counts increments
+        below the first edge and the last column those at or above the last
+        edge, so no pair is lost; the moment sums are unaffected. Default=None
+    use_exhaustive : bool, optional
+        Enumerate every distinct pair of a block pair (weight 1) where that is
+        cheaper than five times its sampling budget, e.g. for sparse masks
+        with few cells per block; other block pairs are sampled. Default=False
     
     Returns
     -------
@@ -1812,6 +1823,10 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
         Sum of weights in each radial bin for each weighting scheme
     num_bin_points : xp.ndarray
         Number of point pairs in each radial bin for each weighting scheme
+    delta_pdf : xp.ndarray, only with delta_edges
+        Importance-weighted pair counts of shape ([n_weights,] n_vars, nbins,
+        len(delta_edges) + 1); summing over the last axis gives the weighted
+        pair count of each separation bin
     """
     
     # Establish rank early for debug output
@@ -1912,12 +1927,7 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
         print(f"Debug: Successfully created block centers, shape: {block_centers.shape}")
     
     # Create radial bins
-    if log_bin_flag:
-        rbins = xp.logspace(xp.log10(rmin), xp.log10(rmax), nbins+1)
-        r_ = xp.sqrt(rbins[1:]*rbins[:-1])
-    else:
-        rbins = xp.linspace(0, rmax, nbins+1)
-        r_ = 0.5*(rbins[1:]+rbins[:-1])
+    rbins, r_ = radial_bin_edges(rmin, rmax, nbins, log_bin_flag)
     if debug:
         print(f"Debug: Created {nbins} radial bins, log_bin_flag={log_bin_flag}")
     
@@ -1925,6 +1935,12 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
     sf = xp.zeros((n_weights, no_vars, max_order, nbins), dtype=xp.float64)
     num_bin_points = xp.zeros((n_weights, nbins), dtype=xp.float64)
     weight_sum_bin = xp.zeros((n_weights, nbins), dtype=xp.float64)
+    pair_options = dict(use_exhaustive=bool(use_exhaustive))
+    delta_pdf = None
+    if delta_edges is not None:
+        delta_edges = _validated_delta_edges(delta_edges)
+        delta_pdf = xp.zeros((n_weights, no_vars, nbins, len(delta_edges) + 1), dtype=xp.float64)
+        pair_options.update(delta_edges=delta_edges, delta_pdf=delta_pdf)
     if debug:
         print(f"Debug: Successfully initialized result arrays with shapes:")
         if debug:
@@ -2002,7 +2018,7 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
                           n_samples1, n_points_per_block, nsamples_block_min,
                           periodic_x, periodic_y, periodic_z, sparse_data, xyzlim=xyz,
                           mpi_manager=mpi_manager, mb_offset=mb_offset, debug=debug,
-                          pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
+                          pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales, pair_options=pair_options)
     else:
         # NON-MPI MODE: Process local blocks only
         # Process blocks in batches
@@ -2024,7 +2040,7 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
                                 n_samples1, n_points_per_block, nsamples_block_min, 
                                 periodic_x, periodic_y, periodic_z, sparse_data, xyzlim=xyz, 
                                 use_mpi=False, mpi_manager=None, mb_offset=0,
-                                pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
+                                pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales, pair_options=pair_options)
         if debug:
             print(f"Debug: Completed batch pair processing")
     
@@ -2067,7 +2083,7 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
                                         nbins, max_order, n_samples1, n_points_per_block, 
                                         nsamples_block_min, periodic_x, periodic_y, periodic_z, 
                                         sparse_data, xyzlim=xyz, debug=debug,
-                                        pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
+                                        pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales, pair_options=pair_options)
                 if debug:
                     print(f"Debug: Completed processing missed pairs")
     
@@ -2081,6 +2097,8 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
         sf = sf[0]
         num_bin_points = num_bin_points[0]
         weight_sum_bin = weight_sum_bin[0]
+        if delta_pdf is not None:
+            delta_pdf = delta_pdf[0]
         if debug:
             print(f"Debug: Reshaped output for single weight, sf shape: {sf.shape}")
     
@@ -2108,12 +2126,16 @@ def get_sf_mb(ad, varlist, weights='ones', xyz=None, max_order=10, npairs=1e7, n
         sf = xp.asarray(sf_total)
         num_bin_points = xp.asarray(num_bin_points_total)
         weight_sum_bin = xp.asarray(weight_sum_bin_total)
+        if delta_pdf is not None:
+            delta_pdf = xp.asarray(mpi_manager.allreduce(asnumpy(delta_pdf), op='sum'))
         
         if debug:
             print(f"Debug: Rank {mpi_manager.rank}: After aggregation, total points: {num_bin_points.sum()}")
 
     if debug:
         print(f"Debug: Total points in bins: {num_bin_points.sum()}")
+    if delta_pdf is not None:
+        return r_, sf, weight_sum_bin, xp.array(num_bin_points, dtype=int), delta_pdf
     return r_, sf, weight_sum_bin, xp.array(num_bin_points, dtype=int)
 def _process_mpi_pairs(ad, my_pairs, block_cache, weights_list, varlist,
                       sf, num_bin_points, weight_sum_bin,
@@ -2121,9 +2143,31 @@ def _process_mpi_pairs(ad, my_pairs, block_cache, weights_list, varlist,
                       n_samples1, n_points_per_block, nsamples_block_min,
                       periodic_x, periodic_y, periodic_z, sparse_data=False, xyzlim=None,
                       mpi_manager=None, mb_offset=0, debug=False, pair_workspace=None,
-                      weight_sampling_scales=None):
+                      weight_sampling_scales=None, pair_options=None):
+    """Isotropic SF pairs of this rank, on the synchronized MPI schedule."""
+    def process_pair(global_b1, global_b2, block_centers_global):
+        _process_block_pair(
+            ad, global_b1, global_b2, block_cache, block_centers_global,
+            weights_list, varlist, sf, num_bin_points, weight_sum_bin,
+            rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
+            n_samples1, n_points_per_block, nsamples_block_min,
+            periodic_x, periodic_y, periodic_z, sparse_data, debug=False, use_mpi=True,
+            pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales, **(pair_options or {}))
+    _run_mpi_pair_schedule(ad, my_pairs, block_cache, weights_list, varlist,
+                           n_points_per_block, process_pair, xyzlim=xyzlim,
+                           mpi_manager=mpi_manager, mb_offset=mb_offset, debug=debug)
+
+
+def _run_mpi_pair_schedule(ad, my_pairs, block_cache, weights_list, varlist,
+                           n_points_per_block, process_pair, xyzlim=None,
+                           mpi_manager=None, mb_offset=0, debug=False):
     """
     Process assigned block pairs in MPI mode with memory-efficient batching.
+
+    process_pair(b1, b2, block_centers_global) accumulates one global block
+    pair whose blocks are both in block_cache. Every collective call
+    (remote-block exchange, allreduce of group and chunk counts) is made the
+    same number of times on every rank, whatever its pair list.
 
     PAIR COVERAGE GUARANTEE:
     - Caller generates ALL pairs (i,j) where 0 <= i <= j < n_mbs
@@ -2253,13 +2297,7 @@ def _process_mpi_pairs(ad, my_pairs, block_cache, weights_list, varlist,
                     )
                 continue
 
-            _process_block_pair(
-                ad, global_b1, global_b2, block_cache, block_centers_global,
-                weights_list, varlist, sf, num_bin_points, weight_sum_bin,
-                rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
-                n_samples1, n_points_per_block, nsamples_block_min,
-                periodic_x, periodic_y, periodic_z, sparse_data, debug=False, use_mpi=True,
-                pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
+            process_pair(global_b1, global_b2, block_centers_global)
 
             pairs_processed += 1
 
@@ -2353,14 +2391,7 @@ def _process_mpi_pairs(ad, my_pairs, block_cache, weights_list, varlist,
                         )
                     continue
 
-                _process_block_pair(
-                    ad, global_b1, global_b2, block_cache, block_centers_global,
-                    weights_list, varlist, sf, num_bin_points, weight_sum_bin,
-                    rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
-                    n_samples1, n_points_per_block, nsamples_block_min,
-                    periodic_x, periodic_y, periodic_z, sparse_data, debug=False, use_mpi=True,
-                    pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales
-                )
+                process_pair(global_b1, global_b2, block_centers_global)
 
                 pairs_processed += 1
 
@@ -2450,62 +2481,6 @@ def _load_all_blocks_upfront(ad, block_cache, blocks_needed, weights_list, varli
     # Exchange remote blocks via MPI (all ranks participate together)
     _exchange_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, varlist,
                                 local_start, local_end, xyzlim, mpi_manager, debug)
-
-def _load_blocks_for_mpi_pair(ad, block_cache, blocks_needed, weights_list, varlist,
-                               local_start, local_end, xyzlim, mpi_manager, debug=False):
-    """
-    Load blocks for MPI pair computation using collective exchange.
-    
-    Strategy: All ranks announce their needs, then exchange data in one collective operation.
-    """
-    # Separate local and remote blocks
-    local_blocks = [b for b in blocks_needed if local_start <= b < local_end and b not in block_cache]
-    remote_blocks = [b for b in blocks_needed if (b < local_start or b >= local_end) and b not in block_cache]
-    
-    if debug and (local_blocks or remote_blocks):
-        if debug:
-            print(f"Debug: Rank {mpi_manager.rank}: Loading {len(local_blocks)} local blocks, {len(remote_blocks)} remote blocks")
-    
-    # Load local blocks using contiguous runs only, not the full enclosing span.
-    if local_blocks:
-        region_status_map = _prepare_xyz_block_regions(
-            ad, local_blocks, xyzlim)
-
-        for global_mbl, global_mbh in _iter_contiguous_block_runs(local_blocks):
-            weight_data_dict = {}
-            for weight_name in weights_list:
-                weight_data_dict[weight_name] = (
-                    ad.data(weight_name, global_mbl, global_mbh)
-                    if isinstance(weight_name, str) else weight_name)
-
-            var_data_dict = {}
-            for var_name in varlist:
-                var_data_dict[var_name] = (
-                    ad.data(var_name, global_mbl, global_mbh)
-                    if isinstance(var_name, str) else var_name)
-
-            for global_b in range(global_mbl, global_mbh):
-                array_idx = global_b - global_mbl
-                region_status = region_status_map[global_b]
-                region_status, region_trimmed, coords_block, weights_block, vars_block = (
-                    _extract_xyz_region_block_data(
-                        ad.mb_geometry[global_b],
-                        weight_data_dict[weights_list[0]][array_idx].shape,
-                        {weight_name: weight_data_dict[weight_name][array_idx]
-                         for weight_name in weights_list},
-                        {var_name: var_data_dict[var_name][array_idx]
-                         for var_name in varlist},
-                        region_status, xyzlim))
-
-                block_cache[global_b] = _finalize_block_cache_entry(
-                    coords_block, region_status, region_trimmed,
-                    weights_block, vars_block,
-                    weights_list, varlist)
-    
-    # Load remote blocks via MPI if any
-    if remote_blocks:
-        _exchange_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, varlist,
-                                    local_start, local_end, xyzlim, mpi_manager, debug)
 
 def _exchange_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, varlist,
                                 local_start, local_end, xyzlim, mpi_manager, debug=False):
@@ -2621,7 +2596,7 @@ def _process_batch_pairs(ad, batches, block_cache, processed_pairs, weights_list
                     n_samples1, n_points_per_block, nsamples_block_min, 
                     periodic_x, periodic_y, periodic_z, sparse_data=False, xyzlim=None, debug=False, 
                     use_mpi=False, mpi_manager=None, mb_offset=0, pair_workspace=None,
-                    weight_sampling_scales=None):
+                    weight_sampling_scales=None, pair_options=None):
     """
     Helper function to process batch pairs for structure functions.
     
@@ -2629,6 +2604,10 @@ def _process_batch_pairs(ad, batches, block_cache, processed_pairs, weights_list
     local block. For remote blocks (on other ranks), it uses MPI communication to 
     exchange data as needed.
     """
+    if use_mpi and mpi_manager is not None:
+        # MPI pairs go through _run_mpi_pair_schedule; this loop's per-rank
+        # owner rule does not match the meshblock decomposition.
+        raise ValueError('batch pair loop is serial; MPI runs use the synchronized pair schedule')
     
     if debug:
         print(f"Debug: Starting _process_batch_pairs with {len(batches)} batches")
@@ -2693,7 +2672,7 @@ def _process_batch_pairs(ad, batches, block_cache, processed_pairs, weights_list
                                         rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                                         n_samples1, n_points_per_block, nsamples_block_min,
                                         periodic_x, periodic_y, periodic_z, sparse_data, use_mpi=use_mpi,
-                                        pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
+                                        pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales, **(pair_options or {}))
                     processed_pairs.add(pair)
         
         # Process cross-batch pairs
@@ -2730,7 +2709,7 @@ def _process_batch_pairs(ad, batches, block_cache, processed_pairs, weights_list
                                             rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                                             n_samples1, n_points_per_block, nsamples_block_min,
                                             periodic_x, periodic_y, periodic_z, sparse_data, use_mpi=use_mpi,
-                                            pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales)
+                                            pair_workspace=pair_workspace, weight_sampling_scales=weight_sampling_scales, **(pair_options or {}))
                         processed_pairs.add(pair)
             
             # Clear batch2 data from cache
@@ -2838,10 +2817,10 @@ def _load_batch_data(ad, block_cache, batch_blocks, weights_list, varlist, xyzli
                     weights_block, vars_block,
                     weights_list, varlist)
     
-    # Handle remote blocks via MPI
     if remote_blocks and mpi_manager is not None:
-        _load_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, varlist, 
-                               mpi_manager, xyzlim)
+        # Remote blocks are exchanged only by _load_all_blocks_upfront, whose
+        # collectives every rank enters the same number of times.
+        raise ValueError('_load_batch_data cannot fetch remote blocks; use the MPI pair schedule')
 
 
 def _classify_xyz_block_region(mb_geometry, block_idx, xyzlim):
@@ -3137,6 +3116,109 @@ def _pack_sparse_var_stack(var_stack, n_points, no_vars, valid_mask):
     return xp.ascontiguousarray(matrix[:, valid_mask].reshape(-1), dtype=xp.float64)
 
 
+def radial_bin_edges(rmin, rmax, nbins, log_bin_flag=True):
+    """Separation bin edges and centres shared by every pair statistic.
+
+    Log bins span [rmin, rmax], linear bins [0, rmax]. The outermost edges
+    are widened by a relative 1e-9 so that separations exactly at rmin
+    (axis-aligned nearest neighbours, r == dx) and at rmax land in the end
+    bins on every backend: logspace/linspace rounding can otherwise put an
+    edge a few ulp inside, which silently empties the first bin.
+
+    Callers use rmax = half the box diagonal whatever the boundary
+    conditions, so along a non-periodic axis separations beyond rmax exist
+    but are not binned. In the anisotropic SF the l_prll/l_perp bins also
+    start at rmin = dx, so nearest-neighbour pairs at small or large angles
+    to B (l_prll or l_perp below dx) fall under the first edge.
+    """
+    rmin, rmax = float(rmin), float(rmax)
+    if log_bin_flag:
+        edges = xp.logspace(np.log10(rmin), np.log10(rmax), nbins + 1)
+        edges[0] = rmin * (1.0 - 1e-9)
+    else:
+        edges = xp.linspace(0.0, rmax, nbins + 1)
+    edges[-1] = rmax * (1.0 + 1e-9)
+    centres = xp.sqrt(edges[1:] * edges[:-1]) if log_bin_flag else 0.5 * (edges[1:] + edges[:-1])
+    return edges, centres
+
+
+def delta_edges_from_dist(ad, dist_key, scale='linear', n_delta=64, signed=False,
+                          vector=False, normalized_edges=None, min_fraction=1e-3):
+    """Increment-histogram edges for set_sf/set_sf_helmholtz from a cached
+    one-point PDF, ad.dist[dist_key] (as written by set_dist with the same
+    variable, weights and region).
+
+    The largest possible increment follows from the PDF support: max - min
+    for a scalar or velocity component, 2*max for a magnitude (vector=True),
+    so the top edge leaves nothing in the overflow column. The bottom edge is
+    min_fraction times the PDF's standard deviation sigma. Edges are
+    logarithmic in |delta|; signed=True mirrors them about zero (for the
+    signed longitudinal Helmholtz increment), with one bin [-low, low).
+
+    scale is the scale the dist entry was built with ('linear' or 'log10');
+    sigma and the support are evaluated in linear units either way.
+
+    normalized_edges, if given, are edges in units of sigma (fixed across
+    snapshots, so histograms of delta/sigma can be stacked); they are
+    returned multiplied by this snapshot's sigma.
+
+    Returns (edges, sigma).
+    """
+    if not hasattr(ad, 'dist') or dist_key not in ad.dist:
+        raise KeyError(f"no cached one-point PDF ad.dist['{dist_key}']; run set_dist first")
+    entry = ad.dist[dist_key]
+    loc = np.asarray(asnumpy(entry['loc']), dtype=np.float64)
+    pdf = np.asarray(asnumpy(entry['dat']), dtype=np.float64)
+    if loc.size < 2 or loc.shape != pdf.shape:
+        raise ValueError(f"ad.dist['{dist_key}'] has no usable bins")
+    half = 0.5 * np.gradient(loc)
+    lower_edge, upper_edge = loc - half, loc + half
+    if scale == 'log10':
+        values, lower_edge, upper_edge = 10.0 ** loc, 10.0 ** lower_edge, 10.0 ** upper_edge
+    elif scale == 'linear':
+        values = loc
+    else:
+        raise ValueError("scale must be 'linear' or 'log10'")
+    mass = pdf * (2.0 * half)
+    support = mass > 0
+    if not np.any(support) or mass.sum() <= 0:
+        raise ValueError(f"ad.dist['{dist_key}'] is empty")
+    mean = np.sum(values * mass) / mass.sum()
+    sigma = float(np.sqrt(max(np.sum((values - mean) ** 2 * mass) / mass.sum(), 0.0)))
+    if normalized_edges is not None:
+        if not sigma > 0:
+            raise ValueError('cannot normalise increments by a zero standard deviation')
+        return np.asarray(normalized_edges, dtype=np.float64) * sigma, sigma
+    vmin, vmax = lower_edge[support].min(), upper_edge[support].max()
+    span = 2.0 * max(abs(vmin), abs(vmax)) if vector else vmax - vmin
+    low = min_fraction * sigma if sigma > 0 else min_fraction * span
+    if not 0 < low < span:
+        raise ValueError(f'degenerate increment range from ad.dist[{dist_key!r}]')
+    if signed:
+        positive = np.logspace(np.log10(low), np.log10(span), n_delta // 2 + 1)
+        edges = np.concatenate([-positive[::-1], positive])
+    else:
+        edges = np.logspace(np.log10(low), np.log10(span), n_delta + 1)
+    # Widen the top edge so the largest possible increment stays in range.
+    edges[-1] *= 1.0 + 1e-9
+    if signed:
+        edges[0] *= 1.0 + 1e-9
+    return edges, sigma
+
+
+def _validated_delta_edges(delta_edges):
+    """Increment-histogram edges as a contiguous float64 backend array;
+    they must be finite and strictly increasing."""
+    edges = np.asarray(asnumpy(delta_edges), dtype=np.float64).ravel()
+    if edges.size < 2 or not np.all(np.isfinite(edges)) or np.any(np.diff(edges) <= 0):
+        raise ValueError('delta_edges must be finite, strictly increasing, with at least two edges')
+    return xp.ascontiguousarray(xp.asarray(edges))
+
+
+# Placeholder device buffer for kernels launched without an increment histogram.
+_NO_DELTA_PDF = xp.zeros(1, dtype=xp.float64)
+
+
 def _allocate_isotropic_sf_pair_workspace(no_vars, max_order, nbins, array_module=xp):
     """Allocate reusable isotropic SF scratch arrays."""
     return {
@@ -3224,124 +3306,33 @@ def _exchange_chunked_block_payloads(mpi_manager, requests_by_rank, data_to_send
 
     return received_data_all
 
-def _load_remote_blocks_mpi(ad, block_cache, remote_blocks, weights_list, varlist,
-                            mpi_manager, xyzlim=None):
-    """
-    Load blocks from remote MPI ranks via collective communication.
-    
-    Uses MPI_Alltoall pattern: each rank announces which blocks it needs,
-    then all ranks exchange the required data.
-    
-    Parameters
-    ----------
-    ad : AthenaData
-        Athena data object
-    block_cache : dict
-        Cache to store loaded blocks
-    remote_blocks : list of int
-        Global indices of blocks to load from other ranks
-    weights_list : list of str
-        Weight variables to load
-    varlist : list of str
-        Variables to load
-    mpi_manager : MPIManager
-        MPI communication manager
-    xyzlim : array, optional
-        Region of interest limits
-    """
-    from ..core.base import xp, asnumpy
-    
-    if not remote_blocks:
-        return
-    
-    rank = mpi_manager.rank
-    size = mpi_manager.size
-    
-    # Synchronize before MPI communication to avoid deadlock
-    mpi_manager.comm.Barrier()
-    
-    # Determine which rank owns each block
-    mbs_per_rank = ad.n_mbs // size
-    remainder = ad.n_mbs % size
-    
-    def get_owner_rank(global_block_idx):
-        """Get the rank that owns a given global block index"""
-        if global_block_idx < remainder * (mbs_per_rank + 1):
-            return global_block_idx // (mbs_per_rank + 1)
-        else:
-            return remainder + (global_block_idx - remainder * (mbs_per_rank + 1)) // mbs_per_rank
-    
-    # Group remote blocks by owning rank
-    requests_by_rank = {}
-    for block_idx in remote_blocks:
-        owner = get_owner_rank(block_idx)
-        if owner not in requests_by_rank:
-            requests_by_rank[owner] = []
-        requests_by_rank[owner].append(block_idx)
-    
-    # Gather all ranks' requests at all ranks (allgather)
-    all_requests = mpi_manager.comm.allgather(requests_by_rank)
-    
-    # Prepare data to send: what other ranks want from this rank
-    data_to_send = {}
-    for requesting_rank, their_requests in enumerate(all_requests):
-        if rank in their_requests:
-            blocks_they_want = their_requests[rank]
-            data_to_send[requesting_rank] = {}
-            owned_blocks = [
-                global_idx for global_idx in blocks_they_want
-                if 0 <= (global_idx - ad.local_mb_start) < (ad.local_mb_end - ad.local_mb_start)
-            ]
-            region_status_map = _prepare_xyz_block_regions(
-                ad, owned_blocks, xyzlim)
-
-            for global_mbl, global_mbh in _iter_contiguous_block_runs(owned_blocks):
-                weight_data_dict = {
-                    weight_name: ad.data(weight_name, global_mbl, global_mbh)
-                    for weight_name in weights_list
-                }
-                var_data_dict = {
-                    var: ad.data(var, global_mbl, global_mbh)
-                    for var in varlist
-                }
-
-                for global_idx in range(global_mbl, global_mbh):
-                    array_idx = global_idx - global_mbl
-                    region_status = region_status_map[global_idx]
-                    region_status, region_trimmed, coords_block, weights_block, vars_block = (
-                        _extract_xyz_region_block_data(
-                            ad.mb_geometry[global_idx],
-                            weight_data_dict[weights_list[0]][array_idx].shape,
-                            {weight_name: weight_data_dict[weight_name][array_idx]
-                             for weight_name in weights_list},
-                            {var: var_data_dict[var][array_idx] for var in varlist},
-                            region_status, xyzlim))
-                    block_data = {
-                        'weights': {},
-                        'vars': {}
-                    }
-
-                    for weight_name in weights_list:
-                        block_data['weights'][weight_name] = asnumpy(weights_block[weight_name])
-
-                    for var in varlist:
-                        block_data['vars'][var] = asnumpy(vars_block[var])
-
-                    data_to_send[requesting_rank][global_idx] = block_data
-    
-    received_data_all = _exchange_chunked_block_payloads(
-        mpi_manager, requests_by_rank, data_to_send, tag_base=100)
-
-    for global_idx, block_data in received_data_all.items():
-        block_cache[global_idx] = _rebuild_remote_block_cache_entry(
-            ad, global_idx, block_data, xyzlim)
-            
 def _distinct_pair_count(n1, n2, same_block) -> float:
     """Number of distinct point pairs a block pair holds: n(n-1)/2 when a block
     is paired with itself, n1*n2 otherwise. The samplers draw ordered pairs, so
     weighting a block pair by n1*n2 would count same-block pairs twice."""
     n1, n2 = float(n1), float(n2)
     return 0.5 * n1 * (n1 - 1.0) if same_block else n1 * n2
+
+
+def _pair_seed(b1, b2):
+    """Kernel base seed of global block pair (b1, b2): unique for any block
+    count below 2^32, so no two block pairs share a draw sequence."""
+    return np.uint64((int(b1) << 32) | int(b2))
+
+
+def _random_pair_weight(n1, n2, same_block, n_pairs) -> float:
+    """Importance weight of one random draw, so a block pair's weighted sums
+    estimate the sum over its distinct point pairs.
+
+    The random kernels draw ordered (i1, i2) uniformly from all n1*n2
+    combinations, with replacement, and discard i1 == i2 within a block. Each
+    ordered combination is therefore drawn n_pairs/(n1*n2) times on average.
+    Within one block every unordered pair occurs in both orders, hence the
+    extra 1/2; using n(n-1)/2 there would under-weight same-block pairs by
+    (n-1)/n, which matters for sparse masks with few cells per block.
+    """
+    total = 0.5 * float(n1) * float(n1) if same_block else float(n1) * float(n2)
+    return total / max(int(n_pairs), 1)
 
 
 def _sparse_block_view(block_cache, b, weight_name, varlist):
@@ -3369,8 +3360,21 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                     rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                     n_samples1, n_points_per_block, nsamples_block_min,
                     periodic_x, periodic_y, periodic_z, sparse_data=False, debug=False, use_mpi=False, random_seed=None,
-                    pair_workspace=None, weight_sampling_scales=None):
-    """Process a single pair of blocks for structure functions using varlist kernel"""
+                    pair_workspace=None, weight_sampling_scales=None, delta_edges=None, delta_pdf=None,
+                    use_exhaustive=False):
+    """Process a single pair of blocks for structure functions using varlist kernel.
+
+    use_exhaustive enumerates every distinct pair of a block pair (weight 1)
+    whenever that costs less than five times the sampling budget and fits
+    32-bit kernel indexing; other block pairs are sampled as usual.
+
+    With delta_edges (ascending increment edges, on the backend of sf) the
+    per-bin increment histogram is accumulated into delta_pdf, shape
+    (n_weights, n_vars, nbins, len(delta_edges) + 1), with the same
+    importance weights as the moment sums.
+    """
+    if (delta_edges is None) != (delta_pdf is None):
+        raise ValueError('delta_edges and delta_pdf must be given together')
     
     if debug:
         print(f"Debug: Starting _process_block_pair for pair ({b1}, {b2})")
@@ -3527,6 +3531,15 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
             local_sf = workspace['sf']
             local_num_bin_points = workspace['num']
             local_weight_sum_bin = workspace['wsum']
+            if delta_edges is not None:
+                pdf_size = no_vars * nbins * (len(delta_edges) + 1)
+                if workspace.get('pdf') is None or workspace['pdf'].size != pdf_size:
+                    workspace['pdf'] = xp.zeros(pdf_size, dtype=xp.float64)
+                else:
+                    workspace['pdf'].fill(0)
+                local_pdf, n_delta_edges = workspace['pdf'], len(delta_edges)
+            else:
+                local_pdf, n_delta_edges = _NO_DELTA_PDF, 0
             
             # Configure CUDA grid
             threadsperblock = 256
@@ -3561,15 +3574,41 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
             if b1 == b2:
                 x2_valid, y2_valid, z2_valid = x1_valid, y1_valid, z1_valid
                 weight2_valid, data2_valid = weight1_valid, data1_valid
-            pair_weight = _distinct_pair_count(n_valid1, n_valid2, b1 == b2) / max(n_pairs, 1)
-            # Exhaustive-kernel path is currently disabled; always uses random sampling.
-            use_exhaustive = False
+            pair_weight = _random_pair_weight(n_valid1, n_valid2, b1 == b2, n_pairs)
 
             if (use_exhaustive and n_valid_pairs < 5 * n_samples1_adj * n_samples2_adj
                     and n_valid_pairs <= np.iinfo(np.int32).max // 4):
                 pair_weight = 1.0  # every distinct pair visited once
-                if debug:
-                    print(f"Debug: Would use exhaustive kernel (DISABLED)")
+                if not cupy_enabled or structure_function_varlist_kernel_exhaustive is None:
+                    sf_cpu, num_cpu, weights_cpu, pdf_cpu = _compute_sf_cpu_vectorized(
+                        asnumpy(data1_valid), asnumpy(data2_valid), no_vars,
+                        asnumpy(weight1_valid), asnumpy(weight2_valid),
+                        asnumpy(x1_valid), asnumpy(y1_valid), asnumpy(z1_valid),
+                        asnumpy(x2_valid), asnumpy(y2_valid), asnumpy(z2_valid),
+                        asnumpy(rbins), max_order, float(Lx), float(Ly), float(Lz),
+                        periodic_x, periodic_y, periodic_z, 0, 0, b1 == b2,
+                        delta_edges=None if delta_edges is None else asnumpy(delta_edges),
+                        exhaustive=True)
+                    for ivar in range(no_vars):
+                        sf[iw, ivar] += xp.asarray(sf_cpu[ivar])
+                    num_bin_points[iw] += xp.asarray(num_cpu)
+                    weight_sum_bin[iw] += xp.asarray(weights_cpu)
+                    if delta_pdf is not None:
+                        delta_pdf[iw] += xp.asarray(pdf_cpu)
+                else:
+                    structure_function_varlist_kernel_exhaustive(
+                        ((n_valid_pairs + threadsperblock - 1) // threadsperblock,), (threadsperblock,),
+                        (data1_valid, data2_valid, no_vars,
+                         weight1_valid, weight2_valid,
+                         x1_valid, y1_valid, z1_valid,
+                         x2_valid, y2_valid, z2_valid,
+                         rbins,
+                         local_sf, local_num_bin_points,
+                         local_weight_sum_bin, n_valid_pairs, n_valid1, n_valid2,
+                         float(Lx), float(Ly), float(Lz),
+                         nbins, max_order,
+                         periodic_x, periodic_y, periodic_z,
+                         local_pdf, local_pdf if delta_edges is None else delta_edges, n_delta_edges))
             else:
                 if debug:
                     print(f"Debug: Using random sampling kernel")
@@ -3594,9 +3633,7 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                     if not cupy_enabled or structure_function_varlist_kernel is None:
                         # Use CPU fallback
                         if debug:
-                            accel_msg = "with Numba JIT" if NUMBA_AVAILABLE else "pure NumPy (slow - install numba for 10-100x speedup)"
-                            if debug:
-                                print(f"Debug: Using CPU fallback for structure function computation ({accel_msg})")
+                            print("Debug: Using CPU fallback for structure function computation")
                         
                         # Convert to NumPy arrays
                         data1_cpu = asnumpy(data1_valid)
@@ -3611,42 +3648,28 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                         z2_cpu = asnumpy(z2_valid)
                         rbins_cpu = asnumpy(rbins)
                         
-                        # Compute for each variable
-                        for ivar, var in enumerate(varlist):
-                            # Extract data for this variable
-                            var_data1 = data1_cpu[ivar * n_valid1:(ivar+1) * n_valid1]
-                            var_data2 = data2_cpu[ivar * n_valid2:(ivar+1) * n_valid2]
-                            
-                            # Compute structure function on CPU using vectorized implementation
-                            # Use deterministic seed based on block pair (b1, b2) for reproducibility
-                            # This ensures CPU and GPU sample the same point pairs
-                            pair_seed = random_seed if random_seed is not None else (b1 * 10000 + b2)
-                            var_sf_cpu, num_cpu, weights_cpu = _compute_sf_cpu_vectorized(
-                                var_data1, var_data2,
-                                weight1_cpu, weight2_cpu,
-                                x1_cpu, y1_cpu, z1_cpu,
-                                x2_cpu, y2_cpu, z2_cpu,
-                                rbins_cpu, nbins, max_order,
-                                float(Lx), float(Ly), float(Lz),
-                                periodic_x, periodic_y, periodic_z,
-                                n_pairs, use_mpi=use_mpi, random_seed=pair_seed
-                            )
-                            
-                            # Accumulate results
-                            sf[iw, ivar] += pair_weight * var_sf_cpu
-                            
-                            # Accumulate weights (only once per weight)
-                            if ivar == 0:
-                                num_bin_points[iw] += num_cpu
-                                weight_sum_bin[iw] += pair_weight * weights_cpu
+                        pair_seed = np.uint64(random_seed) if random_seed is not None else _pair_seed(b1, b2)
+                        sf_cpu, num_cpu, weights_cpu, pdf_cpu = _compute_sf_cpu_vectorized(
+                            data1_cpu, data2_cpu, no_vars,
+                            weight1_cpu, weight2_cpu,
+                            x1_cpu, y1_cpu, z1_cpu,
+                            x2_cpu, y2_cpu, z2_cpu,
+                            rbins_cpu, max_order,
+                            float(Lx), float(Ly), float(Lz),
+                            periodic_x, periodic_y, periodic_z,
+                            n_pairs, pair_seed, b1 == b2,
+                            delta_edges=None if delta_edges is None else asnumpy(delta_edges))
+                        for ivar in range(no_vars):
+                            sf[iw, ivar] += pair_weight * xp.asarray(sf_cpu[ivar])
+                        num_bin_points[iw] += xp.asarray(num_cpu)
+                        weight_sum_bin[iw] += pair_weight * xp.asarray(weights_cpu)
+                        if delta_pdf is not None:
+                            delta_pdf[iw] += pair_weight * xp.asarray(pdf_cpu)
                         
                         if debug:
                             print(f"Debug: CPU fallback computation completed")
                     else:
-                        # Use GPU kernel with deterministic base seed
-                        # Use block indices to create reproducible seed
-                        pair_seed = random_seed if random_seed is not None else (b1 * 10000 + b2)
-                        base_seed = np.uint32((int(pair_seed) * 1013904223) % (2**32))
+                        base_seed = np.uint64(random_seed) if random_seed is not None else _pair_seed(b1, b2)
                         structure_function_varlist_kernel(
                             (blockspergrid,), (threadsperblock,),
                             (data1_valid, data2_valid, no_vars,
@@ -3659,7 +3682,8 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
                             float(Lx), float(Ly), float(Lz),
                             nbins, max_order,
                             periodic_x, periodic_y, periodic_z,
-                            base_seed)
+                            base_seed,
+                            local_pdf, local_pdf if delta_edges is None else delta_edges, n_delta_edges)
                         )
                         
                         if debug:
@@ -3689,6 +3713,8 @@ def _process_block_pair(ad, b1, b2, block_cache, block_centers, weights_list, va
 
                 num_bin_points[iw] += local_num_bin_points
                 weight_sum_bin[iw] += pair_weight * local_weight_sum_bin
+                if delta_pdf is not None:
+                    delta_pdf[iw] += pair_weight * local_pdf.reshape(no_vars, nbins, -1)
             
             if debug:
                 points_added = int(local_num_bin_points.sum())
@@ -3802,20 +3828,9 @@ def get_sf_helmholtz(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7
         # Get weight data
         if debug:
             print(f"Debug: Loading weight data for: {weight_name}")
-        try:
-            if weight_name == 'ones':
-                weight_data = None  # Will create ones arrays later
-                if debug:
-                    print(f"Debug: Using ones for weight")
-            else:
-                weight_data = ad.data(weight_name)
-                if debug:
-                    print(f"Debug: Successfully loaded weight data for {weight_name}")
-        except Exception as e:
-            print(f"Error: Failed to load weight data for {weight_name}: {e}")
-            # Fallback to ones if weight data can't be loaded
-            print(f"Warning: Using 'ones' as fallback for weight {weight_name}")
-            weight_data = None
+        # A weight that fails to load is an error: silently using 'ones' would
+        # return an unweighted, whole-domain SF under the requested name.
+        weight_data = None if weight_name == 'ones' else ad.data(weight_name)
         
         # Apply xyz filtering if specified
         if xyz is not None:
@@ -3824,7 +3839,7 @@ def get_sf_helmholtz(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7
             try:
                 xyz_weights = ad.data('xyzbool', xyz=xyz)
                 if weight_data is not None:
-                    weight_data *= xyz_weights
+                    weight_data = weight_data * xyz_weights  # never modify ad.data() results in place
                 else:
                     weight_data = xyz_weights
                 if debug:
@@ -3889,12 +3904,7 @@ def get_sf_helmholtz(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7
             
         # Make rbins
         try:
-            if log_bin_flag:
-                rbins = xp.logspace(xp.log10(rmin),xp.log10(rmax),nbins+1)
-                r_ = xp.sqrt(rbins[1:]*rbins[:-1])
-            else:
-                rbins = xp.linspace(0,rmax,nbins+1)
-                r_ = 0.5*(rbins[1:]+rbins[:-1])
+            rbins, r_ = radial_bin_edges(rmin, rmax, nbins, log_bin_flag)
             if debug:
                 print(f"Debug: Created {nbins} radial bins, log_bin_flag={log_bin_flag}")
         except Exception as e:
@@ -4045,10 +4055,14 @@ def get_sf_helmholtz(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7
                     blockspergrid = (n_pairs + threadsperblock - 1) // threadsperblock
                     # Uniform average over all point pairs: weight this block pair's sums by
                     # (point pairs it holds) / (pairs sampled from it).
-                    pair_weight = _distinct_pair_count(n_points_per_block, n_points_per_block, int(b1) == int(b2)) / max(n_pairs, 1)
+                    pair_weight = _random_pair_weight(n_points_per_block, n_points_per_block, int(b1) == int(b2), n_pairs)
 
-                    # Launch kernel with deterministic seed based on block index
-                    base_seed = idx * 12345 + 67890
+                    if int(b1) == int(b2):
+                        # Same arrays, so the kernel recognises the same-block pair
+                        # and skips same-point draws.
+                        data2_x, data2_y, data2_z = data1_x, data1_y, data1_z
+                        weight2, x2, y2, z2 = weight1, x1, y1, z1
+                    base_seed = _pair_seed(b1, b2)
                     local_sf_comp = xp.zeros_like(sf_comp_flat_contiguous)
                     local_sf_sol = xp.zeros_like(sf_sol_flat_contiguous)
                     local_num = xp.zeros_like(num_bin_points_contiguous)
@@ -4067,7 +4081,8 @@ def get_sf_helmholtz(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7
                         n_points_per_block, n_points_per_block,
                         float(Lx), float(Ly), float(Lz),
                         nbins, max_order,
-                        periodic_x, periodic_y, periodic_z, base_seed))
+                        periodic_x, periodic_y, periodic_z, base_seed,
+                        _NO_DELTA_PDF, _NO_DELTA_PDF, 0, _NO_DELTA_PDF, _NO_DELTA_PDF, 0))
                         
                     # Keep the hot path asynchronous unless debug asks for eager synchronization.
                     if debug and cupy_enabled:
@@ -4112,7 +4127,8 @@ def get_sf_helmholtz(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7
         raise 
 
 def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=1e7, nbins=100, 
-            log_bin_flag=True, nsamples_block_min=1000, sparse_data=False, debug=False, simultaneous_blocks=None, mpi_manager=None):
+            log_bin_flag=True, nsamples_block_min=1000, sparse_data=False, debug=False, simultaneous_blocks=None, mpi_manager=None,
+            delta_edges_comp=None, delta_edges_sol=None):
     """
     Calculate structure functions with Helmholtz decomposition using GPU acceleration and batch processing.
 
@@ -4144,6 +4160,11 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
         Number of blocks to process per batch. Default=None (auto)
     mpi_manager : MPIManager, optional
         MPI manager for distributed computation. Default=None
+    delta_edges_comp, delta_edges_sol : array-like, optional
+        Edges for per-separation-bin histograms of the signed longitudinal
+        increment (dv . r_hat, which is invariant under swapping the two
+        points) and of the transverse magnitude, with underflow/overflow
+        columns as in get_sf_mb. Default=None
     
     Returns
     -------
@@ -4157,8 +4178,15 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
         Sum of weights in each radial bin
     num_bin_points : xp.ndarray
         Number of point pairs in each radial bin
+    delta_pdf_comp, delta_pdf_sol : xp.ndarray or None
+        Only when either edge set is given: histograms of shape
+        ([n_weights,] nbins, len(edges) + 1), None for a part without edges
     """
     
+    if not cupy_enabled or structure_function_helmholtz_kernel is None:
+        # There is no CPU Helmholtz kernel; fail instead of returning zeros.
+        raise RuntimeError('get_sf_helmholtz_mb requires CUDA (CuPy); no CPU Helmholtz kernel exists')
+
     # Establish rank early for debug output
     rank = mpi_manager.rank if mpi_manager else 0
     
@@ -4235,7 +4263,7 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
     # Calculate sampling parameters
     # IMPORTANT: For MPI mode, use GLOBAL block count
     # This ensures consistent sampling rates across all configurations
-    n_samples1 = int(np.sqrt(npairs)/ad.n_mbs)  # Use global block count
+    n_samples1 = max(1, int(np.sqrt(npairs)/ad.n_mbs))  # Use global block count
     if n_samples1 < nsamples_block_min:
         print(f'Warning: n_samples1 = {n_samples1} is less than {nsamples_block_min}, consider increasing npairs')
     n_points_per_block = ad.nx1 * ad.nx2 * ad.nx3
@@ -4253,12 +4281,7 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
         print(f"Debug: Successfully created block centers, shape: {block_centers.shape}")
     
     # Create radial bins
-    if log_bin_flag:
-        rbins = xp.logspace(xp.log10(rmin), xp.log10(rmax), nbins+1)
-        r_ = xp.sqrt(rbins[1:]*rbins[:-1])
-    else:
-        rbins = xp.linspace(0, rmax, nbins+1)
-        r_ = 0.5*(rbins[1:]+rbins[:-1])
+    rbins, r_ = radial_bin_edges(rmin, rmax, nbins, log_bin_flag)
     if debug:
         print(f"Debug: Created {nbins} radial bins, log_bin_flag={log_bin_flag}")
     
@@ -4267,6 +4290,16 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
     sf_sol = xp.zeros((n_weights, max_order, nbins), dtype=xp.float64)
     num_bin_points = xp.zeros((n_weights, nbins), dtype=xp.float64)
     weight_sum_bin = xp.zeros((n_weights, nbins), dtype=xp.float64)
+    delta = None
+    if delta_edges_comp is not None or delta_edges_sol is not None:
+        delta = {}
+        for part, edges in (('comp', delta_edges_comp), ('sol', delta_edges_sol)):
+            if edges is None:
+                delta[part + '_edges'] = delta['pdf_' + part] = None
+            else:
+                delta[part + '_edges'] = _validated_delta_edges(edges)
+                delta['pdf_' + part] = xp.zeros((n_weights, nbins, len(delta[part + '_edges']) + 1),
+                                                dtype=xp.float64)
     if debug:
         print(f"Debug: Successfully initialized result arrays with shapes:")
         if debug:
@@ -4344,7 +4377,7 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
                           rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                           n_samples1, n_points_per_block, nsamples_block_min,
                           periodic_x, periodic_y, periodic_z, sparse_data, xyzlim=xyz,
-                          mpi_manager=mpi_manager, mb_offset=mb_offset, debug=debug)
+                          mpi_manager=mpi_manager, mb_offset=mb_offset, debug=debug, delta=delta)
     else:
         # NON-MPI MODE: Process local blocks only
         # Process blocks in batches
@@ -4365,7 +4398,7 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
                                 block_centers, rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                                 n_samples1, n_points_per_block, nsamples_block_min, 
                                 periodic_x, periodic_y, periodic_z, sparse_data, xyzlim=xyz, 
-                                use_mpi=False, mpi_manager=None, mb_offset=0, debug=debug)
+                                use_mpi=False, mpi_manager=None, mb_offset=0, debug=debug, delta=delta)
         if debug:
             print(f"Debug: Completed batch pair processing")
     
@@ -4408,7 +4441,7 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
                                         nbins, max_order, n_samples1, n_points_per_block, 
                                         nsamples_block_min, periodic_x, periodic_y, periodic_z, 
                                         sparse_data, xyzlim=xyz, debug=debug,
-                                        use_mpi=False, mpi_manager=None, mb_offset=0)
+                                        use_mpi=False, mpi_manager=None, mb_offset=0, delta=delta)
                 if debug:
                     print(f"Debug: Completed processing missed pairs")
     
@@ -4423,6 +4456,10 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
         sf_sol = sf_sol[0]
         num_bin_points = num_bin_points[0]
         weight_sum_bin = weight_sum_bin[0]
+        if delta is not None:
+            for part in ('comp', 'sol'):
+                if delta['pdf_' + part] is not None:
+                    delta['pdf_' + part] = delta['pdf_' + part][0]
         if debug:
             print(f"Debug: Reshaped output for single weight, sf_comp shape: {sf_comp.shape}")
     
@@ -4453,10 +4490,18 @@ def get_sf_helmholtz_mb(ad, var, weights='ones', xyz=None, max_order=10, npairs=
         sf_sol = xp.asarray(sf_sol_total)
         num_bin_points = xp.asarray(num_bin_points_total)
         weight_sum_bin = xp.asarray(weight_sum_bin_total)
+        if delta is not None:
+            for part in ('comp', 'sol'):
+                if delta['pdf_' + part] is not None:
+                    delta['pdf_' + part] = xp.asarray(
+                        mpi_manager.allreduce(asnumpy(delta['pdf_' + part]), op='sum'))
         
         if debug:
             print(f"Debug: Rank {mpi_manager.rank}: MPI aggregation complete")
     
+    if delta is not None:
+        return (r_, sf_comp, sf_sol, weight_sum_bin, xp.array(num_bin_points, dtype=int),
+                delta['pdf_comp'], delta['pdf_sol'])
     return r_, sf_comp, sf_sol, weight_sum_bin, xp.array(num_bin_points, dtype=int)
 
 def _process_mpi_pairs_helmholtz(ad, my_pairs, block_cache, weights_list, varlist,
@@ -4464,203 +4509,29 @@ def _process_mpi_pairs_helmholtz(ad, my_pairs, block_cache, weights_list, varlis
                       rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                       n_samples1, n_points_per_block, nsamples_block_min,
                       periodic_x, periodic_y, periodic_z, sparse_data=False, xyzlim=None,
-                      mpi_manager=None, mb_offset=0, debug=False):
-    """
-    Process assigned block pairs in MPI mode with Helmholtz decomposition.
-    
-    PAIR COVERAGE GUARANTEE:
-    - Caller generates ALL pairs (i,j) where 0 <= i <= j < n_mbs
-    - Pairs are distributed round-robin: rank r processes pairs where idx % size == r
-    - This ensures every pair is processed by exactly one rank
-    - Results from all ranks are aggregated via MPI reduce after processing
-    
-    MEMORY MANAGEMENT:
-    - Pairs processed in batches sized by determine_blocks_per_batch()
-    - Batch size calculated from actual GPU/CPU memory and block dimensions
-    - Blocks loaded/unloaded per batch to respect memory constraints
-    
-    OPTIMIZATION:
-    - Pairs reordered to minimize remote block fetching:
-      1. Both blocks local (no MPI needed)
-      2. One block local (minimal MPI)
-      3. Both blocks remote (maximum MPI)
-    """
-    rank = mpi_manager.rank if mpi_manager else 0
-    size = mpi_manager.size if mpi_manager else 1
-    
-    if debug:
-        print(f"Debug: Rank {rank}: Processing {len(my_pairs)} assigned pairs (Helmholtz)")
-    
-    # Get local block range for this rank
-    local_start = mb_offset
-    # Calculate number of local meshblocks
-    if hasattr(ad, 'has_full_data') and not ad.has_full_data:
-        nmbs_local = ad.local_mb_end - ad.local_mb_start
-    else:
-        nmbs_local = ad.n_mbs
-    local_end = mb_offset + nmbs_local
-    
-    if debug:
-        print(f"Debug: Rank {rank}: Local blocks [{local_start}, {local_end})")
-    
-    # DON'T filter pairs - process ALL assigned pairs
-    # We'll load remote blocks via MPI as needed
-    
-    # Compute block centers for ALL GLOBAL blocks (needed for sampling weights)
-    # Each rank computes this independently - no communication needed
-    block_centers_global = np.zeros((ad.n_mbs, 3))
-    full_geometry = ad.mb_geometry[:ad.n_mbs, :]
-    block_centers_global[:, 0] = 0.5 * (full_geometry[:, 0] + full_geometry[:, 1])
-    block_centers_global[:, 1] = 0.5 * (full_geometry[:, 2] + full_geometry[:, 3])
-    block_centers_global[:, 2] = 0.5 * (full_geometry[:, 4] + full_geometry[:, 5])
-    
-    if debug:
-        print(f"Debug: Rank {rank}: Created global block_centers with shape {block_centers_global.shape}")
-        if debug:
-            print(f"Debug: Rank {rank}: Processing {len(my_pairs)} assigned pairs (including remote blocks)")
-    
-    # Determine batch size based on actual memory and block size
-    # Use same memory estimation as non-MPI version
-    from athena_research.utils.batch_processing import determine_blocks_per_batch
-    
-    # Calculate blocks per batch based on memory
-    blocks_per_batch = determine_blocks_per_batch(ad.n_mbs, len(varlist) * 3, len(weights_list), n_points_per_block)
-    
-    if debug:
-        print(f"Debug: Rank {rank}: Calculated blocks_per_batch={blocks_per_batch} based on memory constraints")
-    
-    # Get all unique blocks needed by this rank
-    all_blocks_needed = set()
-    for global_b1, global_b2 in my_pairs:
-        all_blocks_needed.add(global_b1)
-        all_blocks_needed.add(global_b2)
-    
-    # Separate local vs remote blocks
-    local_blocks = [b for b in all_blocks_needed if local_start <= b < local_end]
-    remote_blocks = [b for b in all_blocks_needed if b < local_start or b >= local_end]
-    
-    if debug:
-        print(f"Debug: Rank {rank}: Need {len(local_blocks)} local and {len(remote_blocks)} remote blocks")
-    
-    # Optimize pair ordering: prioritize pairs with both blocks local,
-    # then pairs with one local block, then pairs with both remote
-    # This minimizes remote block fetching per batch
-    pairs_by_locality = {
-        'both_local': [],
-        'one_local': [],
-        'both_remote': []
-    }
-    
-    for global_b1, global_b2 in my_pairs:
-        b1_local = (local_start <= global_b1 < local_end)
-        b2_local = (local_start <= global_b2 < local_end)
-        
-        if b1_local and b2_local:
-            pairs_by_locality['both_local'].append((global_b1, global_b2))
-        elif b1_local or b2_local:
-            pairs_by_locality['one_local'].append((global_b1, global_b2))
-        else:
-            pairs_by_locality['both_remote'].append((global_b1, global_b2))
-    
-    # Reorder pairs to process local-heavy batches first
-    optimized_pairs = (pairs_by_locality['both_local'] + 
-                      pairs_by_locality['one_local'] + 
-                      pairs_by_locality['both_remote'])
-    
-    if debug:
-        print(f"Debug: Rank {rank}: Pair locality - both_local:{len(pairs_by_locality['both_local'])}, "
-              f"one_local:{len(pairs_by_locality['one_local'])}, both_remote:{len(pairs_by_locality['both_remote'])}")
-    
-    
-    # Process pairs in batches
-    pairs_processed = 0
-    pair_idx = 0
-    
-    while pair_idx < len(optimized_pairs):
-        # Determine blocks needed for this batch of pairs
-        batch_blocks_needed = set()
-        batch_end_idx = pair_idx
-        
-        # Greedily add pairs to batch until we hit memory limit
-        while batch_end_idx < len(optimized_pairs) and len(batch_blocks_needed) < blocks_per_batch:
-            global_b1, global_b2 = optimized_pairs[batch_end_idx]
-            
-            # Check if adding this pair would exceed batch size
-            new_blocks = set()
-            if global_b1 not in block_cache:
-                new_blocks.add(global_b1)
-            if global_b2 not in block_cache:
-                new_blocks.add(global_b2)
-            
-            # If this would exceed limit and we already have some blocks, stop
-            if len(batch_blocks_needed) + len(new_blocks) > blocks_per_batch and len(batch_blocks_needed) > 0:
-                break
-            
-            batch_blocks_needed.update(new_blocks)
-            batch_end_idx += 1
-        
-        # Extract batch pairs
-        batch_pairs = optimized_pairs[pair_idx:batch_end_idx]
-        
-        if debug:
-            print(f"Debug: Rank {rank}: Processing batch with {len(batch_blocks_needed)} blocks, {len(batch_pairs)} pairs")
-        
-        # Load blocks for this batch
-        if batch_blocks_needed:
-            _load_all_blocks_upfront(ad, block_cache, list(batch_blocks_needed),
-                                    weights_list, varlist,
-                                    local_start, local_end, xyzlim, mpi_manager, debug=False)
-        
-        # Process all pairs in this batch
-        for global_b1, global_b2 in batch_pairs:
-            if debug and pairs_processed % 10 == 0:
-                if debug:
-                    print(f"Debug: Rank {rank}: Processing pair {pairs_processed}/{len(optimized_pairs)}: ({global_b1}, {global_b2})")
-            
-            # Check if blocks are outside xyz limits
-            if xyzlim is not None:
-                if is_block_outside_xyz(ad.mb_geometry, global_b1, xyzlim) or \
-                   is_block_outside_xyz(ad.mb_geometry, global_b2, xyzlim):
-                    continue
-            
-            # Verify both blocks are loaded
-            if global_b1 not in block_cache or global_b2 not in block_cache:
-                if debug:
-                    print(f"Debug: Rank {rank}: Warning - blocks ({global_b1}, {global_b2}) not in cache, skipping")
-                continue
-        
-            # Process the pair using GLOBAL indices (ONLY DIFFERENCE: Helmholtz kernel)
-            _process_block_pair_helmholtz(ad, global_b1, global_b2, block_cache, block_centers_global,
-                                         weights_list, varlist, sf_comp, sf_sol, num_bin_points, weight_sum_bin,
-                                         rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
-                                         n_samples1, n_points_per_block, nsamples_block_min,
-                                         periodic_x, periodic_y, periodic_z, sparse_data, debug=False, use_mpi=True,
-                                         random_seed=(global_b1 * 10000 + global_b2))
-            
-            pairs_processed += 1
-        
-        # Clear cache for this batch to free memory
-        for block_id in batch_blocks_needed:
-            if block_id in block_cache:
-                del block_cache[block_id]
-        
-        _free_gpu_memory_pool()
+                      mpi_manager=None, mb_offset=0, debug=False, delta=None):
+    """Helmholtz SF pairs of this rank, on the same synchronized MPI schedule
+    as the isotropic path (a per-batch remote exchange would make ranks with
+    different batch counts issue mismatched collectives)."""
+    def process_pair(global_b1, global_b2, block_centers_global):
+        _process_block_pair_helmholtz(
+            ad, global_b1, global_b2, block_cache, block_centers_global,
+            weights_list, varlist, sf_comp, sf_sol, num_bin_points, weight_sum_bin,
+            rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
+            n_samples1, n_points_per_block, nsamples_block_min,
+            periodic_x, periodic_y, periodic_z, sparse_data, debug=False, use_mpi=True,
+            random_seed=_pair_seed(global_b1, global_b2), delta=delta)
+    _run_mpi_pair_schedule(ad, my_pairs, block_cache, weights_list, varlist,
+                           n_points_per_block, process_pair, xyzlim=xyzlim,
+                           mpi_manager=mpi_manager, mb_offset=mb_offset, debug=debug)
 
-        if debug:
-            print(f"Debug: Rank {rank}: Batch complete, cleared {len(batch_blocks_needed)} blocks, processed {pairs_processed}/{len(optimized_pairs)} pairs so far")
-        
-        # Move to next batch
-        pair_idx = batch_end_idx
-    
-    if debug:
-        print(f"Debug: Rank {rank}: Completed processing all {pairs_processed} assigned pairs")
 
 def _process_batch_pairs_helmholtz(ad, batches, block_cache, processed_pairs, weights_list, varlist, 
                         sf_comp, sf_sol, num_bin_points, weight_sum_bin,
                         block_centers, rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                         n_samples1, n_points_per_block, nsamples_block_min, 
                         periodic_x, periodic_y, periodic_z, sparse_data=False, xyzlim=None, debug=False, 
-                        use_mpi=False, mpi_manager=None, mb_offset=0):
+                        use_mpi=False, mpi_manager=None, mb_offset=0, delta=None):
     """
     Helper function to process batch pairs for Helmholtz-decomposed structure functions.
     
@@ -4668,6 +4539,10 @@ def _process_batch_pairs_helmholtz(ad, batches, block_cache, processed_pairs, we
     local block. For remote blocks (on other ranks), it uses MPI communication to 
     exchange data as needed.
     """
+    if use_mpi and mpi_manager is not None:
+        # MPI pairs go through _run_mpi_pair_schedule; this loop's per-rank
+        # owner rule does not match the meshblock decomposition.
+        raise ValueError('batch pair loop is serial; MPI runs use the synchronized pair schedule')
     
     if debug:
         print(f"Debug: Starting Helmholtz batch pairs processing with {len(batches)} batches")
@@ -4740,7 +4615,8 @@ def _process_batch_pairs_helmholtz(ad, batches, block_cache, processed_pairs, we
                         sf_comp, sf_sol, num_bin_points, weight_sum_bin, 
                         rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                         n_samples1, n_points_per_block, nsamples_block_min,
-                        periodic_x, periodic_y, periodic_z, sparse_data, debug=debug, use_mpi=use_mpi
+                        periodic_x, periodic_y, periodic_z, sparse_data, debug=debug, use_mpi=use_mpi,
+                        delta=delta
                     )
                     processed_pairs.add(pair)
                     intra_pairs += 1
@@ -4785,7 +4661,8 @@ def _process_batch_pairs_helmholtz(ad, batches, block_cache, processed_pairs, we
                             sf_comp, sf_sol, num_bin_points, weight_sum_bin, 
                             rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                             n_samples1, n_points_per_block, nsamples_block_min,
-                            periodic_x, periodic_y, periodic_z, sparse_data, debug=debug, use_mpi=use_mpi
+                            periodic_x, periodic_y, periodic_z, sparse_data, debug=debug, use_mpi=use_mpi,
+                            delta=delta
                         )
                         processed_pairs.add(pair)
                         cross_pairs += 1
@@ -4813,8 +4690,15 @@ def _process_block_pair_helmholtz(ad, b1, b2, block_cache, block_centers, weight
                             sf_comp, sf_sol, num_bin_points, weight_sum_bin, 
                             rmax, rmin, Lx, Ly, Lz, rbins, nbins, max_order,
                             n_samples1, n_points_per_block, nsamples_block_min,
-                            periodic_x, periodic_y, periodic_z, sparse_data=False, debug=False, use_mpi=False, random_seed=None):
-    """Process a single pair of blocks for Helmholtz-decomposed structure functions"""
+                            periodic_x, periodic_y, periodic_z, sparse_data=False, debug=False, use_mpi=False, random_seed=None,
+                            delta=None):
+    """Process a single pair of blocks for Helmholtz-decomposed structure functions.
+
+    delta, if given, holds increment-histogram edges and accumulators:
+    'comp_edges'/'pdf_comp' for the signed longitudinal increment and
+    'sol_edges'/'pdf_sol' for the transverse magnitude; each pair may be
+    None. Accumulators have shape (n_weights, nbins, len(edges) + 1).
+    """
     
     if debug:
         print(f"Debug: Processing Helmholtz block pair ({b1}, {b2})")
@@ -4877,191 +4761,243 @@ def _process_block_pair_helmholtz(ad, b1, b2, block_cache, block_centers, weight
                 print(f"Debug: Skipping Helmholtz pair ({b1}, {b2}) for weight {weight_name} - zero phase support in block cache")
             continue
         
-        try:
-            # Process data differently based on sparse_data flag
-            if sparse_data:
-                if debug:
-                    print(f"Debug: Using sparse data filtering for weight {weight_name}")
-                # Filter out points with zero or negative weights
-                valid_points1 = weight1 > 0
-                valid_points2 = weight2 > 0
-                
-                # Convert array sum to host scalar safely
-                if cupy_enabled:
-                    valid_count1 = int(xp.sum(valid_points1).get())
-                    valid_count2 = int(xp.sum(valid_points2).get())
-                else:
-                    valid_count1 = int(xp.sum(valid_points1))
-                    valid_count2 = int(xp.sum(valid_points2))
-                
-                if debug:
-                    print(f"Debug: Valid points - block {b1}: {valid_count1}, block {b2}: {valid_count2}")
-                
-                # Skip if no valid points
-                if valid_count1 == 0 or valid_count2 == 0:
-                    if debug:
-                        print(f"Debug: Skipping pair ({b1}, {b2}) - no valid points")
-                    continue
-                
-                # Extract only valid points
-                x1_valid = x1[valid_points1]
-                y1_valid = y1[valid_points1]
-                z1_valid = z1[valid_points1]
-                weight1_valid = weight1[valid_points1]
-                
-                x2_valid = x2[valid_points2]
-                y2_valid = y2[valid_points2]
-                z2_valid = z2[valid_points2]
-                weight2_valid = weight2[valid_points2]
-                
-                # Extract valid vector components
-                vx1_valid = vx1[valid_points1]
-                vy1_valid = vy1[valid_points1]
-                vz1_valid = vz1[valid_points1]
-                
-                vx2_valid = vx2[valid_points2]
-                vy2_valid = vy2[valid_points2]
-                vz2_valid = vz2[valid_points2]
-                
-                # Get number of valid points
-                n_valid1 = x1_valid.size
-                n_valid2 = x2_valid.size
-                
-                # If valid points are fewer than what we need, adjust n_samples
-                n_samples1_adj = min(n_samples1, n_valid1)
-                n_samples2_adj = min(n_samples2, n_valid2)
+        # Process data differently based on sparse_data flag
+        if sparse_data:
+            if debug:
+                print(f"Debug: Using sparse data filtering for weight {weight_name}")
+            # Filter out points with zero or negative weights
+            valid_points1 = weight1 > 0
+            valid_points2 = weight2 > 0
+            
+            # Convert array sum to host scalar safely
+            if cupy_enabled:
+                valid_count1 = int(xp.sum(valid_points1).get())
+                valid_count2 = int(xp.sum(valid_points2).get())
             else:
+                valid_count1 = int(xp.sum(valid_points1))
+                valid_count2 = int(xp.sum(valid_points2))
+            
+            if debug:
+                print(f"Debug: Valid points - block {b1}: {valid_count1}, block {b2}: {valid_count2}")
+            
+            # Skip if no valid points
+            if valid_count1 == 0 or valid_count2 == 0:
                 if debug:
-                    print(f"Debug: Using all points (no sparse filtering) for weight {weight_name}")
-                # Use all points, regardless of weight
-                x1_valid = x1
-                y1_valid = y1
-                z1_valid = z1
-                weight1_valid = weight1
-                
-                x2_valid = x2
-                y2_valid = y2
-                z2_valid = z2
-                weight2_valid = weight2
-                
-                vx1_valid = vx1
-                vy1_valid = vy1
-                vz1_valid = vz1
-                
-                vx2_valid = vx2
-                vy2_valid = vy2
-                vz2_valid = vz2
-                
-                # The cached arrays may already be interface-trimmed at load time,
-                # so the valid-point count must follow the cached data rather than
-                # the original full meshblock cell count.
-                n_valid1 = x1_valid.size
-                n_valid2 = x2_valid.size
-                n_samples1_adj = min(n_samples1, n_valid1)
-                n_samples2_adj = min(n_samples2, n_valid2)
+                    print(f"Debug: Skipping pair ({b1}, {b2}) - no valid points")
+                continue
             
-            # Local arrays for accumulation
-            local_sf_comp = xp.zeros((max_order, nbins), dtype=xp.float64)
-            local_sf_sol = xp.zeros((max_order, nbins), dtype=xp.float64)
-            local_sf_comp_flat = xp.ascontiguousarray(local_sf_comp.flatten(), dtype=xp.float64)
-            local_sf_sol_flat = xp.ascontiguousarray(local_sf_sol.flatten(), dtype=xp.float64)
-            local_num_bin_points = xp.zeros(nbins, dtype=xp.float64)
-            local_weight_sum_bin = xp.zeros(nbins, dtype=xp.float64)
+            # Extract only valid points
+            x1_valid = x1[valid_points1]
+            y1_valid = y1[valid_points1]
+            z1_valid = z1[valid_points1]
+            weight1_valid = weight1[valid_points1]
             
-            # Configure CUDA grid
-            threadsperblock = 256
+            x2_valid = x2[valid_points2]
+            y2_valid = y2[valid_points2]
+            z2_valid = z2[valid_points2]
+            weight2_valid = weight2[valid_points2]
+            
+            # Extract valid vector components
+            vx1_valid = vx1[valid_points1]
+            vy1_valid = vy1[valid_points1]
+            vz1_valid = vz1[valid_points1]
+            
+            vx2_valid = vx2[valid_points2]
+            vy2_valid = vy2[valid_points2]
+            vz2_valid = vz2[valid_points2]
+            
+            # Get number of valid points
+            n_valid1 = x1_valid.size
+            n_valid2 = x2_valid.size
+            
+            # If valid points are fewer than what we need, adjust n_samples
+            n_samples1_adj = min(n_samples1, n_valid1)
+            n_samples2_adj = min(n_samples2, n_valid2)
+        else:
+            if debug:
+                print(f"Debug: Using all points (no sparse filtering) for weight {weight_name}")
+            # Use all points, regardless of weight
+            x1_valid = x1
+            y1_valid = y1
+            z1_valid = z1
+            weight1_valid = weight1
+            
+            x2_valid = x2
+            y2_valid = y2
+            z2_valid = z2
+            weight2_valid = weight2
+            
+            vx1_valid = vx1
+            vy1_valid = vy1
+            vz1_valid = vz1
+            
+            vx2_valid = vx2
+            vy2_valid = vy2
+            vz2_valid = vz2
+            
+            # The cached arrays may already be interface-trimmed at load time,
+            # so the valid-point count must follow the cached data rather than
+            # the original full meshblock cell count.
+            n_valid1 = x1_valid.size
+            n_valid2 = x2_valid.size
+            n_samples1_adj = min(n_samples1, n_valid1)
+            n_samples2_adj = min(n_samples2, n_valid2)
+        
+        # Local arrays for accumulation
+        local_sf_comp = xp.zeros((max_order, nbins), dtype=xp.float64)
+        local_sf_sol = xp.zeros((max_order, nbins), dtype=xp.float64)
+        local_sf_comp_flat = xp.ascontiguousarray(local_sf_comp.flatten(), dtype=xp.float64)
+        local_sf_sol_flat = xp.ascontiguousarray(local_sf_sol.flatten(), dtype=xp.float64)
+        local_num_bin_points = xp.zeros(nbins, dtype=xp.float64)
+        local_weight_sum_bin = xp.zeros(nbins, dtype=xp.float64)
+        
+        # Configure CUDA grid
+        threadsperblock = 256
+        n_pairs = int(n_samples1_adj * n_samples2_adj)
+        blockspergrid = (n_pairs + threadsperblock - 1) // threadsperblock
+        n_valid_pairs = n_valid1 * n_valid2
+        if n_pairs > 1e10:
+            # Same cap as the isotropic path: keeps the launch grid valid.
+            scale_factor = np.sqrt(1e10 / n_pairs)
+            n_samples1_adj = max(1, int(n_samples1_adj * scale_factor))
+            n_samples2_adj = max(1, int(n_samples2_adj * scale_factor))
             n_pairs = int(n_samples1_adj * n_samples2_adj)
-            blockspergrid = (n_pairs + threadsperblock - 1) // threadsperblock
-            n_valid_pairs = n_valid1 * n_valid2
-            
-            if debug:
-                print(f"Debug: Kernel configuration - n_pairs: {n_pairs}, n_valid_pairs: {n_valid_pairs}")
-            
-            # Weight this block pair's sums by (valid pairs) / (sampled pairs) so the
-            # binned mean is a uniform average over ALL valid pairs, independent of the
-            # per-block-pair sample counts (distance-dependent n_samples2, sparse
-            # truncation). num_bin_points stays a raw count of sampled pairs.
-            if b1 == b2:
-                x2_valid, y2_valid, z2_valid = x1_valid, y1_valid, z1_valid
-                weight2_valid = weight1_valid
-                vx2_valid, vy2_valid, vz2_valid = vx1_valid, vy1_valid, vz1_valid
-            pair_weight = _distinct_pair_count(n_valid1, n_valid2, b1 == b2) / max(n_pairs, 1)
-            # Choose appropriate kernel based on number of valid pairs
-            if (n_valid_pairs < 5 * n_samples1_adj * n_samples2_adj
-                    and n_valid_pairs <= np.iinfo(np.int32).max // 4):
-                pair_weight = 1.0  # every distinct pair visited once
-                if debug:
-                    print(f"Debug: Using exhaustive Helmholtz kernel for small dataset")
-                # Use exhaustive kernel for small datasets
-                blockspergrid = (n_valid_pairs + threadsperblock - 1) // threadsperblock
-                
-                structure_function_helmholtz_kernel_exhaustive(
-                    (blockspergrid,), (threadsperblock,),
-                    (vx1_valid, vy1_valid, vz1_valid,
-                    vx2_valid, vy2_valid, vz2_valid,
-                    weight1_valid, weight2_valid,
-                    x1_valid, y1_valid, z1_valid,
-                    x2_valid, y2_valid, z2_valid,
-                    rbins, 
-                    local_sf_comp_flat, local_sf_sol_flat, local_num_bin_points,
-                    local_weight_sum_bin, n_valid_pairs,
-                    n_valid1, n_valid2,
-                    float(Lx), float(Ly), float(Lz),
-                    nbins, max_order,
-                    periodic_x, periodic_y, periodic_z)
-                )
+        hist = []
+        for part in ('comp', 'sol'):
+            edges = None if delta is None else delta.get(part + '_edges')
+            if edges is None:
+                hist += [_NO_DELTA_PDF, _NO_DELTA_PDF, 0]
             else:
-                if debug:
-                    print(f"Debug: Using random sampling Helmholtz kernel for large dataset")
-                # Use random sampling kernel for larger datasets
-                blockspergrid = (n_pairs + threadsperblock - 1) // threadsperblock
-                
-                # Use deterministic seed based on block pair (b1, b2) for reproducibility
-                base_seed = random_seed if random_seed is not None else (b1 * 10000 + b2)
-                structure_function_helmholtz_kernel(
-                    (blockspergrid,), (threadsperblock,),
-                    (vx1_valid, vy1_valid, vz1_valid,
-                    vx2_valid, vy2_valid, vz2_valid,
-                    weight1_valid, weight2_valid,
-                    x1_valid, y1_valid, z1_valid,
-                    x2_valid, y2_valid, z2_valid,
-                    rbins, 
-                    local_sf_comp_flat, local_sf_sol_flat, local_num_bin_points,
-                    local_weight_sum_bin, n_pairs, n_valid1, n_valid2,
-                    float(Lx), float(Ly), float(Lz),
-                    nbins, max_order,
-                    periodic_x, periodic_y, periodic_z, base_seed)
-                )
-            
-            # Reshape and accumulate results
-            local_sf_comp = local_sf_comp_flat.reshape((max_order, nbins))
-            local_sf_sol = local_sf_sol_flat.reshape((max_order, nbins))
-            
-            sf_comp[iw] += pair_weight * local_sf_comp
-            sf_sol[iw] += pair_weight * local_sf_sol
-            
-            # Add to weight statistics once per weight
-            num_bin_points[iw] += local_num_bin_points
-            weight_sum_bin[iw] += pair_weight * local_weight_sum_bin
-            
+                hist += [xp.zeros(nbins * (len(edges) + 1), dtype=xp.float64), edges, len(edges)]
+        
+        if debug:
+            print(f"Debug: Kernel configuration - n_pairs: {n_pairs}, n_valid_pairs: {n_valid_pairs}")
+        
+        # Weight this block pair's sums by (valid pairs) / (sampled pairs) so the
+        # binned mean is a uniform average over ALL valid pairs, independent of the
+        # per-block-pair sample counts (distance-dependent n_samples2, sparse
+        # truncation). num_bin_points stays a raw count of sampled pairs.
+        if b1 == b2:
+            x2_valid, y2_valid, z2_valid = x1_valid, y1_valid, z1_valid
+            weight2_valid = weight1_valid
+            vx2_valid, vy2_valid, vz2_valid = vx1_valid, vy1_valid, vz1_valid
+        pair_weight = _random_pair_weight(n_valid1, n_valid2, b1 == b2, n_pairs)
+        # Choose appropriate kernel based on number of valid pairs
+        if (n_valid_pairs < 5 * n_samples1_adj * n_samples2_adj
+                and n_valid_pairs <= np.iinfo(np.int32).max // 4):
+            pair_weight = 1.0  # every distinct pair visited once
             if debug:
-                points_added = int(local_num_bin_points.sum())
-                if debug:
-                    print(f"Debug: Added {points_added} points for weight {weight_name} from blocks ({b1}, {b2})")
+                print(f"Debug: Using exhaustive Helmholtz kernel for small dataset")
+            # Use exhaustive kernel for small datasets
+            blockspergrid = (n_valid_pairs + threadsperblock - 1) // threadsperblock
             
-        except Exception as e:
-            import warnings
-            warnings.warn(
-                f"Skipping Helmholtz block pair ({b1},{b2}) with weight {weight_name} "
-                f"after processing error: {e}", stacklevel=2
+            structure_function_helmholtz_kernel_exhaustive(
+                (blockspergrid,), (threadsperblock,),
+                (vx1_valid, vy1_valid, vz1_valid,
+                vx2_valid, vy2_valid, vz2_valid,
+                weight1_valid, weight2_valid,
+                x1_valid, y1_valid, z1_valid,
+                x2_valid, y2_valid, z2_valid,
+                rbins, 
+                local_sf_comp_flat, local_sf_sol_flat, local_num_bin_points,
+                local_weight_sum_bin, n_valid_pairs,
+                n_valid1, n_valid2,
+                float(Lx), float(Ly), float(Lz),
+                nbins, max_order,
+                periodic_x, periodic_y, periodic_z, *hist)
             )
+        else:
             if debug:
-                import traceback
-                traceback.print_exc()
-            continue
+                print(f"Debug: Using random sampling Helmholtz kernel for large dataset")
+            # Use random sampling kernel for larger datasets
+            blockspergrid = (n_pairs + threadsperblock - 1) // threadsperblock
+            
+            base_seed = np.uint64(random_seed) if random_seed is not None else _pair_seed(b1, b2)
+            structure_function_helmholtz_kernel(
+                (blockspergrid,), (threadsperblock,),
+                (vx1_valid, vy1_valid, vz1_valid,
+                vx2_valid, vy2_valid, vz2_valid,
+                weight1_valid, weight2_valid,
+                x1_valid, y1_valid, z1_valid,
+                x2_valid, y2_valid, z2_valid,
+                rbins, 
+                local_sf_comp_flat, local_sf_sol_flat, local_num_bin_points,
+                local_weight_sum_bin, n_pairs, n_valid1, n_valid2,
+                float(Lx), float(Ly), float(Lz),
+                nbins, max_order,
+                periodic_x, periodic_y, periodic_z, base_seed, *hist)
+            )
+        
+        # Reshape and accumulate results
+        local_sf_comp = local_sf_comp_flat.reshape((max_order, nbins))
+        local_sf_sol = local_sf_sol_flat.reshape((max_order, nbins))
+        
+        sf_comp[iw] += pair_weight * local_sf_comp
+        sf_sol[iw] += pair_weight * local_sf_sol
+        
+        # Add to weight statistics once per weight
+        num_bin_points[iw] += local_num_bin_points
+        weight_sum_bin[iw] += pair_weight * local_weight_sum_bin
+        for part, local in (('comp', hist[0]), ('sol', hist[3])):
+            if delta is not None and delta.get(part + '_edges') is not None:
+                delta['pdf_' + part][iw] += pair_weight * local.reshape(nbins, -1)
+        
+        if debug:
+            points_added = int(local_num_bin_points.sum())
+            if debug:
+                print(f"Debug: Added {points_added} points for weight {weight_name} from blocks ({b1}, {b2})")
+        
     
     if debug:
         print(f"Debug: Successfully completed Helmholtz processing for block pair ({b1}, {b2})")
+
+def _sf_settings_json(**settings):
+    """Canonical record of the settings that determine an SF product, stored
+    with each entry so a cached result is reused only for the same request.
+    Execution-only options (batching, debug, MPI handle) do not enter."""
+    ignored = {'debug', 'simultaneous_blocks', 'mpi_manager', 'auto_select', 'use_mpi', 'redo'}
+
+    def plain(value):
+        if hasattr(value, 'tolist'):
+            return asnumpy(value).tolist()
+        if isinstance(value, (list, tuple)):
+            return [plain(v) for v in value]
+        return value
+    record = {k: plain(v) for k, v in settings.items() if k not in ignored}
+    return json.dumps(record, sort_keys=True, default=str)
+
+
+def _sf_entry_kind(entry):
+    """'helmholtz', 'aniso', 'scalar' or None for an ad.sf entry."""
+    if not isinstance(entry, dict):
+        return None
+    if 'sf_comp' in entry:
+        return 'helmholtz'
+    if 'sf_prll' in entry:
+        return 'aniso'
+    return 'scalar' if 'sf' in entry else None
+
+
+def _refuse_kind_overwrite(sf, key, kind):
+    """Helmholtz and anisotropic products share 'vel'+varsuf style keys;
+    storing one over the other would silently replace a different product."""
+    existing = _sf_entry_kind(sf.get(key))
+    if existing is not None and existing != kind:
+        raise ValueError(f"ad.sf['{key}'] holds a {existing} SF; use a different varsuf for the {kind} SF")
+
+
+def _sf_entry_reusable(entry, settings_json):
+    """A cached entry is reused only if it carries the current sampler tag
+    and was computed with the same settings."""
+    if not sf_entry_is_current(entry):
+        return False
+    stored = entry.get('settings_json', '')
+    if hasattr(stored, 'item'):
+        stored = stored.item()
+    if isinstance(stored, bytes):
+        stored = stored.decode()
+    return stored == settings_json
+
 
 def set_sf(ad, varl=['dens','velx','vely','velz'], varsuf='', redo=False, auto_select=True, use_mpi=False, debug=False, **kwargs):
     """
@@ -5085,12 +5021,17 @@ def set_sf(ad, varl=['dens','velx','vely','velz'], varsuf='', redo=False, auto_s
     debug : bool, optional
         If True, print detailed debug information. Defaults to False.
     **kwargs : dict
-        Additional arguments for structure function calculation.
+        Additional arguments for structure function calculation. With
+        delta_edges (see get_sf_mb) each entry also holds 'delta_pdf', the
+        per-bin increment histogram, and 'delta_edges'.
         
     Returns
     -------
     dict
-        Dictionary of calculated structure functions
+        Dictionary of calculated structure functions. Each entry carries the
+        sampler tag ('sampler') and its settings ('settings_json'); an entry
+        is reused only when both match the current request. A string weight
+        gives arrays without a weight axis, a list of weights keeps it first.
     """
     # Initialize MPI if requested
     mpi_manager = None
@@ -5109,10 +5050,11 @@ def set_sf(ad, varl=['dens','velx','vely','velz'], varsuf='', redo=False, auto_s
         ad.sf = {}
     
     # Check which variables need processing
+    settings_json = _sf_settings_json(kind='scalar', **kwargs)
     vars_to_process = []
     for var in varl:
         varname = var + varsuf
-        if redo or varname not in ad.sf:
+        if redo or not _sf_entry_reusable(ad.sf.get(varname), settings_json):
             vars_to_process.append(var)
     
     if not vars_to_process:
@@ -5161,19 +5103,24 @@ def set_sf(ad, varl=['dens','velx','vely','velz'], varsuf='', redo=False, auto_s
         # CRITICAL: When MPI is enabled, ALWAYS use get_sf_mb (never get_sf)
         # Sparse (masked-cell) sampling exists only in the block-pair path.
         if (use_mb_method or len(vars_to_process) > 1 or kwargs.get('sparse_data')
+                or kwargs.get('delta_edges') is not None
                 or (use_mpi and mpi_manager is not None)):
             # Memory-efficient batch method with multiple variables
             # Pass mpi_manager to get_sf_mb
             if rank == 0 and debug:
                 print(f"[DEBUG set_sf] Calling get_sf_mb for {len(vars_to_process)} variables")
             
-            r_, sf_result, weight_sum, num_bin_points = get_sf_mb(
+            result = get_sf_mb(
                 ad, 
                 vars_to_process, 
                 mpi_manager=mpi_manager,
                 debug=debug,
                 **kwargs
             )
+            r_, sf_result, weight_sum, num_bin_points = result[:4]
+            delta_pdf = result[4] if len(result) > 4 else None
+            # get_sf_mb puts the weight axis first for a list of weights.
+            var_axis = 1 if isinstance(kwargs.get('weights'), list) else 0
             
             if rank == 0 and debug:
                 print(f"[DEBUG set_sf] get_sf_mb returned:")
@@ -5190,15 +5137,7 @@ def set_sf(ad, varl=['dens','velx','vely','velz'], varsuf='', redo=False, auto_s
             # Store results for each variable (only on rank 0 or all ranks)
             for i, var in enumerate(vars_to_process):
                 varname = var + varsuf
-                # Extract SF data for this variable
-                if len(vars_to_process) > 1:
-                    sf_var = sf_result[i]
-                else:
-                    sf_var = sf_result
-                
-                # Squeeze out singleton dimensions (e.g., n_weights=1)
-                # This ensures consistent shape between single-node (4, 30) and MPI (1, 4, 30) -> (4, 30)
-                sf_var_squeezed = asnumpy(sf_var).squeeze()
+                sf_var_squeezed = np.take(asnumpy(sf_result), i, axis=var_axis)
                 
                 if rank == 0 and debug:
                     print(f"[DEBUG set_sf] Storing {varname}:")
@@ -5210,9 +5149,14 @@ def set_sf(ad, varl=['dens','velx','vely','velz'], varsuf='', redo=False, auto_s
                 ad.sf[varname] = {
                     'r': asnumpy(r_),
                     'sf': sf_var_squeezed,
-                    'weight_sum_bin': asnumpy(weight_sum).squeeze(),
-                    'num_bin_points': asnumpy(num_bin_points).squeeze()
+                    'weight_sum_bin': asnumpy(weight_sum),
+                    'num_bin_points': asnumpy(num_bin_points),
+                    'sampler': SF_SAMPLER_VERSION,
+                    'settings_json': settings_json,
                 }
+                if delta_pdf is not None:
+                    ad.sf[varname]['delta_pdf'] = np.take(asnumpy(delta_pdf), i, axis=var_axis)
+                    ad.sf[varname]['delta_edges'] = np.asarray(kwargs['delta_edges'], dtype=np.float64)
         else:
             # Single variable case - use standard method (only when MPI is NOT enabled)
             # This branch should never be reached when use_mpi=True
@@ -5234,7 +5178,9 @@ def set_sf(ad, varl=['dens','velx','vely','velz'], varsuf='', redo=False, auto_s
                 'r': asnumpy(r_),
                 'sf': asnumpy(sf_bin),
                 'weight_sum_bin': asnumpy(weights_bin),
-                'num_bin_points': asnumpy(counts_bin)
+                'num_bin_points': asnumpy(counts_bin),
+                'sampler': SF_SAMPLER_VERSION,
+                'settings_json': settings_json,
             }
     except Exception as e:
         if rank == 0:
@@ -5268,11 +5214,14 @@ def set_sf_helmholtz(ad, var='vel', varsuf='', redo=False, auto_select=True, use
         If True, print detailed debug information. Defaults to False.
     **kwargs : dict
         Additional arguments for Helmholtz structure function calculation.
+        With delta_edges_comp / delta_edges_sol (see get_sf_helmholtz_mb) the
+        entry also holds 'delta_pdf_comp' / 'delta_pdf_sol' and their edges.
         
     Returns
     -------
     dict
-        Dictionary of calculated structure functions
+        Dictionary of calculated structure functions. The entry carries the
+        sampler tag and settings and is reused only when both match.
     """
     # Initialize MPI if requested
     mpi_manager = None
@@ -5292,7 +5241,9 @@ def set_sf_helmholtz(ad, var='vel', varsuf='', redo=False, auto_select=True, use
     
     # Check if processing is needed
     varname = var + varsuf
-    if not redo and varname in ad.sf:
+    settings_json = _sf_settings_json(kind='helmholtz', var=var, **kwargs)
+    _refuse_kind_overwrite(ad.sf, varname, 'helmholtz')
+    if not redo and _sf_entry_reusable(ad.sf.get(varname), settings_json):
         if rank == 0 and debug:
             print(f"[DEBUG set_sf_helmholtz] {varname} already exists and redo=False, skipping")
         return ad.sf  # Nothing to do
@@ -5337,19 +5288,23 @@ def set_sf_helmholtz(ad, var='vel', varsuf='', redo=False, auto_select=True, use
         # Choose the appropriate method based on memory assessment
         # CRITICAL: When MPI is enabled, ALWAYS use get_sf_helmholtz_mb (never get_sf_helmholtz)
         # Sparse (masked-cell) sampling exists only in the block-pair path.
-        if use_mb_method or kwargs.get('sparse_data') or (use_mpi and mpi_manager is not None):
+        wants_delta = (kwargs.get('delta_edges_comp') is not None
+                       or kwargs.get('delta_edges_sol') is not None)
+        if use_mb_method or kwargs.get('sparse_data') or wants_delta or (use_mpi and mpi_manager is not None):
             # Memory-efficient batch method
             # Pass mpi_manager to get_sf_helmholtz_mb
             if rank == 0 and debug:
                 print(f"[DEBUG set_sf_helmholtz] Calling get_sf_helmholtz_mb")
             
-            r_, sf_comp, sf_sol, weight_sum, num_bin_points = get_sf_helmholtz_mb(
+            result = get_sf_helmholtz_mb(
                 ad, 
                 var=var,
                 mpi_manager=mpi_manager,
                 debug=debug,
                 **kwargs
             )
+            r_, sf_comp, sf_sol, weight_sum, num_bin_points = result[:5]
+            delta_pdfs = result[5:] if len(result) > 5 else (None, None)
             
             if rank == 0 and debug:
                 print(f"[DEBUG set_sf_helmholtz] get_sf_helmholtz_mb returned:")
@@ -5368,6 +5323,7 @@ def set_sf_helmholtz(ad, var='vel', varsuf='', redo=False, auto_select=True, use
                 debug=debug,
                 **kwargs
             )
+            delta_pdfs = (None, None)
             
             if rank == 0 and debug:
                 print(f"[DEBUG set_sf_helmholtz] get_sf_helmholtz returned:")
@@ -5392,8 +5348,14 @@ def set_sf_helmholtz(ad, var='vel', varsuf='', redo=False, auto_select=True, use
             'sf_comp': sf_comp_numpy,
             'sf_sol': sf_sol_numpy,
             'weight_sum_bin': asnumpy(weight_sum),
-            'num_bin_points': asnumpy(num_bin_points)
+            'num_bin_points': asnumpy(num_bin_points),
+            'sampler': SF_SAMPLER_VERSION,
+            'settings_json': settings_json,
         }
+        for part, pdf in zip(('comp', 'sol'), delta_pdfs):
+            if pdf is not None:
+                ad.sf[varname]['delta_pdf_' + part] = asnumpy(pdf)
+                ad.sf[varname]['delta_edges_' + part] = np.asarray(kwargs['delta_edges_' + part], dtype=np.float64)
         
     except Exception as e:
         if rank == 0:
@@ -5794,8 +5756,8 @@ def _process_block_pair_aniso_mhd(ad, b1, b2, block_cache, block_centers,
                 blockspergrid = (n_pairs + threadsperblock - 1) // threadsperblock
                 # Uniform average over all distinct pairs: undo the per-block-pair
                 # sampling rate (distance- and topology-dependent target_pairs).
-                pair_weight = float(n_exhaustive_pairs) / n_pairs
-                seed = random_seed if random_seed is not None else (b1 * 10000 + b2)
+                pair_weight = _random_pair_weight(n1, n2, same_block_pair, n_pairs)
+                seed = np.uint64(random_seed) if random_seed is not None else _pair_seed(b1, b2)
                 structure_function_aniso_mhd_kernel(
                     (blockspergrid,), (threadsperblock,),
                     (vx1v, vy1v, vz1v, vx2v, vy2v, vz2v,
@@ -6031,7 +5993,7 @@ def _process_mpi_pairs_aniso_mhd(ad, my_pairs, block_cache,
                 edge_block_pair_boost=edge_block_pair_boost,
                 corner_block_pair_boost=corner_block_pair_boost,
                 sparse_data=sparse_data, debug=False, use_mpi=True,
-                random_seed=(gb1 * 10000 + gb2),
+                random_seed=_pair_seed(gb1, gb2),
                 pair_workspace=pair_workspace)
             pairs_processed += 1
 
@@ -6111,7 +6073,7 @@ def _process_mpi_pairs_aniso_mhd(ad, my_pairs, block_cache,
                     edge_block_pair_boost=edge_block_pair_boost,
                     corner_block_pair_boost=corner_block_pair_boost,
                     sparse_data=sparse_data, debug=False, use_mpi=True,
-                    random_seed=(gb1 * 10000 + gb2),
+                    random_seed=_pair_seed(gb1, gb2),
                     pair_workspace=pair_workspace)
                 pairs_processed += 1
 
@@ -6232,20 +6194,9 @@ def get_sf_aniso_mhd_mb(ad, vel_var='vel', bcc_var='bcc', weights='ones', xyz=No
     block_centers[:, 1] = 0.5 * (local_geom[:, 2] + local_geom[:, 3])
     block_centers[:, 2] = 0.5 * (local_geom[:, 4] + local_geom[:, 5])
 
-    if log_bin_flag:
-        lbins = xp.logspace(xp.log10(rmin), xp.log10(rmax), nbins + 1)
-        lprll_bins = xp.logspace(xp.log10(rmin), xp.log10(rmax), nbins_prll + 1)
-        lperp_bins = xp.logspace(xp.log10(rmin), xp.log10(rmax), nbins_perp + 1)
-        l_ = xp.sqrt(lbins[1:] * lbins[:-1])
-        l_prll_ = xp.sqrt(lprll_bins[1:] * lprll_bins[:-1])
-        l_perp_ = xp.sqrt(lperp_bins[1:] * lperp_bins[:-1])
-    else:
-        lbins = xp.linspace(0, rmax, nbins + 1)
-        lprll_bins = xp.linspace(0, rmax, nbins_prll + 1)
-        lperp_bins = xp.linspace(0, rmax, nbins_perp + 1)
-        l_ = 0.5 * (lbins[1:] + lbins[:-1])
-        l_prll_ = 0.5 * (lprll_bins[1:] + lprll_bins[:-1])
-        l_perp_ = 0.5 * (lperp_bins[1:] + lperp_bins[:-1])
+    lbins, l_ = radial_bin_edges(rmin, rmax, nbins, log_bin_flag)
+    lprll_bins, l_prll_ = radial_bin_edges(rmin, rmax, nbins_prll, log_bin_flag)
+    lperp_bins, l_perp_ = radial_bin_edges(rmin, rmax, nbins_perp, log_bin_flag)
 
     sf_accum = _allocate_aniso_mhd_accumulators(
         n_weights, max_order, nbins, nbins_prll, nbins_perp, array_module=xp)
@@ -6369,7 +6320,10 @@ def set_sf_aniso_mhd(ad, vel_var='vel', bcc_var='bcc', varsuf='',
     bcc_perp_key = bcc_var + '_perp' + varsuf
 
     done_keys = [vel_key, vel_perp_key, bcc_key, bcc_perp_key]
-    if not redo and all(key in ad.sf for key in done_keys):
+    settings_json = _sf_settings_json(kind='aniso', vel_var=vel_var, bcc_var=bcc_var, **kwargs)
+    for key in done_keys:
+        _refuse_kind_overwrite(ad.sf, key, 'aniso')
+    if not redo and all(_sf_entry_reusable(ad.sf.get(key), settings_json) for key in done_keys):
         if rank == 0 and debug:
             print(f'[DEBUG set_sf_aniso_mhd] {done_keys} already exist; skipping (redo=False)')
         return ad.sf
@@ -6410,6 +6364,8 @@ def set_sf_aniso_mhd(ad, vel_var='vel', bcc_var='bcc', varsuf='',
                 'wsum': wsum_np,
                 'wsum_prll': wsum_prll_np,
                 'wsum_perp': wsum_perp_np,
+                'sampler': SF_SAMPLER_VERSION,
+                'settings_json': settings_json,
             }
 
         ad.sf[vel_key] = _build_entry(result['vel'])
@@ -6438,7 +6394,9 @@ def set_sf_aniso_mhd(ad, vel_var='vel', bcc_var='bcc', varsuf='',
 # filled). Cached SFs without this tag came from the old sampler, whose
 # correlated draws bias small-separation SFs in thin masked regions, and are
 # treated as missing so they get recomputed.
-SF_SAMPLER_VERSION = 'hashed_sparse_importance_v2'
+# Bump whenever pair sampling, weighting or binning changes the numbers, so
+# cached SFs and checkpoint states from older samplers are recomputed.
+SF_SAMPLER_VERSION = 'hashed_sparse_importance_v3'
 
 
 def sf_entry_is_current(entry) -> bool:

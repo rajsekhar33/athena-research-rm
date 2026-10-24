@@ -169,7 +169,9 @@ def set_dist(ad, varl=['dens', 'temp', 'pres'], varsuf='', scale='log10',
             n_weights=n_weights,
             n_points_per_block=n_points_per_block
         )
-    simultaneous_blocks = min(simultaneous_blocks, n_mbs_local)
+    # A rank that owns no meshblocks runs zero batches but must still join
+    # the MPI reduction below, or the other ranks hang.
+    simultaneous_blocks = max(1, min(simultaneous_blocks, n_mbs_local))
     
     # Process blocks in optimized batches
     num_batches = (n_mbs_local + simultaneous_blocks - 1) // simultaneous_blocks
@@ -198,11 +200,12 @@ def set_dist(ad, varl=['dens', 'temp', 'pres'], varsuf='', scale='log10',
         weights_combined = weinorm * bool_z
         weights_flat = weights_combined.ravel()
         
-        # Skip batch if no valid data points (prevents zero-size array error)
+        # Skip batch only if every weight is zero; signed weights (e.g. fluxes)
+        # must keep their negative contributions.
         if cupy_enabled:
-            n_valid = int(xp.sum(weights_flat > 0).get())
+            n_valid = int(xp.count_nonzero(weights_flat).get())
         else:
-            n_valid = int(xp.sum(weights_flat > 0))
+            n_valid = int(xp.count_nonzero(weights_flat))
         
         if n_valid == 0:
             if debug and rank == 0:
@@ -219,11 +222,12 @@ def set_dist(ad, varl=['dens', 'temp', 'pres'], varsuf='', scale='log10',
             else:
                 data = ad.data(var, batch_start_global, batch_end_global)
             
-            # Handle numerical issues
-            xp.nan_to_num(data, copy=False, posinf=0.0, neginf=0.0)
-            
-            # Flatten data array
-            data_flat = data.ravel()
+            # Non-finite cells (NaN, or log of zero/negative) get zero weight,
+            # matching the support used by calc_filtered_extrema. Never write
+            # into ``data``: it may be a view of the cached raw array.
+            finite = xp.isfinite(data).ravel()
+            data_flat = xp.where(finite, data.ravel(), 0.0)
+            var_weights_flat = xp.where(finite, weights_flat, 0.0)
             
             # Verify shapes match
             if data_flat.shape != weights_flat.shape:
@@ -232,7 +236,7 @@ def set_dist(ad, varl=['dens', 'temp', 'pres'], varsuf='', scale='log10',
                                f"weinorm.shape={weinorm.shape}, bool_z.shape={bool_z.shape}")
             
             # Compute histogram for this batch using pre-computed bin edges
-            hist_vals, _ = xp.histogram(data_flat, bins=bin_edges_list[ivar], weights=weights_flat, density=False)
+            hist_vals, _ = xp.histogram(data_flat, bins=bin_edges_list[ivar], weights=var_weights_flat, density=False)
             
             # Accumulate results
             pdf[ivar] += hist_vals
@@ -257,8 +261,14 @@ def set_dist(ad, varl=['dens', 'temp', 'pres'], varsuf='', scale='log10',
         mean = xp.sum(binned_data[ivar] * normalized_pdf * bin_width[ivar]) / xp.sum(normalized_pdf * bin_width[ivar])
         rms = xp.sqrt(xp.sum(binned_data[ivar]**2 * normalized_pdf * bin_width[ivar]) / xp.sum(normalized_pdf * bin_width[ivar]))
         sigma = xp.sqrt(rms**2 - mean**2)
-        skew = xp.sum((binned_data[ivar] - mean)**3 * normalized_pdf * bin_width[ivar]) / xp.sum(normalized_pdf * bin_width[ivar])
-        kurtosis = xp.sum((binned_data[ivar] - mean)**4 * normalized_pdf * bin_width[ivar]) / xp.sum(normalized_pdf * bin_width[ivar])
+        # Standardized moments: skewness = m3/sigma^3, kurtosis = m4/sigma^4
+        # (non-excess; 3 for a Gaussian). Undefined (NaN) when sigma == 0.
+        m3 = xp.sum((binned_data[ivar] - mean)**3 * normalized_pdf * bin_width[ivar]) / xp.sum(normalized_pdf * bin_width[ivar])
+        m4 = xp.sum((binned_data[ivar] - mean)**4 * normalized_pdf * bin_width[ivar]) / xp.sum(normalized_pdf * bin_width[ivar])
+        has_spread = sigma > 0
+        safe_sigma = xp.where(has_spread, sigma, 1.0)
+        skew = xp.where(has_spread, m3 / safe_sigma**3, xp.nan)
+        kurtosis = xp.where(has_spread, m4 / safe_sigma**4, xp.nan)
         
         # Store results
         ad.dist[varname] = {
@@ -438,7 +448,9 @@ def set_dist2d(ad, varl2d=[['dens','temp'],['dens','pres']], scales=['log10','lo
             n_weights=n_weights,
             n_points_per_block=n_points_per_block
         )
-    simultaneous_blocks = min(simultaneous_blocks, n_mbs_local)
+    # A rank that owns no meshblocks runs zero batches but must still join
+    # the MPI reduction below, or the other ranks hang.
+    simultaneous_blocks = max(1, min(simultaneous_blocks, n_mbs_local))
     # Process blocks in optimized batches
     num_batches = (n_mbs_local + simultaneous_blocks - 1) // simultaneous_blocks
     
@@ -476,9 +488,10 @@ def set_dist2d(ad, varl2d=[['dens','temp'],['dens','pres']], scales=['log10','lo
                     dats[i] = xp.log(ad.data(var, batch_start_global, batch_end_global))
                 else:
                     dats[i] = ad.data(var, batch_start_global, batch_end_global)
-                
-                # Handle numerical issues
-                xp.nan_to_num(dats[i], copy=False, posinf=0.0, neginf=0.0)
+            
+            # Cells where either coordinate is non-finite get zero weight;
+            # ``dats`` may be views of cached raw arrays, so never modify them.
+            finite = xp.logical_and(xp.isfinite(dats[0]), xp.isfinite(dats[1])).ravel()
             
             # Prepare weights for histogram
             weight_flat = weinorm.ravel()
@@ -489,8 +502,8 @@ def set_dist2d(ad, varl2d=[['dens','temp'],['dens','pres']], scales=['log10','lo
                 raise ValueError(f"Shape mismatch: weinorm.ravel()={weight_flat.shape}, bool_z.ravel()={bool_flat.shape}")
             
             # Check data shapes match weights
-            dats0_flat = dats[0].ravel()
-            dats1_flat = dats[1].ravel()
+            dats0_flat = xp.where(finite, dats[0].ravel(), 0.0)
+            dats1_flat = xp.where(finite, dats[1].ravel(), 0.0)
             if dats0_flat.shape != weight_flat.shape:
                 raise ValueError(f"Shape mismatch: dats[0].ravel()={dats0_flat.shape}, weights={weight_flat.shape}, "
                                f"dats[0].shape={dats[0].shape}, weinorm.shape={weinorm.shape}")
@@ -498,14 +511,15 @@ def set_dist2d(ad, varl2d=[['dens','temp'],['dens','pres']], scales=['log10','lo
                 raise ValueError(f"Shape mismatch: dats[1].ravel()={dats1_flat.shape}, weights={weight_flat.shape}, "
                                f"dats[1].shape={dats[1].shape}, weinorm.shape={weinorm.shape}")
             
-            # Combine weights and boolean mask
-            weights_combined = weight_flat * bool_flat
+            # Combine weights, boolean mask and finiteness
+            weights_combined = xp.where(finite, weight_flat * bool_flat, 0.0)
             
-            # Skip if no valid data points (prevents zero-size array error in CuPy)
+            # Skip only if every weight is zero; signed weights (e.g. var*weight
+            # in weighted projections) must keep their negative contributions.
             if cupy_enabled:
-                n_valid = int(xp.sum(weights_combined > 0).get())
+                n_valid = int(xp.count_nonzero(weights_combined).get())
             else:
-                n_valid = int(xp.sum(weights_combined > 0))
+                n_valid = int(xp.count_nonzero(weights_combined))
             
             if n_valid == 0:
                 if debug and rank == 0:
